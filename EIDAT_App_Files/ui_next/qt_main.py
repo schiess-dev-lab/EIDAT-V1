@@ -15838,12 +15838,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return out
 
         def _obs_label(run_display: str, run_name_value: str, row: dict) -> str:
-            parts: list[str] = [str(run_display or run_name_value).strip() or str(run_name_value or "").strip()]
-            for key in ("program_title", "source_run_name"):
-                value = str((row or {}).get(key) or "").strip()
-                if value and value not in parts:
-                    parts.append(value)
-            return " | ".join([part for part in parts if str(part).strip()])
+            labeler = getattr(be, "_td_perf_export_condition_label", None)
+            base_row = dict(row or {})
+            if callable(labeler):
+                try:
+                    label = str(labeler(base_row, display_name=run_display) or "").strip()
+                except Exception:
+                    label = ""
+                if label:
+                    return label
+            return str(run_display or run_name_value).strip() or str(run_name_value or "").strip()
 
         def _cp_matches(value: object, target: object) -> bool:
             if target in (None, ""):
@@ -16239,12 +16243,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return out
 
         def _obs_label(run_display: str, run_name_value: str, row: dict) -> str:
-            parts: list[str] = [str(run_display or run_name_value).strip() or str(run_name_value or "").strip()]
-            for key in ("program_title", "source_run_name"):
-                value = str((row or {}).get(key) or "").strip()
-                if value and value not in parts:
-                    parts.append(value)
-            return " | ".join([part for part in parts if str(part).strip()])
+            labeler = getattr(be, "_td_perf_export_condition_label", None)
+            base_row = dict(row or {})
+            if callable(labeler):
+                try:
+                    label = str(labeler(base_row, display_name=run_display) or "").strip()
+                except Exception:
+                    label = ""
+                if label:
+                    return label
+            return str(run_display or run_name_value).strip() or str(run_name_value or "").strip()
 
         def _cp_matches(value: object, target: object) -> bool:
             if target in (None, ""):

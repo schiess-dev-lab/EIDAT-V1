@@ -598,6 +598,13 @@ class _CachedConditionMeanCollectorHarness:
         *,
         control_period_filter=None,
         run_type_filter=None,
+        filter_state=None,
+        suppression_voltage_filter=None,
+        source_run_filter=None,
+        program_filter=None,
+        serial_filter=None,
+        member_source_runs=None,
+        include_source_labels: bool = False,
     ) -> list[dict[str, object]]:
         return [dict(row) for row in self._rows.get((run_name, column_name, stat), [])]
 
@@ -4104,7 +4111,25 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 },
                 condition_y_names={"RunA": {"thrust"}},
                 sequence_obs_rows=[
-                    ("obs_seq1", "SN1", "RunA", "Program A", "Seq1", "pulsed mode", 0.25, 60.0, 24.0, 12.0, 123, 456)
+                    be._td_build_sequence_observation_row(
+                        "obs_seq1",
+                        "SN1",
+                        "RunA",
+                        "Program A",
+                        "Seq1",
+                        "pulsed mode",
+                        0.25,
+                        60.0,
+                        24.0,
+                        12.0,
+                        123,
+                        456,
+                        {
+                            "display_name": "Run A",
+                            "condition_display": "Run A",
+                        },
+                        fallback_display_name="Run A",
+                    )
                 ],
                 sequence_metric_rows=[
                     ("obs_seq1", "SN1", "RunA", "thrust", "mean", 15.0, 456, 123, "Program A", "Seq1")
@@ -4173,6 +4198,125 @@ class TestTDSupportWorkbook(unittest.TestCase):
     ) -> None:
         self._make_source_sqlite(path)
         with sqlite3.connect(str(path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS __sequence_context (
+                    sheet_name TEXT PRIMARY KEY,
+                    source_sheet_name TEXT,
+                    data_mode_raw TEXT,
+                    run_type TEXT,
+                    on_time_value REAL,
+                    on_time_units TEXT,
+                    off_time_value REAL,
+                    off_time_units TEXT,
+                    control_period REAL,
+                    nominal_pf_value REAL,
+                    nominal_pf_units TEXT,
+                    nominal_tf_value REAL,
+                    nominal_tf_units TEXT,
+                    suppression_voltage_value REAL,
+                    suppression_voltage_units TEXT,
+                    valve_voltage_value REAL,
+                    valve_voltage_units TEXT,
+                    extraction_status TEXT,
+                    extraction_reason TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO __sequence_context(
+                    sheet_name,
+                    source_sheet_name,
+                    data_mode_raw,
+                    run_type,
+                    on_time_value,
+                    on_time_units,
+                    off_time_value,
+                    off_time_units,
+                    control_period,
+                    nominal_pf_value,
+                    nominal_pf_units,
+                    nominal_tf_value,
+                    nominal_tf_units,
+                    suppression_voltage_value,
+                    suppression_voltage_units,
+                    valve_voltage_value,
+                    valve_voltage_units,
+                    extraction_status,
+                    extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "RunA",
+                    "RunA",
+                    data_mode_raw,
+                    run_type,
+                    on_time_value,
+                    on_time_units,
+                    off_time_value,
+                    off_time_units,
+                    (
+                        (float(on_time_value) + float(off_time_value))
+                        if on_time_value is not None and off_time_value is not None
+                        else None
+                    ),
+                    nominal_pf_value,
+                    nominal_pf_units,
+                    nominal_tf_value,
+                    nominal_tf_units,
+                    suppression_voltage_value,
+                    suppression_voltage_units,
+                    valve_voltage_value,
+                    valve_voltage_units,
+                    extraction_status,
+                    extraction_reason,
+                ),
+            )
+            conn.commit()
+
+    def _make_source_sqlite_without_feed_columns_with_sequence_context(
+        self,
+        path: Path,
+        *,
+        extraction_status: str = "ok",
+        extraction_reason: str = "",
+        data_mode_raw: str = "Pulse Mode",
+        run_type: str = "PM",
+        on_time_value: float | None = 5.0,
+        on_time_units: str = "sec",
+        off_time_value: float | None = 20.0,
+        off_time_units: str = "sec",
+        nominal_pf_value: float | None = 100.0,
+        nominal_pf_units: str = "psia",
+        nominal_tf_value: float | None = 70.0,
+        nominal_tf_units: str = "F",
+        suppression_voltage_value: float | None = 24.0,
+        suppression_voltage_units: str = "V",
+        valve_voltage_value: float | None = None,
+        valve_voltage_units: str = "V",
+    ) -> None:
+        with sqlite3.connect(str(path)) as conn:
+            conn.execute(
+                """
+                CREATE TABLE "sheet__RunA" (
+                    excel_row INTEGER NOT NULL,
+                    "Time" REAL,
+                    thrust REAL
+                )
+                """
+            )
+            conn.executemany(
+                'INSERT INTO "sheet__RunA"(excel_row,"Time",thrust) VALUES(?,?,?)',
+                [
+                    (1, 0.0, 10.0),
+                    (2, 1.0, 20.0),
+                    (3, 2.0, 30.0),
+                    (4, 3.0, 40.0),
+                    (5, 4.0, 50.0),
+                    (6, 5.0, 60.0),
+                ],
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS __sequence_context (
@@ -4950,9 +5094,21 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(ws_prog.cell(2, headers["feed_temperature"]).value, 70)
                 self.assertEqual(str(ws_prog.cell(2, headers["feed_temperature_units"]).value or "").strip(), "F")
                 self.assertEqual(ws_prog.cell(2, headers["suppression_voltage"]).value, 24)
+                self.assertEqual(str(ws_prog.cell(2, headers["pulse_width_units"]).value or "").strip(), "sec")
+                self.assertEqual(ws_prog.cell(2, headers["off_time"]).value, 20)
+                self.assertEqual(str(ws_prog.cell(2, headers["off_time_units"]).value or "").strip(), "sec")
+                self.assertEqual(str(ws_prog.cell(2, headers["suppression_voltage_units"]).value or "").strip(), "V")
+                self.assertEqual(str(ws_prog.cell(2, headers["data_mode_raw"]).value or "").strip(), "Pulse Mode")
+                self.assertEqual(str(ws_prog.cell(2, headers["source_sheet_name"]).value or "").strip(), "RunA")
+                self.assertEqual(str(ws_prog.cell(2, headers["extraction_status"]).value or "").strip(), "ok")
 
                 ws_cond = wb["RunConditions"]
                 self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "100 psia, PM, 5 Sec ON / 20 Sec OFF")
+                cond_headers = self._sheet_header_map(ws_cond)
+                self.assertEqual(ws_cond.cell(2, cond_headers["off_time"]).value, 20)
+                self.assertEqual(str(ws_cond.cell(2, cond_headers["off_time_units"]).value or "").strip(), "sec")
+                self.assertEqual(str(ws_cond.cell(2, cond_headers["source_sheet_name"]).value or "").strip(), "RunA")
+                self.assertEqual(str(ws_cond.cell(2, cond_headers["extraction_status"]).value or "").strip(), "ok")
             finally:
                 wb.close()
 
@@ -5020,6 +5176,9 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "SS")
                 self.assertIsNone(ws_prog.cell(2, headers["pulse_width_on"]).value)
                 self.assertIsNone(ws_prog.cell(2, headers["control_period"]).value)
+                self.assertEqual(str(ws_prog.cell(2, headers["data_mode_raw"]).value or "").strip(), "Steady State")
+                self.assertEqual(str(ws_prog.cell(2, headers["source_sheet_name"]).value or "").strip(), "RunA")
+                self.assertEqual(str(ws_prog.cell(2, headers["extraction_status"]).value or "").strip(), "ok")
 
                 ws_cond = wb["RunConditions"]
                 self.assertEqual(str(ws_cond.cell(2, 1).value or "").strip(), "410 psia, SS")
@@ -9077,7 +9236,25 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.execute(
                     """
                     UPDATE td_raw_condition_observations
-                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    SET run_type=NULL,
+                        pulse_width=NULL,
+                        control_period=NULL,
+                        suppression_voltage=NULL,
+                        valve_voltage=NULL,
+                        condition_display=NULL,
+                        feed_pressure=NULL,
+                        feed_pressure_units='',
+                        feed_temperature=NULL,
+                        feed_temperature_units='',
+                        pulse_width_units='',
+                        off_time=NULL,
+                        off_time_units='',
+                        suppression_voltage_units='',
+                        valve_voltage_units='',
+                        data_mode_raw='',
+                        source_sheet_name='',
+                        extraction_status='',
+                        extraction_reason=''
                     """
                 )
                 conn.commit()
@@ -9085,13 +9262,49 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.execute(
                     """
                     UPDATE td_condition_observations
-                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    SET run_type=NULL,
+                        pulse_width=NULL,
+                        control_period=NULL,
+                        suppression_voltage=NULL,
+                        valve_voltage=NULL,
+                        condition_display=NULL,
+                        feed_pressure=NULL,
+                        feed_pressure_units='',
+                        feed_temperature=NULL,
+                        feed_temperature_units='',
+                        pulse_width_units='',
+                        off_time=NULL,
+                        off_time_units='',
+                        suppression_voltage_units='',
+                        valve_voltage_units='',
+                        data_mode_raw='',
+                        source_sheet_name='',
+                        extraction_status='',
+                        extraction_reason=''
                     """
                 )
                 conn.execute(
                     """
                     UPDATE td_condition_observations_sequences
-                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    SET run_type=NULL,
+                        pulse_width=NULL,
+                        control_period=NULL,
+                        suppression_voltage=NULL,
+                        valve_voltage=NULL,
+                        condition_display=NULL,
+                        feed_pressure=NULL,
+                        feed_pressure_units='',
+                        feed_temperature=NULL,
+                        feed_temperature_units='',
+                        pulse_width_units='',
+                        off_time=NULL,
+                        off_time_units='',
+                        suppression_voltage_units='',
+                        valve_voltage_units='',
+                        data_mode_raw='',
+                        source_sheet_name='',
+                        extraction_status='',
+                        extraction_reason=''
                     """
                 )
                 conn.commit()
@@ -9107,7 +9320,25 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             with sqlite3.connect(str(raw_db)) as conn:
                 raw_row = conn.execute(
-                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_raw_condition_observations"
+                    """
+                    SELECT
+                        run_type,
+                        pulse_width,
+                        control_period,
+                        suppression_voltage,
+                        valve_voltage,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        off_time,
+                        off_time_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status
+                    FROM td_raw_condition_observations
+                    """
                 ).fetchone()
             self.assertIsNotNone(raw_row)
             assert raw_row is not None
@@ -9116,13 +9347,59 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertAlmostEqual(float(raw_row[2] or 0.0), 2.0)
             self.assertAlmostEqual(float(raw_row[3] or 0.0), 20.0)
             self.assertAlmostEqual(float(raw_row[4] or 0.0), 28.0)
+            self.assertEqual(str(raw_row[5] or "").strip(), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+            self.assertAlmostEqual(float(raw_row[6] or 0.0), 257.0)
+            self.assertEqual(str(raw_row[7] or "").strip(), "psia")
+            self.assertAlmostEqual(float(raw_row[8] or 0.0), 70.0)
+            self.assertEqual(str(raw_row[9] or "").strip(), "F")
+            self.assertAlmostEqual(float(raw_row[10] or 0.0), 1.984)
+            self.assertEqual(str(raw_row[11] or "").strip(), "sec")
+            self.assertEqual(str(raw_row[12] or "").strip(), "Pulse Mode")
+            self.assertEqual(str(raw_row[13] or "").strip(), "RunA")
+            self.assertEqual(str(raw_row[14] or "").strip(), "ok")
 
             with sqlite3.connect(str(impl_db)) as conn:
                 obs_row = conn.execute(
-                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations"
+                    """
+                    SELECT
+                        run_type,
+                        pulse_width,
+                        control_period,
+                        suppression_voltage,
+                        valve_voltage,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        off_time,
+                        off_time_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status
+                    FROM td_condition_observations
+                    """
                 ).fetchone()
                 seq_row = conn.execute(
-                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations_sequences"
+                    """
+                    SELECT
+                        run_type,
+                        pulse_width,
+                        control_period,
+                        suppression_voltage,
+                        valve_voltage,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        off_time,
+                        off_time_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status
+                    FROM td_condition_observations_sequences
+                    """
                 ).fetchone()
             self.assertIsNotNone(obs_row)
             self.assertIsNotNone(seq_row)
@@ -9133,11 +9410,31 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertAlmostEqual(float(obs_row[2] or 0.0), 2.0)
             self.assertAlmostEqual(float(obs_row[3] or 0.0), 20.0)
             self.assertAlmostEqual(float(obs_row[4] or 0.0), 28.0)
+            self.assertEqual(str(obs_row[5] or "").strip(), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+            self.assertAlmostEqual(float(obs_row[6] or 0.0), 257.0)
+            self.assertEqual(str(obs_row[7] or "").strip(), "psia")
+            self.assertAlmostEqual(float(obs_row[8] or 0.0), 70.0)
+            self.assertEqual(str(obs_row[9] or "").strip(), "F")
+            self.assertAlmostEqual(float(obs_row[10] or 0.0), 1.984)
+            self.assertEqual(str(obs_row[11] or "").strip(), "sec")
+            self.assertEqual(str(obs_row[12] or "").strip(), "Pulse Mode")
+            self.assertEqual(str(obs_row[13] or "").strip(), "RunA")
+            self.assertEqual(str(obs_row[14] or "").strip(), "ok")
             self.assertEqual(str(seq_row[0] or "").strip(), "PM")
             self.assertAlmostEqual(float(seq_row[1] or 0.0), 0.016)
             self.assertAlmostEqual(float(seq_row[2] or 0.0), 2.0)
             self.assertAlmostEqual(float(seq_row[3] or 0.0), 20.0)
             self.assertAlmostEqual(float(seq_row[4] or 0.0), 28.0)
+            self.assertEqual(str(seq_row[5] or "").strip(), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+            self.assertAlmostEqual(float(seq_row[6] or 0.0), 257.0)
+            self.assertEqual(str(seq_row[7] or "").strip(), "psia")
+            self.assertAlmostEqual(float(seq_row[8] or 0.0), 70.0)
+            self.assertEqual(str(seq_row[9] or "").strip(), "F")
+            self.assertAlmostEqual(float(seq_row[10] or 0.0), 1.984)
+            self.assertEqual(str(seq_row[11] or "").strip(), "sec")
+            self.assertEqual(str(seq_row[12] or "").strip(), "Pulse Mode")
+            self.assertEqual(str(seq_row[13] or "").strip(), "RunA")
+            self.assertEqual(str(seq_row[14] or "").strip(), "ok")
 
     def test_cache_state_requests_calc_when_impl_condition_metadata_drops(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -9167,13 +9464,49 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 conn.execute(
                     """
                     UPDATE td_condition_observations
-                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    SET run_type=NULL,
+                        pulse_width=NULL,
+                        control_period=NULL,
+                        suppression_voltage=NULL,
+                        valve_voltage=NULL,
+                        condition_display=NULL,
+                        feed_pressure=NULL,
+                        feed_pressure_units='',
+                        feed_temperature=NULL,
+                        feed_temperature_units='',
+                        pulse_width_units='',
+                        off_time=NULL,
+                        off_time_units='',
+                        suppression_voltage_units='',
+                        valve_voltage_units='',
+                        data_mode_raw='',
+                        source_sheet_name='',
+                        extraction_status='',
+                        extraction_reason=''
                     """
                 )
                 conn.execute(
                     """
                     UPDATE td_condition_observations_sequences
-                    SET run_type=NULL, pulse_width=NULL, control_period=NULL, suppression_voltage=NULL, valve_voltage=NULL
+                    SET run_type=NULL,
+                        pulse_width=NULL,
+                        control_period=NULL,
+                        suppression_voltage=NULL,
+                        valve_voltage=NULL,
+                        condition_display=NULL,
+                        feed_pressure=NULL,
+                        feed_pressure_units='',
+                        feed_temperature=NULL,
+                        feed_temperature_units='',
+                        pulse_width_units='',
+                        off_time=NULL,
+                        off_time_units='',
+                        suppression_voltage_units='',
+                        valve_voltage_units='',
+                        data_mode_raw='',
+                        source_sheet_name='',
+                        extraction_status='',
+                        extraction_reason=''
                     """
                 )
                 conn.commit()
@@ -9190,10 +9523,46 @@ class TestTDSupportWorkbook(unittest.TestCase):
 
             with sqlite3.connect(str(impl_db)) as conn:
                 obs_row = conn.execute(
-                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations"
+                    """
+                    SELECT
+                        run_type,
+                        pulse_width,
+                        control_period,
+                        suppression_voltage,
+                        valve_voltage,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        off_time,
+                        off_time_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status
+                    FROM td_condition_observations
+                    """
                 ).fetchone()
                 seq_row = conn.execute(
-                    "SELECT run_type, pulse_width, control_period, suppression_voltage, valve_voltage FROM td_condition_observations_sequences"
+                    """
+                    SELECT
+                        run_type,
+                        pulse_width,
+                        control_period,
+                        suppression_voltage,
+                        valve_voltage,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        off_time,
+                        off_time_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status
+                    FROM td_condition_observations_sequences
+                    """
                 ).fetchone()
             self.assertIsNotNone(obs_row)
             self.assertIsNotNone(seq_row)
@@ -9204,11 +9573,31 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertAlmostEqual(float(obs_row[2] or 0.0), 2.0)
             self.assertAlmostEqual(float(obs_row[3] or 0.0), 20.0)
             self.assertAlmostEqual(float(obs_row[4] or 0.0), 28.0)
+            self.assertEqual(str(obs_row[5] or "").strip(), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+            self.assertAlmostEqual(float(obs_row[6] or 0.0), 257.0)
+            self.assertEqual(str(obs_row[7] or "").strip(), "psia")
+            self.assertAlmostEqual(float(obs_row[8] or 0.0), 70.0)
+            self.assertEqual(str(obs_row[9] or "").strip(), "F")
+            self.assertAlmostEqual(float(obs_row[10] or 0.0), 1.984)
+            self.assertEqual(str(obs_row[11] or "").strip(), "sec")
+            self.assertEqual(str(obs_row[12] or "").strip(), "Pulse Mode")
+            self.assertEqual(str(obs_row[13] or "").strip(), "RunA")
+            self.assertEqual(str(obs_row[14] or "").strip(), "ok")
             self.assertEqual(str(seq_row[0] or "").strip(), "PM")
             self.assertAlmostEqual(float(seq_row[1] or 0.0), 0.016)
             self.assertAlmostEqual(float(seq_row[2] or 0.0), 2.0)
             self.assertAlmostEqual(float(seq_row[3] or 0.0), 20.0)
             self.assertAlmostEqual(float(seq_row[4] or 0.0), 28.0)
+            self.assertEqual(str(seq_row[5] or "").strip(), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+            self.assertAlmostEqual(float(seq_row[6] or 0.0), 257.0)
+            self.assertEqual(str(seq_row[7] or "").strip(), "psia")
+            self.assertAlmostEqual(float(seq_row[8] or 0.0), 70.0)
+            self.assertEqual(str(seq_row[9] or "").strip(), "F")
+            self.assertAlmostEqual(float(seq_row[10] or 0.0), 1.984)
+            self.assertEqual(str(seq_row[11] or "").strip(), "sec")
+            self.assertEqual(str(seq_row[12] or "").strip(), "Pulse Mode")
+            self.assertEqual(str(seq_row[13] or "").strip(), "RunA")
+            self.assertEqual(str(seq_row[14] or "").strip(), "ok")
 
     def test_cache_state_allows_blank_aggregate_fields_when_sequence_values_conflict(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
@@ -9299,6 +9688,233 @@ class TestTDSupportWorkbook(unittest.TestCase):
             payload = be.sync_test_data_project_cache(root, wb_path, rebuild=False)
             self.assertEqual(str(payload.get("mode") or ""), "noop")
             self.assertEqual(str(payload.get("reason") or ""), "")
+
+    def test_project_cache_propagates_full_sequence_context_payload_and_run_condition_label(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            paths = self._build_project_cache_from_sequence_context(
+                root,
+                run_type="PM",
+                on_time_value=0.016,
+                on_time_units="sec",
+                off_time_value=1.984,
+                off_time_units="sec",
+                nominal_pf_value=257.0,
+                nominal_pf_units="psia",
+                nominal_tf_value=70.0,
+                nominal_tf_units="F",
+                suppression_voltage_value=20.0,
+                suppression_voltage_units="V",
+                valve_voltage_value=28.0,
+                valve_voltage_units="V",
+            )
+            impl_db = paths["impl_db"]
+            raw_db = paths["raw_db"]
+            wb_path = paths["wb_path"]
+            expected_label = "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF"
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                run_row = conn.execute(
+                    """
+                    SELECT
+                        display_name,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        pulse_width_units,
+                        off_time,
+                        off_time_units,
+                        suppression_voltage,
+                        suppression_voltage_units,
+                        valve_voltage,
+                        valve_voltage_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status,
+                        extraction_reason
+                    FROM td_runs
+                    """
+                ).fetchone()
+                seq_row = conn.execute(
+                    """
+                    SELECT
+                        source_run_name,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        pulse_width_units,
+                        off_time,
+                        off_time_units,
+                        suppression_voltage,
+                        suppression_voltage_units,
+                        valve_voltage,
+                        valve_voltage_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status,
+                        extraction_reason
+                    FROM td_condition_observations_sequences
+                    """
+                ).fetchone()
+            with sqlite3.connect(str(raw_db)) as conn:
+                raw_row = conn.execute(
+                    """
+                    SELECT
+                        source_run_name,
+                        condition_display,
+                        feed_pressure,
+                        feed_pressure_units,
+                        feed_temperature,
+                        feed_temperature_units,
+                        pulse_width_units,
+                        off_time,
+                        off_time_units,
+                        suppression_voltage,
+                        suppression_voltage_units,
+                        valve_voltage,
+                        valve_voltage_units,
+                        data_mode_raw,
+                        source_sheet_name,
+                        extraction_status,
+                        extraction_reason
+                    FROM td_raw_condition_observations
+                    """
+                ).fetchone()
+
+            self.assertIsNotNone(run_row)
+            self.assertIsNotNone(seq_row)
+            self.assertIsNotNone(raw_row)
+            assert run_row is not None
+            assert seq_row is not None
+            assert raw_row is not None
+            self.assertEqual(str(run_row[0] or "").strip(), expected_label)
+            self.assertEqual(str(run_row[1] or "").strip(), expected_label)
+            self.assertAlmostEqual(float(run_row[2] or 0.0), 257.0)
+            self.assertEqual(str(run_row[3] or "").strip(), "psia")
+            self.assertAlmostEqual(float(run_row[4] or 0.0), 70.0)
+            self.assertEqual(str(run_row[5] or "").strip(), "F")
+            self.assertEqual(str(run_row[6] or "").strip(), "sec")
+            self.assertAlmostEqual(float(run_row[7] or 0.0), 1.984)
+            self.assertEqual(str(run_row[8] or "").strip(), "sec")
+            self.assertAlmostEqual(float(run_row[9] or 0.0), 20.0)
+            self.assertEqual(str(run_row[10] or "").strip(), "V")
+            self.assertAlmostEqual(float(run_row[11] or 0.0), 28.0)
+            self.assertEqual(str(run_row[12] or "").strip(), "V")
+            self.assertEqual(str(run_row[13] or "").strip(), "Pulse Mode")
+            self.assertEqual(str(run_row[14] or "").strip(), "RunA")
+            self.assertEqual(str(run_row[15] or "").strip(), "ok")
+            self.assertEqual(str(run_row[16] or "").strip(), "")
+
+            self.assertEqual(str(seq_row[0] or "").strip(), "RunA")
+            self.assertEqual(str(seq_row[1] or "").strip(), expected_label)
+            self.assertAlmostEqual(float(seq_row[2] or 0.0), 257.0)
+            self.assertEqual(str(raw_row[0] or "").strip(), "RunA")
+            self.assertEqual(str(raw_row[1] or "").strip(), expected_label)
+            self.assertAlmostEqual(float(raw_row[2] or 0.0), 257.0)
+
+            selection_views = be.td_list_run_selection_views(impl_db, wb_path)
+            self.assertEqual([item.get("display_text") for item in selection_views.get("condition") or []], [expected_label])
+            self.assertEqual([item.get("run_condition") for item in selection_views.get("sequence") or []], [expected_label])
+
+    def test_update_workbook_exports_raw_cache_payload_and_synthesizes_sequence_context_feed_metrics(self) -> None:
+        from openpyxl import Workbook, load_workbook  # type: ignore
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            src_db = root / "src.sqlite3"
+            self._make_source_sqlite_without_feed_columns_with_sequence_context(
+                src_db,
+                run_type="PM",
+                on_time_value=0.016,
+                on_time_units="sec",
+                off_time_value=1.984,
+                off_time_units="sec",
+                nominal_pf_value=257.0,
+                nominal_pf_units="psia",
+                nominal_tf_value=70.0,
+                nominal_tf_units="F",
+                suppression_voltage_value=20.0,
+                suppression_voltage_units="V",
+                valve_voltage_value=28.0,
+                valve_voltage_units="V",
+            )
+            wb_path = root / "project.xlsx"
+            Workbook().save(str(wb_path))
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": str(src_db), "program_title": "P267"}],
+                config=self._make_config(),
+            )
+            support_path = be.td_support_workbook_path_for(wb_path, project_dir=root)
+            be._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+                program_titles=["P267"],
+                sequences_by_program={"P267": ["RunA"]},
+            )
+
+            result = be.update_test_data_trending_project_workbook(root, wb_path, overwrite=True)
+            impl_db = root / "implementation_trending.sqlite3"
+            self.assertTrue(Path(str(result.get("implementation_excel") or "")).exists())
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                calc_names = {
+                    str(row[0] or "").strip().lower()
+                    for row in conn.execute("SELECT name FROM td_columns_calc ORDER BY name").fetchall()
+                }
+            self.assertIn("feed pressure", calc_names)
+            self.assertIn("feed temperature", calc_names)
+
+            wb = load_workbook(str(wb_path), read_only=True, data_only=True)
+            try:
+                ws_raw = wb["RawCache_long"]
+                raw_headers = self._sheet_header_map(ws_raw)
+                self.assertEqual(str(ws_raw.cell(2, raw_headers["condition_display"]).value or "").strip(), "257 psia, PM, 0.016 Sec ON / 1.984 Sec OFF")
+                self.assertAlmostEqual(float(ws_raw.cell(2, raw_headers["feed_pressure"]).value or 0.0), 257.0)
+                self.assertEqual(str(ws_raw.cell(2, raw_headers["feed_pressure_units"]).value or "").strip(), "psia")
+                self.assertAlmostEqual(float(ws_raw.cell(2, raw_headers["feed_temperature"]).value or 0.0), 70.0)
+                self.assertEqual(str(ws_raw.cell(2, raw_headers["feed_temperature_units"]).value or "").strip(), "F")
+                self.assertAlmostEqual(float(ws_raw.cell(2, raw_headers["off_time"]).value or 0.0), 1.984)
+                self.assertEqual(str(ws_raw.cell(2, raw_headers["extraction_status"]).value or "").strip(), "ok")
+
+                ws_metrics = wb["Metrics_long"]
+                metric_headers = self._sheet_header_map(ws_metrics)
+                metric_rows = [
+                    {
+                        "parameter_name": str(ws_metrics.cell(r, metric_headers["parameter_name"]).value or "").strip(),
+                        "value_num": ws_metrics.cell(r, metric_headers["value_num"]).value,
+                    }
+                    for r in range(2, (ws_metrics.max_row or 0) + 1)
+                ]
+                self.assertIn("feed pressure", {row["parameter_name"] for row in metric_rows})
+                self.assertIn("feed temperature", {row["parameter_name"] for row in metric_rows})
+            finally:
+                wb.close()
+
+    def test_project_cache_does_not_duplicate_measured_feed_pressure_metric(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            paths = self._build_project_cache_from_sequence_context(root)
+            impl_db = paths["impl_db"]
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM td_columns_calc WHERE LOWER(name)=LOWER('feed pressure')"
+                    ).fetchone()[0]
+                    or 0
+                )
+            self.assertEqual(count, 1)
 
     def test_rebuild_populates_impl_curve_plotter_tables_and_curves_survive_raw_cache_removal(self) -> None:
         from openpyxl import load_workbook  # type: ignore
@@ -12897,7 +13513,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         self.assertEqual(fit_error_text, "")
         mean_result = results.get("mean") or {}
         self.assertEqual(mean_result.get("performance_plot_method"), "cached_condition_means")
-        self.assertEqual(mean_result.get("curves"), {"SN1": [(1.0, 10.0, "Display RunA | Program A | Source A")]})
+        self.assertEqual(mean_result.get("curves"), {"SN1": [(1.0, 10.0, "Display RunA")]})
         rows = mean_result.get("regression_checker_rows") or []
         self.assertEqual(len(rows), 1)
         self.assertEqual(
@@ -12910,7 +13526,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 "source_run_name": "Source A",
                 "control_period": 60.0,
                 "suppression_voltage": 24.0,
-                "condition_label": "Display RunA | Program A | Source A",
+                "condition_label": "Display RunA",
                 "serial": "SN1",
                 "input_1": 1.0,
                 "input_2": None,
@@ -12939,17 +13555,17 @@ class TestTDSupportWorkbook(unittest.TestCase):
             mean_result.get("points_3d"),
             {
                 "SN1": [
-                    (1.0, 1.0, 10.0, "Display RunA | Program A | Source A"),
-                    (1.0, 2.0, 12.0, "Display RunA | Program A | Source A"),
-                    (2.0, 1.0, 14.0, "Display RunA | Program A | Source A"),
-                    (2.0, 2.0, 16.0, "Display RunA | Program A | Source A"),
+                    (1.0, 1.0, 10.0, "Display RunA"),
+                    (1.0, 2.0, 12.0, "Display RunA"),
+                    (2.0, 1.0, 14.0, "Display RunA"),
+                    (2.0, 2.0, 16.0, "Display RunA"),
                 ]
             },
         )
         rows = mean_result.get("regression_checker_rows") or []
         self.assertEqual(len(rows), 4)
         self.assertEqual(rows[0].get("observation_id"), "obs1")
-        self.assertEqual(rows[0].get("condition_label"), "Display RunA | Program A | Source A")
+        self.assertEqual(rows[0].get("condition_label"), "Display RunA")
         self.assertEqual(rows[0].get("input_1"), 1.0)
         self.assertEqual(rows[0].get("input_2"), 1.0)
         self.assertEqual(rows[0].get("actual_mean"), 10.0)

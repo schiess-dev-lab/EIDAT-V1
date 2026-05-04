@@ -3134,7 +3134,7 @@ GLOBAL_RUN_MIRROR_DIRNAME = "global_run_mirror"
 LOCAL_PROJECTS_MIRROR_DIRNAME = "projects"
 PROJECT_UPDATE_DEBUG_JSON = "update_debug.json"
 TD_CACHE_DEBUG_JSON = "td_cache_debug.json"
-TD_PROJECT_CACHE_SCHEMA_VERSION = "7"
+TD_PROJECT_CACHE_SCHEMA_VERSION = "8"
 TD_LIFE_METRICS_TABLE = "td_life_metrics"
 TD_PLOTTER_SEQUENCES_TABLE = "td_plotter_sequences"
 TD_PLOTTER_CURVE_CATALOG_TABLE = "td_plotter_curve_catalog"
@@ -3337,6 +3337,43 @@ def _td_raw_curve_table_name(run_name: str, parameter_name: str) -> str:
     return f"td_raw__{_td_norm_ident_token(run_name)}__{_td_norm_ident_token(parameter_name)}"
 
 
+TD_RUN_CONDITION_METADATA_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
+    ("condition_display", "TEXT"),
+    ("feed_pressure", "REAL"),
+    ("feed_pressure_units", "TEXT"),
+    ("feed_temperature", "REAL"),
+    ("feed_temperature_units", "TEXT"),
+    ("pulse_width_units", "TEXT"),
+    ("off_time", "REAL"),
+    ("off_time_units", "TEXT"),
+    ("suppression_voltage", "REAL"),
+    ("suppression_voltage_units", "TEXT"),
+    ("valve_voltage", "REAL"),
+    ("valve_voltage_units", "TEXT"),
+    ("data_mode_raw", "TEXT"),
+    ("source_sheet_name", "TEXT"),
+    ("extraction_status", "TEXT"),
+    ("extraction_reason", "TEXT"),
+)
+
+TD_OBSERVATION_CONDITION_METADATA_COLUMN_SPECS: tuple[tuple[str, str], ...] = (
+    ("condition_display", "TEXT"),
+    ("feed_pressure", "REAL"),
+    ("feed_pressure_units", "TEXT"),
+    ("feed_temperature", "REAL"),
+    ("feed_temperature_units", "TEXT"),
+    ("pulse_width_units", "TEXT"),
+    ("off_time", "REAL"),
+    ("off_time_units", "TEXT"),
+    ("suppression_voltage_units", "TEXT"),
+    ("valve_voltage_units", "TEXT"),
+    ("data_mode_raw", "TEXT"),
+    ("source_sheet_name", "TEXT"),
+    ("extraction_status", "TEXT"),
+    ("extraction_reason", "TEXT"),
+)
+
+
 def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -3356,6 +3393,22 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
             pulse_width REAL,
             run_type TEXT,
             control_period REAL,
+            condition_display TEXT,
+            feed_pressure REAL,
+            feed_pressure_units TEXT,
+            feed_temperature REAL,
+            feed_temperature_units TEXT,
+            pulse_width_units TEXT,
+            off_time REAL,
+            off_time_units TEXT,
+            suppression_voltage REAL,
+            suppression_voltage_units TEXT,
+            valve_voltage REAL,
+            valve_voltage_units TEXT,
+            data_mode_raw TEXT,
+            source_sheet_name TEXT,
+            extraction_status TEXT,
+            extraction_reason TEXT,
             computed_epoch_ns INTEGER NOT NULL
         )
         """
@@ -3372,6 +3425,11 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE td_raw_sequences ADD COLUMN control_period REAL")
     except Exception:
         pass
+    for column_name, column_sql in TD_RUN_CONDITION_METADATA_COLUMN_SPECS:
+        try:
+            conn.execute(f"ALTER TABLE td_raw_sequences ADD COLUMN {column_name} {column_sql}")
+        except Exception:
+            pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_raw_condition_observations (
@@ -3385,6 +3443,20 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
             control_period REAL,
             suppression_voltage REAL,
             valve_voltage REAL,
+            condition_display TEXT,
+            feed_pressure REAL,
+            feed_pressure_units TEXT,
+            feed_temperature REAL,
+            feed_temperature_units TEXT,
+            pulse_width_units TEXT,
+            off_time REAL,
+            off_time_units TEXT,
+            suppression_voltage_units TEXT,
+            valve_voltage_units TEXT,
+            data_mode_raw TEXT,
+            source_sheet_name TEXT,
+            extraction_status TEXT,
+            extraction_reason TEXT,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
@@ -3398,6 +3470,11 @@ def _ensure_test_data_raw_cache_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE td_raw_condition_observations ADD COLUMN valve_voltage REAL")
     except Exception:
         pass
+    for column_name, column_sql in TD_OBSERVATION_CONDITION_METADATA_COLUMN_SPECS:
+        try:
+            conn.execute(f"ALTER TABLE td_raw_condition_observations ADD COLUMN {column_name} {column_sql}")
+        except Exception:
+            pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_raw_curve_catalog (
@@ -7322,7 +7399,23 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             display_name TEXT,
             run_type TEXT,
             control_period REAL,
-            pulse_width REAL
+            pulse_width REAL,
+            condition_display TEXT,
+            feed_pressure REAL,
+            feed_pressure_units TEXT,
+            feed_temperature REAL,
+            feed_temperature_units TEXT,
+            pulse_width_units TEXT,
+            off_time REAL,
+            off_time_units TEXT,
+            suppression_voltage REAL,
+            suppression_voltage_units TEXT,
+            valve_voltage REAL,
+            valve_voltage_units TEXT,
+            data_mode_raw TEXT,
+            source_sheet_name TEXT,
+            extraction_status TEXT,
+            extraction_reason TEXT
         )
         """
     )
@@ -7343,6 +7436,11 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE td_runs ADD COLUMN pulse_width REAL")
     except Exception:
         pass
+    for column_name, column_sql in TD_RUN_CONDITION_METADATA_COLUMN_SPECS:
+        try:
+            conn.execute(f"ALTER TABLE td_runs ADD COLUMN {column_name} {column_sql}")
+        except Exception:
+            pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_condition_observations (
@@ -7356,6 +7454,20 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             control_period REAL,
             suppression_voltage REAL,
             valve_voltage REAL,
+            condition_display TEXT,
+            feed_pressure REAL,
+            feed_pressure_units TEXT,
+            feed_temperature REAL,
+            feed_temperature_units TEXT,
+            pulse_width_units TEXT,
+            off_time REAL,
+            off_time_units TEXT,
+            suppression_voltage_units TEXT,
+            valve_voltage_units TEXT,
+            data_mode_raw TEXT,
+            source_sheet_name TEXT,
+            extraction_status TEXT,
+            extraction_reason TEXT,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
@@ -7369,6 +7481,11 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE td_condition_observations ADD COLUMN valve_voltage REAL")
     except Exception:
         pass
+    for column_name, column_sql in TD_OBSERVATION_CONDITION_METADATA_COLUMN_SPECS:
+        try:
+            conn.execute(f"ALTER TABLE td_condition_observations ADD COLUMN {column_name} {column_sql}")
+        except Exception:
+            pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_condition_observations_sequences (
@@ -7382,6 +7499,20 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
             control_period REAL,
             suppression_voltage REAL,
             valve_voltage REAL,
+            condition_display TEXT,
+            feed_pressure REAL,
+            feed_pressure_units TEXT,
+            feed_temperature REAL,
+            feed_temperature_units TEXT,
+            pulse_width_units TEXT,
+            off_time REAL,
+            off_time_units TEXT,
+            suppression_voltage_units TEXT,
+            valve_voltage_units TEXT,
+            data_mode_raw TEXT,
+            source_sheet_name TEXT,
+            extraction_status TEXT,
+            extraction_reason TEXT,
             source_mtime_ns INTEGER,
             computed_epoch_ns INTEGER NOT NULL
         )
@@ -7395,6 +7526,11 @@ def _ensure_test_data_impl_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE td_condition_observations_sequences ADD COLUMN valve_voltage REAL")
     except Exception:
         pass
+    for column_name, column_sql in TD_OBSERVATION_CONDITION_METADATA_COLUMN_SPECS:
+        try:
+            conn.execute(f"ALTER TABLE td_condition_observations_sequences ADD COLUMN {column_name} {column_sql}")
+        except Exception:
+            pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS td_columns_calc (
@@ -10256,7 +10392,7 @@ def _td_sequence_context_support_fields(row: Mapping[str, object] | None) -> dic
         off_time_value = _td_finite_float(row.get("off_time_value"))
         if on_time_value is not None and off_time_value is not None:
             control_period = float(on_time_value) + float(off_time_value)
-    return {
+    payload = {
         "feed_pressure": row.get("nominal_pf_value"),
         "feed_pressure_units": str(row.get("nominal_pf_units") or "").strip(),
         "feed_temperature": row.get("nominal_tf_value"),
@@ -10264,11 +10400,24 @@ def _td_sequence_context_support_fields(row: Mapping[str, object] | None) -> dic
         "run_type": td_normalize_run_type(row.get("run_type")),
         "pulse_width": row.get("on_time_value"),
         "pulse_width_on": row.get("on_time_value"),
+        "pulse_width_units": str(row.get("on_time_units") or "").strip(),
         "off_time": row.get("off_time_value"),
+        "off_time_units": str(row.get("off_time_units") or "").strip(),
         "control_period": control_period,
         "suppression_voltage": row.get("suppression_voltage_value"),
+        "suppression_voltage_units": str(row.get("suppression_voltage_units") or "").strip(),
         "valve_voltage": row.get("valve_voltage_value"),
+        "valve_voltage_units": str(row.get("valve_voltage_units") or "").strip(),
+        "data_mode_raw": str(row.get("data_mode_raw") or "").strip(),
+        "source_sheet_name": str(row.get("source_sheet_name") or "").strip(),
+        "extraction_status": str(row.get("extraction_status") or "").strip(),
+        "extraction_reason": str(row.get("extraction_reason") or "").strip(),
     }
+    payload["condition_display"] = (
+        td_build_run_condition_label(dict(payload))
+        or _td_sequence_context_source_label(row, source_run_name=row.get("sheet_name"))
+    )
+    return payload
 
 
 def _td_sequence_context_source_label(
@@ -12419,6 +12568,7 @@ def _td_support_program_row_defaults(source_run_name: object, *, program_title: 
         "source_run_name": source,
         "condition_key": source,
         "display_name": source,
+        "source_sheet_name": "",
         "feed_pressure": None,
         "feed_pressure_units": "",
         "feed_temperature": None,
@@ -12426,16 +12576,82 @@ def _td_support_program_row_defaults(source_run_name: object, *, program_title: 
         "run_type": "",
         "pulse_width": None,
         "pulse_width_on": None,
+        "pulse_width_units": "",
+        "off_time": None,
+        "off_time_units": "",
         "control_period": None,
         "suppression_voltage": None,
+        "suppression_voltage_units": "",
         "valve_voltage": None,
+        "valve_voltage_units": "",
+        "data_mode_raw": "",
+        "extraction_status": "",
+        "extraction_reason": "",
         "exclude_first_n": None,
         "last_n_rows": None,
         "enabled": True,
     }
 
 
-def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str]:
+TD_SUPPORT_PROGRAM_ROW_HEADERS = [
+    "source_run_name",
+    "condition_key",
+    "display_name",
+    "feed_pressure",
+    "feed_pressure_units",
+    "run_type",
+    "pulse_width_on",
+    "pulse_width_units",
+    "off_time",
+    "off_time_units",
+    "control_period",
+    "exclude_first_n",
+    "last_n_rows",
+    "enabled",
+    "feed_temperature",
+    "feed_temperature_units",
+    "suppression_voltage",
+    "suppression_voltage_units",
+    "valve_voltage",
+    "valve_voltage_units",
+    "data_mode_raw",
+    "source_sheet_name",
+    "extraction_status",
+    "extraction_reason",
+]
+
+TD_SUPPORT_RUN_CONDITIONS_HEADERS = [
+    "condition_key",
+    "display_name",
+    "feed_pressure",
+    "feed_pressure_units",
+    "run_type",
+    "pulse_width_on",
+    "pulse_width_units",
+    "off_time",
+    "off_time_units",
+    "control_period",
+    "feed_temperature",
+    "feed_temperature_units",
+    "suppression_voltage",
+    "suppression_voltage_units",
+    "valve_voltage",
+    "valve_voltage_units",
+    "data_mode_raw",
+    "source_sheet_name",
+    "extraction_status",
+    "extraction_reason",
+    "member_sequences",
+    "member_programs",
+    "parameter_name",
+    "units",
+    "min_value",
+    "max_value",
+    "enabled",
+]
+
+
+def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str]:
     return (
         _td_format_compact_value(row.get("feed_pressure")).lower(),
         str(row.get("feed_pressure_units") or "").strip().lower(),
@@ -12443,6 +12659,7 @@ def _td_condition_identity_parts(row: Mapping[str, object]) -> tuple[str, str, s
         str(row.get("feed_temperature_units") or "").strip().lower(),
         td_normalize_run_type(row.get("run_type")).lower(),
         _td_format_compact_value(row.get("pulse_width_on", row.get("pulse_width"))).lower(),
+        _td_format_compact_value(row.get("off_time")).lower(),
         _td_format_compact_value(row.get("control_period")).lower(),
     )
 
@@ -12467,6 +12684,7 @@ def _td_condition_base_key(row: Mapping[str, object]) -> str:
             str(row.get("feed_pressure_units") or "").strip(),
             td_normalize_run_type(row.get("run_type")),
             _td_format_compact_value(_td_support_sequence_pulse_width(row)),
+            _td_format_compact_value(row.get("off_time")),
             _td_format_compact_value(row.get("control_period")),
         ]
         joined = "_".join([p for p in parts if str(p).strip()])
@@ -12476,7 +12694,7 @@ def _td_condition_base_key(row: Mapping[str, object]) -> str:
     return explicit or source_run_name
 
 
-def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str]:
+def _td_support_condition_group_identity(row: Mapping[str, object]) -> tuple[str, str, str, str, str, str, str, str, str]:
     condition_parts = _td_condition_identity_parts(row)
     if any(bool(part) for part in condition_parts):
         return ("",) + condition_parts
@@ -12498,12 +12716,35 @@ def _td_distinct_condition_values(rows: Sequence[Mapping[str, object]], field_na
     return list(values_by_key.values())
 
 
+TD_SUPPORT_GROUP_UNIQUE_FIELDS = (
+    "feed_pressure",
+    "feed_pressure_units",
+    "feed_temperature",
+    "feed_temperature_units",
+    "run_type",
+    "pulse_width",
+    "pulse_width_on",
+    "pulse_width_units",
+    "off_time",
+    "off_time_units",
+    "control_period",
+    "suppression_voltage",
+    "suppression_voltage_units",
+    "valve_voltage",
+    "valve_voltage_units",
+    "data_mode_raw",
+    "source_sheet_name",
+    "extraction_status",
+    "extraction_reason",
+)
+
+
 def _td_group_program_rows_into_conditions(
     rows: Sequence[Mapping[str, object]],
     *,
     diagnostics: dict[str, int] | None = None,
 ) -> list[dict]:
-    grouped: dict[tuple[str, str, str, str, str, str, str, str], dict] = {}
+    grouped: dict[tuple[str, str, str, str, str, str, str, str, str], dict] = {}
     diag = diagnostics if isinstance(diagnostics, dict) else None
     if diag is not None:
         diag.clear()
@@ -12567,9 +12808,18 @@ def _td_group_program_rows_into_conditions(
                 "run_type": str(raw_row.get("run_type") or "").strip(),
                 "pulse_width": raw_row.get("pulse_width_on", raw_row.get("pulse_width")),
                 "pulse_width_on": raw_row.get("pulse_width_on", raw_row.get("pulse_width")),
+                "pulse_width_units": str(raw_row.get("pulse_width_units") or "").strip(),
+                "off_time": raw_row.get("off_time"),
+                "off_time_units": str(raw_row.get("off_time_units") or "").strip(),
                 "control_period": raw_row.get("control_period"),
                 "suppression_voltage": raw_row.get("suppression_voltage"),
+                "suppression_voltage_units": str(raw_row.get("suppression_voltage_units") or "").strip(),
                 "valve_voltage": raw_row.get("valve_voltage"),
+                "valve_voltage_units": str(raw_row.get("valve_voltage_units") or "").strip(),
+                "data_mode_raw": str(raw_row.get("data_mode_raw") or "").strip(),
+                "source_sheet_name": str(raw_row.get("source_sheet_name") or "").strip(),
+                "extraction_status": str(raw_row.get("extraction_status") or "").strip(),
+                "extraction_reason": str(raw_row.get("extraction_reason") or "").strip(),
                 "member_rows": [],
                 "member_sequences": [],
                 "member_programs": [],
@@ -12612,11 +12862,18 @@ def _td_group_program_rows_into_conditions(
                 str(group.get("feed_temperature_units") or "").strip(),
                 td_normalize_run_type(group.get("run_type")),
                 _td_format_compact_value(group.get("pulse_width_on")),
+                _td_format_compact_value(group.get("off_time")),
                 _td_format_compact_value(group.get("control_period")),
             ]
             suffix = re.sub(r"[^A-Za-z0-9]+", "_", "_".join([p for p in suffix_parts if str(p).strip()])).strip("_")
             group["condition_key"] = f"{base_key}_{suffix or str(dup_count + 1)}"
         member_rows = [dict(row) for row in (group.get("member_rows") or []) if isinstance(row, Mapping)]
+        for field_name in TD_SUPPORT_GROUP_UNIQUE_FIELDS:
+            distinct_values = _td_distinct_condition_values(member_rows, field_name)
+            if len(distinct_values) == 1:
+                group[field_name] = distinct_values[0]
+            elif distinct_values:
+                group[field_name] = None
         member_suppression_voltages = _td_distinct_condition_values(member_rows, "suppression_voltage")
         member_valve_voltages = _td_distinct_condition_values(member_rows, "valve_voltage")
         group["suppression_voltage"] = member_suppression_voltages[0] if len(member_suppression_voltages) == 1 else None
@@ -12733,46 +12990,10 @@ def _write_td_support_workbook(
 
     for idx, title in enumerate(programs):
         ws_prog = wb.create_sheet(_td_support_program_sheet_name(title, idx))
-        ws_prog.append(
-            [
-                "source_run_name",
-                "condition_key",
-                "display_name",
-                "feed_pressure",
-                "feed_pressure_units",
-                "run_type",
-                "pulse_width_on",
-                "control_period",
-                "exclude_first_n",
-                "last_n_rows",
-                "enabled",
-                "feed_temperature",
-                "feed_temperature_units",
-                "suppression_voltage",
-                "valve_voltage",
-            ]
-        )
+        ws_prog.append(list(TD_SUPPORT_PROGRAM_ROW_HEADERS))
         for seq_name in (program_sequence_map.get(title) or []):
             row = _td_support_program_row_defaults(seq_name, program_title=title)
-            ws_prog.append(
-                [
-                    row["source_run_name"],
-                    row["condition_key"],
-                    row["display_name"],
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    True,
-                    "",
-                    "",
-                    "",
-                    "",
-                ]
-            )
+            ws_prog.append([row.get(header) for header in TD_SUPPORT_PROGRAM_ROW_HEADERS])
 
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(path))
@@ -12824,26 +13045,7 @@ def _refresh_td_support_run_conditions_sheet(
         for d in param_defs
         if str(d.get("name") or "").strip()
     }
-    headers = [
-        "condition_key",
-        "display_name",
-        "feed_pressure",
-        "feed_pressure_units",
-        "run_type",
-        "pulse_width_on",
-        "control_period",
-        "member_sequences",
-        "member_programs",
-        "parameter_name",
-        "units",
-        "min_value",
-        "max_value",
-        "enabled",
-        "feed_temperature",
-        "feed_temperature_units",
-        "suppression_voltage",
-        "valve_voltage",
-    ]
+    headers = list(TD_SUPPORT_RUN_CONDITIONS_HEADERS)
     desired_rows: list[list[object]] = []
     rows_written = 0
     for row in run_conditions:
@@ -12870,7 +13072,20 @@ def _refresh_td_support_run_conditions_sheet(
                     str(row.get("feed_pressure_units") or "").strip(),
                     str(row.get("run_type") or "").strip(),
                     row.get("pulse_width_on", row.get("pulse_width")),
+                    str(row.get("pulse_width_units") or "").strip(),
+                    row.get("off_time"),
+                    str(row.get("off_time_units") or "").strip(),
                     row.get("control_period"),
+                    row.get("feed_temperature"),
+                    str(row.get("feed_temperature_units") or "").strip(),
+                    row.get("suppression_voltage"),
+                    str(row.get("suppression_voltage_units") or "").strip(),
+                    row.get("valve_voltage"),
+                    str(row.get("valve_voltage_units") or "").strip(),
+                    str(row.get("data_mode_raw") or "").strip(),
+                    str(row.get("source_sheet_name") or "").strip(),
+                    str(row.get("extraction_status") or "").strip(),
+                    str(row.get("extraction_reason") or "").strip(),
                     str(row.get("member_sequences_text") or "").strip(),
                     str(row.get("member_programs_text") or "").strip(),
                     param_name,
@@ -12878,10 +13093,6 @@ def _refresh_td_support_run_conditions_sheet(
                     bound.get("min_value"),
                     bound.get("max_value"),
                     bool(bound.get("enabled", row.get("enabled", True))),
-                    row.get("feed_temperature"),
-                    str(row.get("feed_temperature_units") or "").strip(),
-                    row.get("suppression_voltage"),
-                    row.get("valve_voltage"),
                 ]
             )
             rows_written += 1
@@ -13129,23 +13340,7 @@ def _sync_td_support_workbook_program_sheets(
         except Exception:
             pass
 
-        row_headers = [
-            "source_run_name",
-            "condition_key",
-            "display_name",
-            "feed_pressure",
-            "feed_pressure_units",
-            "run_type",
-            "pulse_width_on",
-            "control_period",
-            "exclude_first_n",
-            "last_n_rows",
-            "enabled",
-            "feed_temperature",
-            "feed_temperature_units",
-            "suppression_voltage",
-            "valve_voltage",
-        ]
+        row_headers = list(TD_SUPPORT_PROGRAM_ROW_HEADERS)
         for title in desired_program_titles:
             sheet_name = desired_sheet_by_title[title]
             existing_enabled = next(
@@ -13192,6 +13387,9 @@ def _sync_td_support_workbook_program_sheets(
                         str(row_data.get("feed_pressure_units") or "").strip(),
                         str(row_data.get("run_type") or "").strip(),
                         row_data.get("pulse_width_on", row_data.get("pulse_width")),
+                        str(row_data.get("pulse_width_units") or "").strip(),
+                        row_data.get("off_time"),
+                        str(row_data.get("off_time_units") or "").strip(),
                         row_data.get("control_period"),
                         row_data.get("exclude_first_n"),
                         row_data.get("last_n_rows"),
@@ -13199,7 +13397,13 @@ def _sync_td_support_workbook_program_sheets(
                         row_data.get("feed_temperature"),
                         str(row_data.get("feed_temperature_units") or "").strip(),
                         row_data.get("suppression_voltage"),
+                        str(row_data.get("suppression_voltage_units") or "").strip(),
                         row_data.get("valve_voltage"),
+                        str(row_data.get("valve_voltage_units") or "").strip(),
+                        str(row_data.get("data_mode_raw") or "").strip(),
+                        str(row_data.get("source_sheet_name") or "").strip(),
+                        str(row_data.get("extraction_status") or "").strip(),
+                        str(row_data.get("extraction_reason") or "").strip(),
                     ]
                 )
             for row in desired_rows:
@@ -13413,14 +13617,23 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "display_name": raw_display_name or condition_key,
                     "feed_pressure": ws.cell(row, headers.get("feed_pressure", 3)).value if headers.get("feed_pressure") else None,
                     "feed_pressure_units": str(ws.cell(row, headers.get("feed_pressure_units", 4)).value or "").strip(),
-                    "feed_temperature": ws.cell(row, headers.get("feed_temperature", 5)).value if headers.get("feed_temperature") else None,
-                    "feed_temperature_units": str(ws.cell(row, headers.get("feed_temperature_units", 6)).value or "").strip() if headers.get("feed_temperature_units") else "",
+                    "feed_temperature": ws.cell(row, headers.get("feed_temperature")).value if headers.get("feed_temperature") else None,
+                    "feed_temperature_units": str(ws.cell(row, headers.get("feed_temperature_units")).value or "").strip() if headers.get("feed_temperature_units") else "",
                     "run_type": str(ws.cell(row, headers.get("run_type", 5)).value or "").strip(),
                     "pulse_width": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
                     "pulse_width_on": ws.cell(row, headers.get("pulse_width_on", 6)).value if headers.get("pulse_width_on") else None,
+                    "pulse_width_units": str(ws.cell(row, headers.get("pulse_width_units")).value or "").strip() if headers.get("pulse_width_units") else "",
+                    "off_time": ws.cell(row, headers.get("off_time")).value if headers.get("off_time") else None,
+                    "off_time_units": str(ws.cell(row, headers.get("off_time_units")).value or "").strip() if headers.get("off_time_units") else "",
                     "control_period": ws.cell(row, headers.get("control_period", 7)).value if headers.get("control_period") else None,
-                    "suppression_voltage": ws.cell(row, headers.get("suppression_voltage", 10)).value if headers.get("suppression_voltage") else None,
+                    "suppression_voltage": ws.cell(row, headers.get("suppression_voltage")).value if headers.get("suppression_voltage") else None,
+                    "suppression_voltage_units": str(ws.cell(row, headers.get("suppression_voltage_units")).value or "").strip() if headers.get("suppression_voltage_units") else "",
                     "valve_voltage": ws.cell(row, headers.get("valve_voltage")).value if headers.get("valve_voltage") else None,
+                    "valve_voltage_units": str(ws.cell(row, headers.get("valve_voltage_units")).value or "").strip() if headers.get("valve_voltage_units") else "",
+                    "data_mode_raw": str(ws.cell(row, headers.get("data_mode_raw")).value or "").strip() if headers.get("data_mode_raw") else "",
+                    "source_sheet_name": str(ws.cell(row, headers.get("source_sheet_name")).value or "").strip() if headers.get("source_sheet_name") else "",
+                    "extraction_status": str(ws.cell(row, headers.get("extraction_status")).value or "").strip() if headers.get("extraction_status") else "",
+                    "extraction_reason": str(ws.cell(row, headers.get("extraction_reason")).value or "").strip() if headers.get("extraction_reason") else "",
                     "sheet_name": str(ws.cell(row, headers.get("sheet_name", 8)).value or "").strip() if headers.get("sheet_name") else "",
                     "member_sequences_text": str(ws.cell(row, headers.get("member_sequences", 9)).value or "").strip() if headers.get("member_sequences") else "",
                     "member_programs_text": str(ws.cell(row, headers.get("member_programs", 10)).value or "").strip() if headers.get("member_programs") else "",
@@ -13500,9 +13713,11 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "feed_pressure",
                     "feed_temperature",
                     "pulse_width_on",
+                    "off_time",
                     "control_period",
                     "suppression_voltage",
                     "valve_voltage",
+                    "extraction_status",
                 )
             )
             new_program_schema_detected = new_program_schema_detected or bool(has_full_condition_columns)
@@ -13534,9 +13749,18 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "run_type": str(ws.cell(row, headers.get("run_type")).value or "").strip() if headers.get("run_type") else "",
                             "pulse_width": ws.cell(row, headers.get("pulse_width_on")).value if headers.get("pulse_width_on") else None,
                             "pulse_width_on": ws.cell(row, headers.get("pulse_width_on")).value if headers.get("pulse_width_on") else None,
+                            "pulse_width_units": str(ws.cell(row, headers.get("pulse_width_units")).value or "").strip() if headers.get("pulse_width_units") else "",
+                            "off_time": ws.cell(row, headers.get("off_time")).value if headers.get("off_time") else None,
+                            "off_time_units": str(ws.cell(row, headers.get("off_time_units")).value or "").strip() if headers.get("off_time_units") else "",
                             "control_period": ws.cell(row, headers.get("control_period")).value if headers.get("control_period") else None,
                             "suppression_voltage": ws.cell(row, headers.get("suppression_voltage")).value if headers.get("suppression_voltage") else None,
+                            "suppression_voltage_units": str(ws.cell(row, headers.get("suppression_voltage_units")).value or "").strip() if headers.get("suppression_voltage_units") else "",
                             "valve_voltage": ws.cell(row, headers.get("valve_voltage")).value if headers.get("valve_voltage") else None,
+                            "valve_voltage_units": str(ws.cell(row, headers.get("valve_voltage_units")).value or "").strip() if headers.get("valve_voltage_units") else "",
+                            "data_mode_raw": str(ws.cell(row, headers.get("data_mode_raw")).value or "").strip() if headers.get("data_mode_raw") else "",
+                            "source_sheet_name": str(ws.cell(row, headers.get("source_sheet_name")).value or "").strip() if headers.get("source_sheet_name") else "",
+                            "extraction_status": str(ws.cell(row, headers.get("extraction_status")).value or "").strip() if headers.get("extraction_status") else "",
+                            "extraction_reason": str(ws.cell(row, headers.get("extraction_reason")).value or "").strip() if headers.get("extraction_reason") else "",
                         }
                     )
                     row_out["display_name"] = _td_effective_run_condition_label(
@@ -13624,8 +13848,18 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                         "run_type": str(row.get("run_type") or "").strip(),
                         "pulse_width": row.get("pulse_width"),
                         "pulse_width_on": row.get("pulse_width"),
+                        "pulse_width_units": "",
+                        "off_time": None,
+                        "off_time_units": "",
                         "control_period": row.get("control_period"),
                         "suppression_voltage": None,
+                        "suppression_voltage_units": "",
+                        "valve_voltage": None,
+                        "valve_voltage_units": "",
+                        "data_mode_raw": "",
+                        "source_sheet_name": "",
+                        "extraction_status": "",
+                        "extraction_reason": "",
                         "enabled": bool(row.get("enabled", True)),
                     }
                 )
@@ -13699,17 +13933,26 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                     "display_name": str(group.get("display_name") or "").strip(),
                     "feed_pressure": group.get("feed_pressure"),
                     "feed_pressure_units": str(group.get("feed_pressure_units") or "").strip(),
-                    "feed_temperature": group.get("feed_temperature"),
-                    "feed_temperature_units": str(group.get("feed_temperature_units") or "").strip(),
-                    "run_type": str(group.get("run_type") or "").strip(),
-                    "pulse_width": group.get("pulse_width_on"),
-                    "pulse_width_on": group.get("pulse_width_on"),
-                    "control_period": group.get("control_period"),
-                    "suppression_voltage": group.get("suppression_voltage"),
-                    "valve_voltage": group.get("valve_voltage"),
-                    "member_suppression_voltages": list(group.get("member_suppression_voltages") or []),
-                    "member_valve_voltages": list(group.get("member_valve_voltages") or []),
-                    "sheet_name": str(group.get("sheet_name") or "").strip(),
+                     "feed_temperature": group.get("feed_temperature"),
+                     "feed_temperature_units": str(group.get("feed_temperature_units") or "").strip(),
+                     "run_type": str(group.get("run_type") or "").strip(),
+                     "pulse_width": group.get("pulse_width_on"),
+                     "pulse_width_on": group.get("pulse_width_on"),
+                     "pulse_width_units": str(group.get("pulse_width_units") or "").strip(),
+                     "off_time": group.get("off_time"),
+                     "off_time_units": str(group.get("off_time_units") or "").strip(),
+                     "control_period": group.get("control_period"),
+                     "suppression_voltage": group.get("suppression_voltage"),
+                     "suppression_voltage_units": str(group.get("suppression_voltage_units") or "").strip(),
+                     "valve_voltage": group.get("valve_voltage"),
+                     "valve_voltage_units": str(group.get("valve_voltage_units") or "").strip(),
+                     "data_mode_raw": str(group.get("data_mode_raw") or "").strip(),
+                     "source_sheet_name": str(group.get("source_sheet_name") or "").strip(),
+                     "extraction_status": str(group.get("extraction_status") or "").strip(),
+                     "extraction_reason": str(group.get("extraction_reason") or "").strip(),
+                     "member_suppression_voltages": list(group.get("member_suppression_voltages") or []),
+                     "member_valve_voltages": list(group.get("member_valve_voltages") or []),
+                     "sheet_name": str(group.get("sheet_name") or "").strip(),
                     "member_sequences_text": ", ".join([str(v).strip() for v in (group.get("member_sequences") or []) if str(v).strip()]),
                     "member_programs_text": ", ".join([str(v).strip() for v in (group.get("member_programs") or []) if str(v).strip()]),
                     "enabled": True,
@@ -13731,17 +13974,26 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "program_title": str(member.get("program_title") or "").strip(),
                             "feed_pressure": group.get("feed_pressure"),
                             "feed_pressure_units": str(group.get("feed_pressure_units") or "").strip(),
-                            "feed_temperature": group.get("feed_temperature"),
-                            "feed_temperature_units": str(group.get("feed_temperature_units") or "").strip(),
-                            "run_type": str(group.get("run_type") or "").strip(),
-                            "pulse_width": group.get("pulse_width_on"),
-                            "pulse_width_on": group.get("pulse_width_on"),
-                            "control_period": group.get("control_period"),
-                            "suppression_voltage": member.get("suppression_voltage"),
-                            "valve_voltage": member.get("valve_voltage"),
-                            "exclude_first_n": member.get("exclude_first_n"),
-                            "last_n_rows": member.get("last_n_rows"),
-                            "enabled": bool(member.get("enabled", True)),
+                             "feed_temperature": group.get("feed_temperature"),
+                             "feed_temperature_units": str(group.get("feed_temperature_units") or "").strip(),
+                             "run_type": str(group.get("run_type") or "").strip(),
+                             "pulse_width": member.get("pulse_width", member.get("pulse_width_on", group.get("pulse_width_on"))),
+                             "pulse_width_on": member.get("pulse_width_on", member.get("pulse_width", group.get("pulse_width_on"))),
+                             "pulse_width_units": str(member.get("pulse_width_units") or group.get("pulse_width_units") or "").strip(),
+                             "off_time": member.get("off_time", group.get("off_time")),
+                             "off_time_units": str(member.get("off_time_units") or group.get("off_time_units") or "").strip(),
+                             "control_period": member.get("control_period", group.get("control_period")),
+                             "suppression_voltage": member.get("suppression_voltage"),
+                             "suppression_voltage_units": str(member.get("suppression_voltage_units") or group.get("suppression_voltage_units") or "").strip(),
+                             "valve_voltage": member.get("valve_voltage"),
+                             "valve_voltage_units": str(member.get("valve_voltage_units") or group.get("valve_voltage_units") or "").strip(),
+                             "data_mode_raw": str(member.get("data_mode_raw") or group.get("data_mode_raw") or "").strip(),
+                             "source_sheet_name": str(member.get("source_sheet_name") or "").strip(),
+                             "extraction_status": str(member.get("extraction_status") or group.get("extraction_status") or "").strip(),
+                             "extraction_reason": str(member.get("extraction_reason") or group.get("extraction_reason") or "").strip(),
+                             "exclude_first_n": member.get("exclude_first_n"),
+                             "last_n_rows": member.get("last_n_rows"),
+                             "enabled": bool(member.get("enabled", True)),
                         }
                     )
         else:
@@ -13765,9 +14017,18 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
                             "run_type": str(condition.get("run_type") or "").strip(),
                             "pulse_width": condition.get("pulse_width"),
                             "pulse_width_on": condition.get("pulse_width_on"),
+                            "pulse_width_units": str(condition.get("pulse_width_units") or "").strip(),
+                            "off_time": condition.get("off_time"),
+                            "off_time_units": str(condition.get("off_time_units") or "").strip(),
                             "control_period": condition.get("control_period"),
                             "suppression_voltage": condition.get("suppression_voltage"),
+                            "suppression_voltage_units": str(condition.get("suppression_voltage_units") or "").strip(),
                             "valve_voltage": condition.get("valve_voltage"),
+                            "valve_voltage_units": str(condition.get("valve_voltage_units") or "").strip(),
+                            "data_mode_raw": str(condition.get("data_mode_raw") or "").strip(),
+                            "source_sheet_name": str(condition.get("source_sheet_name") or "").strip(),
+                            "extraction_status": str(condition.get("extraction_status") or "").strip(),
+                            "extraction_reason": str(condition.get("extraction_reason") or "").strip(),
                             "exclude_first_n": row.get("exclude_first_n"),
                             "last_n_rows": row.get("last_n_rows"),
                             "enabled": bool(row.get("enabled", True) and condition.get("enabled", True)),
@@ -14298,6 +14559,7 @@ def _td_resolved_support_condition_payload(
         "condition_key": resolved_condition_key,
         "sequence_name": resolved_condition_key,
         "source_run_name": str(source_run_name or "").strip(),
+        "source_sheet_name": str(condition.get("source_sheet_name") or (mapping or {}).get("source_sheet_name") or "").strip(),
         "feed_pressure": condition.get("feed_pressure", (mapping or {}).get("feed_pressure")),
         "feed_pressure_units": str(condition.get("feed_pressure_units") or (mapping or {}).get("feed_pressure_units") or "").strip(),
         "feed_temperature": condition.get("feed_temperature", (mapping or {}).get("feed_temperature")),
@@ -14305,9 +14567,17 @@ def _td_resolved_support_condition_payload(
         "run_type": str(condition.get("run_type") or (mapping or {}).get("run_type") or "").strip(),
         "pulse_width": condition.get("pulse_width", (mapping or {}).get("pulse_width")),
         "pulse_width_on": condition.get("pulse_width_on", condition.get("pulse_width", (mapping or {}).get("pulse_width_on", (mapping or {}).get("pulse_width")))),
+        "pulse_width_units": str(condition.get("pulse_width_units") or (mapping or {}).get("pulse_width_units") or "").strip(),
+        "off_time": condition.get("off_time", (mapping or {}).get("off_time")),
+        "off_time_units": str(condition.get("off_time_units") or (mapping or {}).get("off_time_units") or "").strip(),
         "control_period": condition.get("control_period", (mapping or {}).get("control_period")),
         "suppression_voltage": condition.get("suppression_voltage", (mapping or {}).get("suppression_voltage")),
+        "suppression_voltage_units": str(condition.get("suppression_voltage_units") or (mapping or {}).get("suppression_voltage_units") or "").strip(),
         "valve_voltage": condition.get("valve_voltage", (mapping or {}).get("valve_voltage")),
+        "valve_voltage_units": str(condition.get("valve_voltage_units") or (mapping or {}).get("valve_voltage_units") or "").strip(),
+        "data_mode_raw": str(condition.get("data_mode_raw") or (mapping or {}).get("data_mode_raw") or "").strip(),
+        "extraction_status": str(condition.get("extraction_status") or (mapping or {}).get("extraction_status") or "").strip(),
+        "extraction_reason": str(condition.get("extraction_reason") or (mapping or {}).get("extraction_reason") or "").strip(),
         "exclude_first_n": (mapping or {}).get("exclude_first_n"),
         "last_n_rows": (mapping or {}).get("last_n_rows"),
         "matched_support": bool(mapping or condition),
@@ -14322,6 +14592,7 @@ def _td_resolved_support_condition_payload(
         ),
     )
     payload["display_name"] = display_name
+    payload["condition_display"] = display_name
     payload["source_run_name"] = str(source_run_name or "").strip() or display_name
     return payload
 
@@ -14378,7 +14649,9 @@ def _td_resolve_support_condition_for_source(program_title: object, source_run_n
         "condition_key": source_run,
         "sequence_name": source_run,
         "display_name": source_run,
+        "condition_display": source_run,
         "source_run_name": source_run,
+        "source_sheet_name": "",
         "feed_pressure": None,
         "feed_pressure_units": "",
         "feed_temperature": None,
@@ -14386,9 +14659,17 @@ def _td_resolve_support_condition_for_source(program_title: object, source_run_n
         "run_type": "",
         "pulse_width": None,
         "pulse_width_on": None,
+        "pulse_width_units": "",
+        "off_time": None,
+        "off_time_units": "",
         "control_period": None,
         "suppression_voltage": None,
+        "suppression_voltage_units": "",
         "valve_voltage": None,
+        "valve_voltage_units": "",
+        "data_mode_raw": "",
+        "extraction_status": "",
+        "extraction_reason": "",
         "exclude_first_n": None,
         "last_n_rows": None,
         "matched_support": False,
@@ -14651,17 +14932,47 @@ def td_list_runs_ex(db_path: Path) -> list[dict]:
 
 
 TD_CONDITION_METADATA_FIELDS = (
+    "condition_display",
+    "feed_pressure",
+    "feed_pressure_units",
+    "feed_temperature",
+    "feed_temperature_units",
     "run_type",
     "pulse_width",
+    "pulse_width_units",
+    "off_time",
+    "off_time_units",
     "control_period",
     "suppression_voltage",
+    "suppression_voltage_units",
     "valve_voltage",
+    "valve_voltage_units",
+    "data_mode_raw",
+    "source_sheet_name",
+    "extraction_status",
+    "extraction_reason",
 )
 
 
 def _td_condition_metadata_normalized_value(field_name: str, value: object) -> str | float | None:
-    if str(field_name or "").strip() == "run_type":
+    field_key = str(field_name or "").strip()
+    if field_key == "run_type":
         text = str(td_normalize_run_type(value) or "").strip()
+        return text or None
+    if field_key in {
+        "condition_display",
+        "feed_pressure_units",
+        "feed_temperature_units",
+        "pulse_width_units",
+        "off_time_units",
+        "suppression_voltage_units",
+        "valve_voltage_units",
+        "data_mode_raw",
+        "source_sheet_name",
+        "extraction_status",
+        "extraction_reason",
+    }:
+        text = str(value or "").strip()
         return text or None
     return _td_finite_float(value)
 
@@ -14671,10 +14982,33 @@ def _td_condition_metadata_has_value(field_name: str, value: object) -> bool:
 
 
 def _td_condition_metadata_unique_value(field_name: str, values: Sequence[object]) -> str | float | None:
-    if str(field_name or "").strip() == "run_type":
+    field_key = str(field_name or "").strip()
+    if field_key == "run_type":
         values_by_key: dict[str, str] = {}
         for value in values or []:
             text = str(td_normalize_run_type(value) or "").strip()
+            if not text:
+                continue
+            values_by_key.setdefault(text.casefold(), text)
+        if len(values_by_key) == 1:
+            return next(iter(values_by_key.values()))
+        return None
+    if field_key in {
+        "condition_display",
+        "feed_pressure_units",
+        "feed_temperature_units",
+        "pulse_width_units",
+        "off_time_units",
+        "suppression_voltage_units",
+        "valve_voltage_units",
+        "data_mode_raw",
+        "source_sheet_name",
+        "extraction_status",
+        "extraction_reason",
+    }:
+        values_by_key: dict[str, str] = {}
+        for value in values or []:
+            text = str(value or "").strip()
             if not text:
                 continue
             values_by_key.setdefault(text.casefold(), text)
@@ -14749,11 +15083,25 @@ def _td_raw_condition_metadata_health(
             SELECT
                 serial,
                 COALESCE(source_run_name, ''),
+                COALESCE(condition_display, ''),
+                feed_pressure,
+                COALESCE(feed_pressure_units, ''),
+                feed_temperature,
+                COALESCE(feed_temperature_units, ''),
                 COALESCE(run_type, ''),
                 pulse_width,
+                COALESCE(pulse_width_units, ''),
+                off_time,
+                COALESCE(off_time_units, ''),
                 control_period,
                 suppression_voltage,
-                valve_voltage
+                COALESCE(suppression_voltage_units, ''),
+                valve_voltage,
+                COALESCE(valve_voltage_units, ''),
+                COALESCE(data_mode_raw, ''),
+                COALESCE(source_sheet_name, ''),
+                COALESCE(extraction_status, ''),
+                COALESCE(extraction_reason, '')
             FROM td_raw_condition_observations
             """
         ).fetchall()
@@ -14761,18 +15109,54 @@ def _td_raw_condition_metadata_health(
         return {"ok": False, "missing": ["td_raw_condition_observations unavailable"]}
 
     rows_by_key: dict[tuple[str, str], list[dict[str, object]]] = {}
-    for serial, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in rows:
+    for (
+        serial,
+        source_run_name,
+        condition_display,
+        feed_pressure,
+        feed_pressure_units,
+        feed_temperature,
+        feed_temperature_units,
+        run_type,
+        pulse_width,
+        pulse_width_units,
+        off_time,
+        off_time_units,
+        control_period,
+        suppression_voltage,
+        suppression_voltage_units,
+        valve_voltage,
+        valve_voltage_units,
+        data_mode_raw,
+        source_sheet_name,
+        extraction_status,
+        extraction_reason,
+    ) in rows:
         serial_txt = str(serial or "").strip()
         run_key = _td_support_norm_name(source_run_name)
         if not serial_txt or not run_key:
             continue
         rows_by_key.setdefault((serial_txt, run_key), []).append(
             {
+                "condition_display": condition_display,
+                "feed_pressure": feed_pressure,
+                "feed_pressure_units": feed_pressure_units,
+                "feed_temperature": feed_temperature,
+                "feed_temperature_units": feed_temperature_units,
                 "run_type": run_type,
                 "pulse_width": pulse_width,
+                "pulse_width_units": pulse_width_units,
+                "off_time": off_time,
+                "off_time_units": off_time_units,
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
+                "suppression_voltage_units": suppression_voltage_units,
                 "valve_voltage": valve_voltage,
+                "valve_voltage_units": valve_voltage_units,
+                "data_mode_raw": data_mode_raw,
+                "source_sheet_name": source_sheet_name,
+                "extraction_status": extraction_status,
+                "extraction_reason": extraction_reason,
             }
         )
 
@@ -14800,11 +15184,25 @@ def _td_impl_condition_metadata_health(
             SELECT
                 serial,
                 COALESCE(source_run_name, ''),
+                COALESCE(condition_display, ''),
+                feed_pressure,
+                COALESCE(feed_pressure_units, ''),
+                feed_temperature,
+                COALESCE(feed_temperature_units, ''),
                 COALESCE(run_type, ''),
                 pulse_width,
+                COALESCE(pulse_width_units, ''),
+                off_time,
+                COALESCE(off_time_units, ''),
                 control_period,
                 suppression_voltage,
-                valve_voltage
+                COALESCE(suppression_voltage_units, ''),
+                valve_voltage,
+                COALESCE(valve_voltage_units, ''),
+                COALESCE(data_mode_raw, ''),
+                COALESCE(source_sheet_name, ''),
+                COALESCE(extraction_status, ''),
+                COALESCE(extraction_reason, '')
             FROM td_raw_condition_observations
             """
         ).fetchall()
@@ -14817,11 +15215,25 @@ def _td_impl_condition_metadata_health(
                 serial,
                 COALESCE(run_name, ''),
                 COALESCE(source_run_name, ''),
+                COALESCE(condition_display, ''),
+                feed_pressure,
+                COALESCE(feed_pressure_units, ''),
+                feed_temperature,
+                COALESCE(feed_temperature_units, ''),
                 COALESCE(run_type, ''),
                 pulse_width,
+                COALESCE(pulse_width_units, ''),
+                off_time,
+                COALESCE(off_time_units, ''),
                 control_period,
                 suppression_voltage,
-                valve_voltage
+                COALESCE(suppression_voltage_units, ''),
+                valve_voltage,
+                COALESCE(valve_voltage_units, ''),
+                COALESCE(data_mode_raw, ''),
+                COALESCE(source_sheet_name, ''),
+                COALESCE(extraction_status, ''),
+                COALESCE(extraction_reason, '')
             FROM td_condition_observations_sequences
             """
         ).fetchall()
@@ -14833,11 +15245,25 @@ def _td_impl_condition_metadata_health(
             SELECT
                 serial,
                 COALESCE(run_name, ''),
+                COALESCE(condition_display, ''),
+                feed_pressure,
+                COALESCE(feed_pressure_units, ''),
+                feed_temperature,
+                COALESCE(feed_temperature_units, ''),
                 COALESCE(run_type, ''),
                 pulse_width,
+                COALESCE(pulse_width_units, ''),
+                off_time,
+                COALESCE(off_time_units, ''),
                 control_period,
                 suppression_voltage,
-                valve_voltage
+                COALESCE(suppression_voltage_units, ''),
+                valve_voltage,
+                COALESCE(valve_voltage_units, ''),
+                COALESCE(data_mode_raw, ''),
+                COALESCE(source_sheet_name, ''),
+                COALESCE(extraction_status, ''),
+                COALESCE(extraction_reason, '')
             FROM td_condition_observations
             """
         ).fetchall()
@@ -14845,33 +15271,106 @@ def _td_impl_condition_metadata_health(
         return {"ok": False, "missing": ["td_condition_observations unavailable"]}
 
     raw_rows_by_source_key: dict[tuple[str, str], list[dict[str, object]]] = {}
-    for serial, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in raw_rows:
+    for (
+        serial,
+        source_run_name,
+        condition_display,
+        feed_pressure,
+        feed_pressure_units,
+        feed_temperature,
+        feed_temperature_units,
+        run_type,
+        pulse_width,
+        pulse_width_units,
+        off_time,
+        off_time_units,
+        control_period,
+        suppression_voltage,
+        suppression_voltage_units,
+        valve_voltage,
+        valve_voltage_units,
+        data_mode_raw,
+        source_sheet_name,
+        extraction_status,
+        extraction_reason,
+    ) in raw_rows:
         serial_txt = str(serial or "").strip()
         run_key = _td_support_norm_name(source_run_name)
         if not serial_txt or not run_key:
             continue
         raw_rows_by_source_key.setdefault((serial_txt, run_key), []).append(
             {
+                "condition_display": condition_display,
+                "feed_pressure": feed_pressure,
+                "feed_pressure_units": feed_pressure_units,
+                "feed_temperature": feed_temperature,
+                "feed_temperature_units": feed_temperature_units,
                 "run_type": run_type,
                 "pulse_width": pulse_width,
+                "pulse_width_units": pulse_width_units,
+                "off_time": off_time,
+                "off_time_units": off_time_units,
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
+                "suppression_voltage_units": suppression_voltage_units,
                 "valve_voltage": valve_voltage,
+                "valve_voltage_units": valve_voltage_units,
+                "data_mode_raw": data_mode_raw,
+                "source_sheet_name": source_sheet_name,
+                "extraction_status": extraction_status,
+                "extraction_reason": extraction_reason,
             }
         )
 
     sequence_rows_by_source_key: dict[tuple[str, str], list[dict[str, object]]] = {}
     sequence_rows_by_aggregate_key: dict[tuple[str, str], list[dict[str, object]]] = {}
-    for serial, run_name, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in sequence_rows:
+    for (
+        serial,
+        run_name,
+        source_run_name,
+        condition_display,
+        feed_pressure,
+        feed_pressure_units,
+        feed_temperature,
+        feed_temperature_units,
+        run_type,
+        pulse_width,
+        pulse_width_units,
+        off_time,
+        off_time_units,
+        control_period,
+        suppression_voltage,
+        suppression_voltage_units,
+        valve_voltage,
+        valve_voltage_units,
+        data_mode_raw,
+        source_sheet_name,
+        extraction_status,
+        extraction_reason,
+    ) in sequence_rows:
         serial_txt = str(serial or "").strip()
         run_txt = str(run_name or "").strip()
         source_key = _td_support_norm_name(source_run_name)
         row_payload = {
+            "condition_display": condition_display,
+            "feed_pressure": feed_pressure,
+            "feed_pressure_units": feed_pressure_units,
+            "feed_temperature": feed_temperature,
+            "feed_temperature_units": feed_temperature_units,
             "run_type": run_type,
             "pulse_width": pulse_width,
+            "pulse_width_units": pulse_width_units,
+            "off_time": off_time,
+            "off_time_units": off_time_units,
             "control_period": control_period,
             "suppression_voltage": suppression_voltage,
+            "suppression_voltage_units": suppression_voltage_units,
             "valve_voltage": valve_voltage,
+            "valve_voltage_units": valve_voltage_units,
+            "data_mode_raw": data_mode_raw,
+            "source_sheet_name": source_sheet_name,
+            "extraction_status": extraction_status,
+            "extraction_reason": extraction_reason,
         }
         if serial_txt and source_key:
             sequence_rows_by_source_key.setdefault((serial_txt, source_key), []).append(dict(row_payload))
@@ -14879,17 +15378,53 @@ def _td_impl_condition_metadata_health(
             sequence_rows_by_aggregate_key.setdefault((serial_txt, run_txt), []).append(dict(row_payload))
 
     aggregate_rows_by_key: dict[tuple[str, str], dict[str, object]] = {}
-    for serial, run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage in aggregate_rows:
+    for (
+        serial,
+        run_name,
+        condition_display,
+        feed_pressure,
+        feed_pressure_units,
+        feed_temperature,
+        feed_temperature_units,
+        run_type,
+        pulse_width,
+        pulse_width_units,
+        off_time,
+        off_time_units,
+        control_period,
+        suppression_voltage,
+        suppression_voltage_units,
+        valve_voltage,
+        valve_voltage_units,
+        data_mode_raw,
+        source_sheet_name,
+        extraction_status,
+        extraction_reason,
+    ) in aggregate_rows:
         serial_txt = str(serial or "").strip()
         run_txt = str(run_name or "").strip()
         if not serial_txt or not run_txt:
             continue
         aggregate_rows_by_key[(serial_txt, run_txt)] = {
+            "condition_display": condition_display,
+            "feed_pressure": feed_pressure,
+            "feed_pressure_units": feed_pressure_units,
+            "feed_temperature": feed_temperature,
+            "feed_temperature_units": feed_temperature_units,
             "run_type": run_type,
             "pulse_width": pulse_width,
+            "pulse_width_units": pulse_width_units,
+            "off_time": off_time,
+            "off_time_units": off_time_units,
             "control_period": control_period,
             "suppression_voltage": suppression_voltage,
+            "suppression_voltage_units": suppression_voltage_units,
             "valve_voltage": valve_voltage,
+            "valve_voltage_units": valve_voltage_units,
+            "data_mode_raw": data_mode_raw,
+            "source_sheet_name": source_sheet_name,
+            "extraction_status": extraction_status,
+            "extraction_reason": extraction_reason,
         }
 
     missing: list[str] = []
@@ -15777,7 +16312,22 @@ def _td_validate_generated_workbook_outputs(
         "x_axis_kind",
         "run_type",
         "pulse_width",
+        "pulse_width_units",
+        "off_time",
+        "off_time_units",
         "control_period",
+        "feed_pressure",
+        "feed_pressure_units",
+        "feed_temperature",
+        "feed_temperature_units",
+        "suppression_voltage",
+        "suppression_voltage_units",
+        "valve_voltage",
+        "valve_voltage_units",
+        "data_mode_raw",
+        "source_sheet_name",
+        "extraction_status",
+        "extraction_reason",
         "source_mtime_ns",
     ]
     life_header = [
@@ -16534,6 +17084,41 @@ TD_SEQUENCE_OBS_PULSE_WIDTH_IDX = 6
 TD_SEQUENCE_OBS_CONTROL_PERIOD_IDX = 7
 TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_IDX = 8
 TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX = 9
+TD_SEQUENCE_OBS_CONDITION_DISPLAY_IDX = 12
+TD_SEQUENCE_OBS_FEED_PRESSURE_IDX = 13
+TD_SEQUENCE_OBS_FEED_PRESSURE_UNITS_IDX = 14
+TD_SEQUENCE_OBS_FEED_TEMPERATURE_IDX = 15
+TD_SEQUENCE_OBS_FEED_TEMPERATURE_UNITS_IDX = 16
+TD_SEQUENCE_OBS_OFF_TIME_IDX = 17
+TD_SEQUENCE_OBS_PULSE_WIDTH_UNITS_IDX = 18
+TD_SEQUENCE_OBS_OFF_TIME_UNITS_IDX = 19
+TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_UNITS_IDX = 20
+TD_SEQUENCE_OBS_VALVE_VOLTAGE_UNITS_IDX = 21
+TD_SEQUENCE_OBS_DATA_MODE_RAW_IDX = 22
+TD_SEQUENCE_OBS_SOURCE_SHEET_NAME_IDX = 23
+TD_SEQUENCE_OBS_EXTRACTION_STATUS_IDX = 24
+TD_SEQUENCE_OBS_EXTRACTION_REASON_IDX = 25
+
+TD_FEED_PRESSURE_METRIC_NAME = "feed pressure"
+TD_FEED_TEMPERATURE_METRIC_NAME = "feed temperature"
+TD_FEED_PRESSURE_METRIC_ALIASES = ("feed pressure", "feed_pressure", "pressure", "pc")
+TD_FEED_TEMPERATURE_METRIC_ALIASES = ("feed temperature", "feed_temperature", "temperature", "tf")
+TD_SEQUENCE_OBS_EXTRA_FIELDS = (
+    "condition_display",
+    "feed_pressure",
+    "feed_pressure_units",
+    "feed_temperature",
+    "feed_temperature_units",
+    "off_time",
+    "pulse_width_units",
+    "off_time_units",
+    "suppression_voltage_units",
+    "valve_voltage_units",
+    "data_mode_raw",
+    "source_sheet_name",
+    "extraction_status",
+    "extraction_reason",
+)
 
 
 def _td_group_sequence_observation_rows(
@@ -16581,6 +17166,251 @@ def _td_unique_sequence_text(rows: Sequence[Sequence[object]], index: int) -> st
     if len(values_by_key) == 1:
         return next(iter(values_by_key.values()))
     return ""
+
+
+def _td_metric_name_matches_aliases(name: object, aliases: Sequence[str]) -> bool:
+    name_key = _td_support_norm_name(name)
+    if not name_key:
+        return False
+    return any(name_key == _td_support_norm_name(alias) for alias in aliases if _td_support_norm_name(alias))
+
+
+def _td_metric_names_contain_alias(names: Sequence[object] | set[object] | None, aliases: Sequence[str]) -> bool:
+    return any(_td_metric_name_matches_aliases(name, aliases) for name in (names or []))
+
+
+def _td_condition_metadata_payload(
+    row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> dict[str, object]:
+    payload = dict(row or {}) if isinstance(row, Mapping) else {}
+    return {
+        "condition_display": _td_first_text_from_values(
+            payload.get("condition_display"),
+            _td_effective_run_condition_label(payload, fallback_display_name=fallback_display_name),
+        ),
+        "feed_pressure": _td_first_finite_from_values(payload.get("feed_pressure")),
+        "feed_pressure_units": str(payload.get("feed_pressure_units") or "").strip(),
+        "feed_temperature": _td_first_finite_from_values(payload.get("feed_temperature")),
+        "feed_temperature_units": str(payload.get("feed_temperature_units") or "").strip(),
+        "pulse_width_units": str(payload.get("pulse_width_units") or "").strip(),
+        "off_time": _td_first_finite_from_values(payload.get("off_time")),
+        "off_time_units": str(payload.get("off_time_units") or "").strip(),
+        "suppression_voltage": _td_first_finite_from_values(payload.get("suppression_voltage")),
+        "suppression_voltage_units": str(payload.get("suppression_voltage_units") or "").strip(),
+        "valve_voltage": _td_first_finite_from_values(payload.get("valve_voltage")),
+        "valve_voltage_units": str(payload.get("valve_voltage_units") or "").strip(),
+        "data_mode_raw": str(payload.get("data_mode_raw") or "").strip(),
+        "source_sheet_name": str(payload.get("source_sheet_name") or "").strip(),
+        "extraction_status": str(payload.get("extraction_status") or "").strip(),
+        "extraction_reason": str(payload.get("extraction_reason") or "").strip(),
+    }
+
+
+def _td_run_condition_metadata_values(
+    row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> tuple[object, ...]:
+    payload = _td_condition_metadata_payload(row, fallback_display_name=fallback_display_name)
+    return tuple(payload.get(column_name) for column_name, _column_sql in TD_RUN_CONDITION_METADATA_COLUMN_SPECS)
+
+
+def _td_observation_condition_metadata_values(
+    row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> tuple[object, ...]:
+    payload = _td_condition_metadata_payload(row, fallback_display_name=fallback_display_name)
+    return tuple(payload.get(column_name) for column_name, _column_sql in TD_OBSERVATION_CONDITION_METADATA_COLUMN_SPECS)
+
+
+def _td_sequence_observation_extra_values(
+    row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> tuple[object, ...]:
+    payload = _td_condition_metadata_payload(row, fallback_display_name=fallback_display_name)
+    return tuple(payload.get(column_name) for column_name in TD_SEQUENCE_OBS_EXTRA_FIELDS)
+
+
+def _td_build_impl_run_row(
+    run_name: object,
+    default_x: object,
+    display_name: object,
+    run_type: object,
+    control_period: object,
+    pulse_width: object,
+    metadata_row: Mapping[str, object] | None,
+) -> tuple[object, ...]:
+    display_text = str(display_name or "").strip() or str(run_name or "").strip()
+    return (
+        str(run_name or "").strip(),
+        str(default_x or "").strip(),
+        display_text,
+        str(run_type or "").strip(),
+        control_period,
+        pulse_width,
+        *_td_run_condition_metadata_values(metadata_row, fallback_display_name=display_text),
+    )
+
+
+def _td_build_raw_sequence_row(
+    run_name: object,
+    display_name: object,
+    x_axis_kind: object,
+    source_run_name: object,
+    pulse_width: object,
+    run_type: object,
+    control_period: object,
+    computed_epoch_ns: object,
+    metadata_row: Mapping[str, object] | None,
+) -> tuple[object, ...]:
+    display_text = str(display_name or "").strip() or str(run_name or "").strip()
+    return (
+        str(run_name or "").strip(),
+        display_text,
+        str(x_axis_kind or "").strip(),
+        str(source_run_name or "").strip(),
+        pulse_width,
+        str(run_type or "").strip(),
+        control_period,
+        *_td_run_condition_metadata_values(metadata_row, fallback_display_name=display_text),
+        int(computed_epoch_ns or 0),
+    )
+
+
+def _td_build_impl_observation_row(
+    observation_id: object,
+    serial: object,
+    run_name: object,
+    program_title: object,
+    source_run_name: object,
+    run_type: object,
+    pulse_width: object,
+    control_period: object,
+    suppression_voltage: object,
+    valve_voltage: object,
+    source_mtime_ns: object,
+    computed_epoch_ns: object,
+    metadata_row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> tuple[object, ...]:
+    return (
+        str(observation_id or "").strip(),
+        str(serial or "").strip(),
+        str(run_name or "").strip(),
+        str(program_title or "").strip(),
+        str(source_run_name or "").strip(),
+        str(run_type or "").strip(),
+        pulse_width,
+        control_period,
+        suppression_voltage,
+        valve_voltage,
+        *_td_observation_condition_metadata_values(metadata_row, fallback_display_name=fallback_display_name),
+        source_mtime_ns,
+        int(computed_epoch_ns or 0),
+    )
+
+
+def _td_build_raw_observation_row(
+    observation_id: object,
+    run_name: object,
+    serial: object,
+    program_title: object,
+    source_run_name: object,
+    run_type: object,
+    pulse_width: object,
+    control_period: object,
+    suppression_voltage: object,
+    valve_voltage: object,
+    source_mtime_ns: object,
+    computed_epoch_ns: object,
+    metadata_row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> tuple[object, ...]:
+    return (
+        str(observation_id or "").strip(),
+        str(run_name or "").strip(),
+        str(serial or "").strip(),
+        str(program_title or "").strip(),
+        str(source_run_name or "").strip(),
+        str(run_type or "").strip(),
+        pulse_width,
+        control_period,
+        suppression_voltage,
+        valve_voltage,
+        *_td_observation_condition_metadata_values(metadata_row, fallback_display_name=fallback_display_name),
+        source_mtime_ns,
+        int(computed_epoch_ns or 0),
+    )
+
+
+def _td_build_sequence_observation_row(
+    observation_id: object,
+    serial: object,
+    run_name: object,
+    program_title: object,
+    source_run_name: object,
+    run_type: object,
+    pulse_width: object,
+    control_period: object,
+    suppression_voltage: object,
+    valve_voltage: object,
+    source_mtime_ns: object,
+    computed_epoch_ns: object,
+    metadata_row: Mapping[str, object] | None,
+    *,
+    fallback_display_name: object = "",
+) -> tuple[object, ...]:
+    return (
+        str(observation_id or "").strip(),
+        str(serial or "").strip(),
+        str(run_name or "").strip(),
+        str(program_title or "").strip(),
+        str(source_run_name or "").strip(),
+        str(run_type or "").strip(),
+        pulse_width,
+        control_period,
+        suppression_voltage,
+        valve_voltage,
+        source_mtime_ns,
+        int(computed_epoch_ns or 0),
+        *_td_sequence_observation_extra_values(metadata_row, fallback_display_name=fallback_display_name),
+    )
+
+
+def _td_sequence_context_constant_metrics(
+    row: Mapping[str, object] | None,
+    *,
+    measured_names: Sequence[object] | set[object] | None = None,
+) -> list[tuple[str, float, str]]:
+    payload = _td_condition_metadata_payload(row)
+    metrics: list[tuple[str, float, str]] = []
+    if not _td_metric_names_contain_alias(measured_names, TD_FEED_PRESSURE_METRIC_ALIASES):
+        feed_pressure = _td_finite_float(payload.get("feed_pressure"))
+        if feed_pressure is not None:
+            metrics.append(
+                (
+                    TD_FEED_PRESSURE_METRIC_NAME,
+                    float(feed_pressure),
+                    str(payload.get("feed_pressure_units") or "").strip(),
+                )
+            )
+    if not _td_metric_names_contain_alias(measured_names, TD_FEED_TEMPERATURE_METRIC_ALIASES):
+        feed_temperature = _td_finite_float(payload.get("feed_temperature"))
+        if feed_temperature is not None:
+            metrics.append(
+                (
+                    TD_FEED_TEMPERATURE_METRIC_NAME,
+                    float(feed_temperature),
+                    str(payload.get("feed_temperature_units") or "").strip(),
+                )
+            )
+    return metrics
 
 
 def _td_first_finite_from_values(*values: object) -> float | None:
@@ -16711,18 +17541,94 @@ def _write_test_data_project_calc_cache_from_aggregates(
             run_defaults.get("run_type"),
             _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX),
         )
+        run_metadata_row = {
+            "condition_display": _td_first_text_from_values(
+                condition_meta.get("condition_display"),
+                run_defaults.get("condition_display"),
+                run_display_name,
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_CONDITION_DISPLAY_IDX),
+            ),
+            "feed_pressure": _td_first_finite_from_values(
+                condition_meta.get("feed_pressure"),
+                run_defaults.get("feed_pressure"),
+                _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_IDX),
+            ),
+            "feed_pressure_units": _td_first_text_from_values(
+                condition_meta.get("feed_pressure_units"),
+                run_defaults.get("feed_pressure_units"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_UNITS_IDX),
+            ),
+            "feed_temperature": _td_first_finite_from_values(
+                condition_meta.get("feed_temperature"),
+                run_defaults.get("feed_temperature"),
+                _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_IDX),
+            ),
+            "feed_temperature_units": _td_first_text_from_values(
+                condition_meta.get("feed_temperature_units"),
+                run_defaults.get("feed_temperature_units"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_UNITS_IDX),
+            ),
+            "pulse_width_units": _td_first_text_from_values(
+                condition_meta.get("pulse_width_units"),
+                run_defaults.get("pulse_width_units"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_UNITS_IDX),
+            ),
+            "off_time": _td_first_finite_from_values(
+                condition_meta.get("off_time"),
+                run_defaults.get("off_time"),
+                _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_IDX),
+            ),
+            "off_time_units": _td_first_text_from_values(
+                condition_meta.get("off_time_units"),
+                run_defaults.get("off_time_units"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_UNITS_IDX),
+            ),
+            "suppression_voltage": run_suppression_voltage_value,
+            "suppression_voltage_units": _td_first_text_from_values(
+                condition_meta.get("suppression_voltage_units"),
+                run_defaults.get("suppression_voltage_units"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_UNITS_IDX),
+            ),
+            "valve_voltage": run_valve_voltage_value,
+            "valve_voltage_units": _td_first_text_from_values(
+                condition_meta.get("valve_voltage_units"),
+                run_defaults.get("valve_voltage_units"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_UNITS_IDX),
+            ),
+            "data_mode_raw": _td_first_text_from_values(
+                condition_meta.get("data_mode_raw"),
+                run_defaults.get("data_mode_raw"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_DATA_MODE_RAW_IDX),
+            ),
+            "source_sheet_name": _td_first_text_from_values(
+                condition_meta.get("source_sheet_name"),
+                run_defaults.get("source_sheet_name"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_SOURCE_SHEET_NAME_IDX),
+            ),
+            "extraction_status": _td_first_text_from_values(
+                condition_meta.get("extraction_status"),
+                run_defaults.get("extraction_status"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_STATUS_IDX),
+            ),
+            "extraction_reason": _td_first_text_from_values(
+                condition_meta.get("extraction_reason"),
+                run_defaults.get("extraction_reason"),
+                _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_REASON_IDX),
+            ),
+        }
         member_source_runs = sorted({str(v).strip() for v in (meta.get("source_run_names") or set()) if str(v).strip()})
 
         if condition_key_clean not in inserted_runs:
             inserted_runs.add(condition_key_clean)
             run_rows_to_write.append(
-                (
+                _td_build_impl_run_row(
                     condition_key_clean,
                     default_x,
                     run_display_name,
                     run_type_text,
                     run_control_period_value,
                     run_pulse_width_value,
+                    run_metadata_row,
                 )
             )
             calc_param_defs = _td_complete_calc_param_defs(
@@ -16773,8 +17679,86 @@ def _write_test_data_project_calc_cache_from_aggregates(
         if valve_voltage_value is None:
             valve_voltage_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX)
         obs_run_type_text = run_type_text or _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX)
+        obs_metadata_row = dict(run_metadata_row)
+        obs_metadata_row.update(
+            {
+                "condition_display": _td_first_text_from_values(
+                    condition_meta.get("condition_display"),
+                    run_defaults.get("condition_display"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_CONDITION_DISPLAY_IDX),
+                    run_display_name,
+                ),
+                "feed_pressure": _td_first_finite_from_values(
+                    condition_meta.get("feed_pressure"),
+                    run_defaults.get("feed_pressure"),
+                    _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_IDX),
+                ),
+                "feed_pressure_units": _td_first_text_from_values(
+                    condition_meta.get("feed_pressure_units"),
+                    run_defaults.get("feed_pressure_units"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_UNITS_IDX),
+                ),
+                "feed_temperature": _td_first_finite_from_values(
+                    condition_meta.get("feed_temperature"),
+                    run_defaults.get("feed_temperature"),
+                    _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_IDX),
+                ),
+                "feed_temperature_units": _td_first_text_from_values(
+                    condition_meta.get("feed_temperature_units"),
+                    run_defaults.get("feed_temperature_units"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_UNITS_IDX),
+                ),
+                "pulse_width_units": _td_first_text_from_values(
+                    condition_meta.get("pulse_width_units"),
+                    run_defaults.get("pulse_width_units"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_UNITS_IDX),
+                ),
+                "off_time": _td_first_finite_from_values(
+                    condition_meta.get("off_time"),
+                    run_defaults.get("off_time"),
+                    _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_IDX),
+                ),
+                "off_time_units": _td_first_text_from_values(
+                    condition_meta.get("off_time_units"),
+                    run_defaults.get("off_time_units"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_UNITS_IDX),
+                ),
+                "suppression_voltage": suppression_voltage_value,
+                "suppression_voltage_units": _td_first_text_from_values(
+                    condition_meta.get("suppression_voltage_units"),
+                    run_defaults.get("suppression_voltage_units"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_UNITS_IDX),
+                ),
+                "valve_voltage": valve_voltage_value,
+                "valve_voltage_units": _td_first_text_from_values(
+                    condition_meta.get("valve_voltage_units"),
+                    run_defaults.get("valve_voltage_units"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_UNITS_IDX),
+                ),
+                "data_mode_raw": _td_first_text_from_values(
+                    condition_meta.get("data_mode_raw"),
+                    run_defaults.get("data_mode_raw"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_DATA_MODE_RAW_IDX),
+                ),
+                "source_sheet_name": _td_first_text_from_values(
+                    condition_meta.get("source_sheet_name"),
+                    run_defaults.get("source_sheet_name"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_SOURCE_SHEET_NAME_IDX),
+                ),
+                "extraction_status": _td_first_text_from_values(
+                    condition_meta.get("extraction_status"),
+                    run_defaults.get("extraction_status"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_STATUS_IDX),
+                ),
+                "extraction_reason": _td_first_text_from_values(
+                    condition_meta.get("extraction_reason"),
+                    run_defaults.get("extraction_reason"),
+                    _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_REASON_IDX),
+                ),
+            }
+        )
         obs_rows_to_write.append(
-            (
+            _td_build_impl_observation_row(
                 observation_id_calc,
                 serial_clean,
                 condition_key_clean,
@@ -16787,6 +17771,8 @@ def _write_test_data_project_calc_cache_from_aggregates(
                 valve_voltage_value,
                 source_mtime_max,
                 int(computed_epoch_ns),
+                obs_metadata_row,
+                fallback_display_name=run_display_name,
             )
         )
         for y_name in sorted(condition_y_names.get(condition_key_clean) or set()):
@@ -17029,7 +18015,14 @@ def _write_test_data_project_calc_cache_from_aggregates(
         conn.execute(f"DELETE FROM {TD_PLOTTER_CURVES_TABLE}")
         if run_rows_to_write:
             conn.executemany(
-                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                """
+                INSERT OR REPLACE INTO td_runs(
+                    run_name, default_x, display_name, run_type, control_period, pulse_width,
+                    condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                    pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                    valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status, extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 run_rows_to_write,
             )
         if column_rows_to_write:
@@ -17041,8 +18034,12 @@ def _write_test_data_project_calc_cache_from_aggregates(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period,
+                    suppression_voltage, valve_voltage, condition_display, feed_pressure, feed_pressure_units,
+                    feed_temperature, feed_temperature_units, pulse_width_units, off_time, off_time_units,
+                    suppression_voltage_units, valve_voltage_units, data_mode_raw, source_sheet_name,
+                    extraction_status, extraction_reason, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 obs_rows_to_write,
             )
@@ -17097,8 +18094,12 @@ def _write_test_data_project_calc_cache_from_aggregates(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations_sequences(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period,
+                    suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns, condition_display, feed_pressure,
+                    feed_pressure_units, feed_temperature, feed_temperature_units, off_time, pulse_width_units,
+                    off_time_units, suppression_voltage_units, valve_voltage_units, data_mode_raw, source_sheet_name,
+                    extraction_status, extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sequence_obs_rows_list,
             )
@@ -17308,6 +18309,22 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 pulse_width,
                 COALESCE(run_type, ''),
                 control_period,
+                COALESCE(condition_display, ''),
+                feed_pressure,
+                COALESCE(feed_pressure_units, ''),
+                feed_temperature,
+                COALESCE(feed_temperature_units, ''),
+                COALESCE(pulse_width_units, ''),
+                off_time,
+                COALESCE(off_time_units, ''),
+                suppression_voltage,
+                COALESCE(suppression_voltage_units, ''),
+                valve_voltage,
+                COALESCE(valve_voltage_units, ''),
+                COALESCE(data_mode_raw, ''),
+                COALESCE(source_sheet_name, ''),
+                COALESCE(extraction_status, ''),
+                COALESCE(extraction_reason, ''),
                 computed_epoch_ns
             FROM td_raw_sequences
             ORDER BY run_name
@@ -17391,6 +18408,20 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     control_period,
                     suppression_voltage,
                     valve_voltage,
+                    COALESCE(condition_display, ''),
+                    feed_pressure,
+                    COALESCE(feed_pressure_units, ''),
+                    feed_temperature,
+                    COALESCE(feed_temperature_units, ''),
+                    COALESCE(pulse_width_units, ''),
+                    off_time,
+                    COALESCE(off_time_units, ''),
+                    COALESCE(suppression_voltage_units, ''),
+                    COALESCE(valve_voltage_units, ''),
+                    COALESCE(data_mode_raw, ''),
+                    COALESCE(source_sheet_name, ''),
+                    COALESCE(extraction_status, ''),
+                    COALESCE(extraction_reason, ''),
                     source_mtime_ns,
                     computed_epoch_ns
                 FROM td_raw_condition_observations
@@ -17452,7 +18483,32 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             if run and y:
                 raw_y_by_run.setdefault(run, set()).add(y)
         plotter_sequence_rows: list[tuple[object, ...]] = []
-        for run_name, display_name_raw, default_x_raw, source_run_name_raw, raw_pulse_width, raw_run_type, raw_control_period, raw_run_computed_epoch_ns in raw_runs:
+        for (
+            run_name,
+            display_name_raw,
+            default_x_raw,
+            source_run_name_raw,
+            raw_pulse_width,
+            raw_run_type,
+            raw_control_period,
+            raw_condition_display,
+            raw_feed_pressure,
+            raw_feed_pressure_units,
+            raw_feed_temperature,
+            raw_feed_temperature_units,
+            raw_pulse_width_units,
+            raw_off_time,
+            raw_off_time_units,
+            raw_suppression_voltage,
+            raw_suppression_voltage_units,
+            raw_valve_voltage,
+            raw_valve_voltage_units,
+            raw_data_mode,
+            raw_source_sheet_name,
+            raw_extraction_status,
+            raw_extraction_reason,
+            raw_run_computed_epoch_ns,
+        ) in raw_runs:
             run = str(run_name or "").strip()
             if not run:
                 continue
@@ -17464,6 +18520,22 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 "pulse_width": raw_pulse_width,
                 "run_type": str(raw_run_type or "").strip(),
                 "control_period": raw_control_period,
+                "condition_display": str(raw_condition_display or "").strip(),
+                "feed_pressure": raw_feed_pressure,
+                "feed_pressure_units": str(raw_feed_pressure_units or "").strip(),
+                "feed_temperature": raw_feed_temperature,
+                "feed_temperature_units": str(raw_feed_temperature_units or "").strip(),
+                "pulse_width_units": str(raw_pulse_width_units or "").strip(),
+                "off_time": raw_off_time,
+                "off_time_units": str(raw_off_time_units or "").strip(),
+                "suppression_voltage": raw_suppression_voltage,
+                "suppression_voltage_units": str(raw_suppression_voltage_units or "").strip(),
+                "valve_voltage": raw_valve_voltage,
+                "valve_voltage_units": str(raw_valve_voltage_units or "").strip(),
+                "data_mode_raw": str(raw_data_mode or "").strip(),
+                "source_sheet_name": str(raw_source_sheet_name or "").strip(),
+                "extraction_status": str(raw_extraction_status or "").strip(),
+                "extraction_reason": str(raw_extraction_reason or "").strip(),
             }
             plotter_sequence_rows.append(
                 (
@@ -17499,7 +18571,34 @@ def _rebuild_test_data_project_calc_cache_from_raw(
 
         raw_obs_by_id: dict[str, dict[str, object]] = {}
         plotter_obs_rows_by_id: dict[str, tuple[object, ...]] = {}
-        for observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, obs_computed_epoch_ns in raw_obs_rows:
+        for (
+            observation_id,
+            run_name,
+            serial,
+            program_title,
+            source_run_name,
+            run_type,
+            pulse_width,
+            control_period,
+            suppression_voltage,
+            valve_voltage,
+            condition_display,
+            feed_pressure,
+            feed_pressure_units,
+            feed_temperature,
+            feed_temperature_units,
+            pulse_width_units,
+            off_time,
+            off_time_units,
+            suppression_voltage_units,
+            valve_voltage_units,
+            data_mode_raw,
+            source_sheet_name,
+            extraction_status,
+            extraction_reason,
+            source_mtime_ns,
+            obs_computed_epoch_ns,
+        ) in raw_obs_rows:
             obs_id = str(observation_id or "").strip()
             if not obs_id:
                 continue
@@ -17518,6 +18617,20 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "valve_voltage": valve_voltage,
+                "condition_display": str(condition_display or "").strip(),
+                "feed_pressure": feed_pressure,
+                "feed_pressure_units": str(feed_pressure_units or "").strip(),
+                "feed_temperature": feed_temperature,
+                "feed_temperature_units": str(feed_temperature_units or "").strip(),
+                "pulse_width_units": str(pulse_width_units or "").strip(),
+                "off_time": off_time,
+                "off_time_units": str(off_time_units or "").strip(),
+                "suppression_voltage_units": str(suppression_voltage_units or "").strip(),
+                "valve_voltage_units": str(valve_voltage_units or "").strip(),
+                "data_mode_raw": str(data_mode_raw or "").strip(),
+                "source_sheet_name": str(source_sheet_name or "").strip(),
+                "extraction_status": str(extraction_status or "").strip(),
+                "extraction_reason": str(extraction_reason or "").strip(),
                 "source_mtime_ns": source_mtime_ns,
             }
             plotter_obs_rows_by_id[obs_id] = (
@@ -17555,6 +18668,20 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     "control_period": None,
                     "suppression_voltage": None,
                     "valve_voltage": None,
+                    "condition_display": "",
+                    "feed_pressure": None,
+                    "feed_pressure_units": "",
+                    "feed_temperature": None,
+                    "feed_temperature_units": "",
+                    "pulse_width_units": "",
+                    "off_time": None,
+                    "off_time_units": "",
+                    "suppression_voltage_units": "",
+                    "valve_voltage_units": "",
+                    "data_mode_raw": "",
+                    "source_sheet_name": "",
+                    "extraction_status": "",
+                    "extraction_reason": "",
                     "source_mtime_ns": source_mtime_ns,
                 }
                 plotter_obs_rows_by_id[obs_id] = (
@@ -17716,8 +18843,71 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 support_row.get("run_type"),
                 raw_obs_meta.get("run_type"),
             )
+            sequence_metadata_row = {
+                "condition_display": _td_first_text_from_values(
+                    support_row.get("condition_display"),
+                    raw_obs_meta.get("condition_display"),
+                    support_row.get("display_name"),
+                    condition_key,
+                ),
+                "feed_pressure": _td_first_finite_from_values(
+                    support_row.get("feed_pressure"),
+                    raw_obs_meta.get("feed_pressure"),
+                ),
+                "feed_pressure_units": _td_first_text_from_values(
+                    support_row.get("feed_pressure_units"),
+                    raw_obs_meta.get("feed_pressure_units"),
+                ),
+                "feed_temperature": _td_first_finite_from_values(
+                    support_row.get("feed_temperature"),
+                    raw_obs_meta.get("feed_temperature"),
+                ),
+                "feed_temperature_units": _td_first_text_from_values(
+                    support_row.get("feed_temperature_units"),
+                    raw_obs_meta.get("feed_temperature_units"),
+                ),
+                "pulse_width_units": _td_first_text_from_values(
+                    support_row.get("pulse_width_units"),
+                    raw_obs_meta.get("pulse_width_units"),
+                ),
+                "off_time": _td_first_finite_from_values(
+                    support_row.get("off_time"),
+                    raw_obs_meta.get("off_time"),
+                ),
+                "off_time_units": _td_first_text_from_values(
+                    support_row.get("off_time_units"),
+                    raw_obs_meta.get("off_time_units"),
+                ),
+                "suppression_voltage": sequence_suppression_voltage,
+                "suppression_voltage_units": _td_first_text_from_values(
+                    support_row.get("suppression_voltage_units"),
+                    raw_obs_meta.get("suppression_voltage_units"),
+                ),
+                "valve_voltage": sequence_valve_voltage,
+                "valve_voltage_units": _td_first_text_from_values(
+                    support_row.get("valve_voltage_units"),
+                    raw_obs_meta.get("valve_voltage_units"),
+                ),
+                "data_mode_raw": _td_first_text_from_values(
+                    support_row.get("data_mode_raw"),
+                    raw_obs_meta.get("data_mode_raw"),
+                ),
+                "source_sheet_name": _td_first_text_from_values(
+                    support_row.get("source_sheet_name"),
+                    raw_obs_meta.get("source_sheet_name"),
+                ),
+                "extraction_status": _td_first_text_from_values(
+                    support_row.get("extraction_status"),
+                    raw_obs_meta.get("extraction_status"),
+                ),
+                "extraction_reason": _td_first_text_from_values(
+                    support_row.get("extraction_reason"),
+                    raw_obs_meta.get("extraction_reason"),
+                ),
+            }
             sequence_source_mtime = int(source_mtime_ns or raw_obs_meta.get("source_mtime_ns") or 0)
-            sequence_obs_rows_by_id[obs_id] = (
+            is_new_sequence_obs = obs_id not in sequence_obs_rows_by_id
+            sequence_obs_rows_by_id[obs_id] = _td_build_sequence_observation_row(
                 obs_id,
                 serial_txt,
                 condition_key,
@@ -17730,6 +18920,8 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 sequence_valve_voltage,
                 sequence_source_mtime,
                 computed_epoch_ns,
+                sequence_metadata_row,
+                fallback_display_name=str(support_row.get("display_name") or condition_key).strip() or condition_key,
             )
             stats_map = _compute_stats(list(filtered_y))
             for stat in selected_stats:
@@ -17760,6 +18952,29 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                         prog_txt,
                         source_run_name,
                     )
+            if is_new_sequence_obs:
+                for metric_name, metric_value, metric_units in _td_sequence_context_constant_metrics(
+                    sequence_metadata_row,
+                    measured_names=raw_y_by_run.get(raw_run) or set(),
+                ):
+                    condition_y_names.setdefault(condition_key, set()).add(metric_name)
+                    if metric_units:
+                        condition_units_by_name.setdefault(condition_key, {}).setdefault(metric_name, metric_units)
+                    aggregated_curve_values.setdefault((condition_key, serial_txt, metric_name), []).append(float(metric_value))
+                    constant_stats_map = _compute_constant_stats(float(metric_value))
+                    for stat in selected_stats:
+                        sequence_metric_rows_by_key[(obs_id, metric_name, str(stat))] = (
+                            obs_id,
+                            serial_txt,
+                            condition_key,
+                            metric_name,
+                            str(stat),
+                            constant_stats_map.get(stat),
+                            computed_epoch_ns,
+                            sequence_source_mtime,
+                            prog_txt,
+                            source_run_name,
+                        )
 
         metrics_written = 0
         calc_columns_written = 0
@@ -17803,18 +19018,95 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                 run_valve_voltage_value = _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX)
             run_type_text = _td_first_text_from_values(
                 condition_meta.get("run_type"),
+                (raw_run_defaults.get(condition_key) or {}).get("run_type"),
                 _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX),
             )
+            run_metadata_row = {
+                "condition_display": _td_first_text_from_values(
+                    condition_meta.get("condition_display"),
+                    (raw_run_defaults.get(condition_key) or {}).get("condition_display"),
+                    run_display_name,
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_CONDITION_DISPLAY_IDX),
+                ),
+                "feed_pressure": _td_first_finite_from_values(
+                    condition_meta.get("feed_pressure"),
+                    (raw_run_defaults.get(condition_key) or {}).get("feed_pressure"),
+                    _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_IDX),
+                ),
+                "feed_pressure_units": _td_first_text_from_values(
+                    condition_meta.get("feed_pressure_units"),
+                    (raw_run_defaults.get(condition_key) or {}).get("feed_pressure_units"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_UNITS_IDX),
+                ),
+                "feed_temperature": _td_first_finite_from_values(
+                    condition_meta.get("feed_temperature"),
+                    (raw_run_defaults.get(condition_key) or {}).get("feed_temperature"),
+                    _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_IDX),
+                ),
+                "feed_temperature_units": _td_first_text_from_values(
+                    condition_meta.get("feed_temperature_units"),
+                    (raw_run_defaults.get(condition_key) or {}).get("feed_temperature_units"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_UNITS_IDX),
+                ),
+                "pulse_width_units": _td_first_text_from_values(
+                    condition_meta.get("pulse_width_units"),
+                    (raw_run_defaults.get(condition_key) or {}).get("pulse_width_units"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_UNITS_IDX),
+                ),
+                "off_time": _td_first_finite_from_values(
+                    condition_meta.get("off_time"),
+                    (raw_run_defaults.get(condition_key) or {}).get("off_time"),
+                    _td_unique_sequence_float(condition_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_IDX),
+                ),
+                "off_time_units": _td_first_text_from_values(
+                    condition_meta.get("off_time_units"),
+                    (raw_run_defaults.get(condition_key) or {}).get("off_time_units"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_UNITS_IDX),
+                ),
+                "suppression_voltage": run_suppression_voltage_value,
+                "suppression_voltage_units": _td_first_text_from_values(
+                    condition_meta.get("suppression_voltage_units"),
+                    (raw_run_defaults.get(condition_key) or {}).get("suppression_voltage_units"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_UNITS_IDX),
+                ),
+                "valve_voltage": run_valve_voltage_value,
+                "valve_voltage_units": _td_first_text_from_values(
+                    condition_meta.get("valve_voltage_units"),
+                    (raw_run_defaults.get(condition_key) or {}).get("valve_voltage_units"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_UNITS_IDX),
+                ),
+                "data_mode_raw": _td_first_text_from_values(
+                    condition_meta.get("data_mode_raw"),
+                    (raw_run_defaults.get(condition_key) or {}).get("data_mode_raw"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_DATA_MODE_RAW_IDX),
+                ),
+                "source_sheet_name": _td_first_text_from_values(
+                    condition_meta.get("source_sheet_name"),
+                    (raw_run_defaults.get(condition_key) or {}).get("source_sheet_name"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_SOURCE_SHEET_NAME_IDX),
+                ),
+                "extraction_status": _td_first_text_from_values(
+                    condition_meta.get("extraction_status"),
+                    (raw_run_defaults.get(condition_key) or {}).get("extraction_status"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_STATUS_IDX),
+                ),
+                "extraction_reason": _td_first_text_from_values(
+                    condition_meta.get("extraction_reason"),
+                    (raw_run_defaults.get(condition_key) or {}).get("extraction_reason"),
+                    _td_unique_sequence_text(condition_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_REASON_IDX),
+                ),
+            }
             if condition_key not in inserted_runs:
                 inserted_runs.add(condition_key)
                 run_rows_to_write.append(
-                    (
+                    _td_build_impl_run_row(
                         condition_key,
                         default_x,
                         run_display_name,
                         run_type_text,
                         run_control_period_value,
                         run_pulse_width_value,
+                        run_metadata_row,
                     )
                 )
                 calc_param_defs = _td_complete_calc_param_defs(
@@ -17864,8 +19156,72 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             if valve_voltage_value is None:
                 valve_voltage_value = _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_IDX)
             obs_run_type_text = run_type_text or _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_RUN_TYPE_IDX)
+            obs_metadata_row = dict(run_metadata_row)
+            obs_metadata_row.update(
+                {
+                    "condition_display": _td_first_text_from_values(
+                        condition_meta.get("condition_display"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_CONDITION_DISPLAY_IDX),
+                        run_display_name,
+                    ),
+                    "feed_pressure": _td_first_finite_from_values(
+                        condition_meta.get("feed_pressure"),
+                        _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_IDX),
+                    ),
+                    "feed_pressure_units": _td_first_text_from_values(
+                        condition_meta.get("feed_pressure_units"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_PRESSURE_UNITS_IDX),
+                    ),
+                    "feed_temperature": _td_first_finite_from_values(
+                        condition_meta.get("feed_temperature"),
+                        _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_IDX),
+                    ),
+                    "feed_temperature_units": _td_first_text_from_values(
+                        condition_meta.get("feed_temperature_units"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_FEED_TEMPERATURE_UNITS_IDX),
+                    ),
+                    "pulse_width_units": _td_first_text_from_values(
+                        condition_meta.get("pulse_width_units"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_PULSE_WIDTH_UNITS_IDX),
+                    ),
+                    "off_time": _td_first_finite_from_values(
+                        condition_meta.get("off_time"),
+                        _td_unique_sequence_float(serial_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_IDX),
+                    ),
+                    "off_time_units": _td_first_text_from_values(
+                        condition_meta.get("off_time_units"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_OFF_TIME_UNITS_IDX),
+                    ),
+                    "suppression_voltage": suppression_voltage_value,
+                    "suppression_voltage_units": _td_first_text_from_values(
+                        condition_meta.get("suppression_voltage_units"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_SUPPRESSION_VOLTAGE_UNITS_IDX),
+                    ),
+                    "valve_voltage": valve_voltage_value,
+                    "valve_voltage_units": _td_first_text_from_values(
+                        condition_meta.get("valve_voltage_units"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_VALVE_VOLTAGE_UNITS_IDX),
+                    ),
+                    "data_mode_raw": _td_first_text_from_values(
+                        condition_meta.get("data_mode_raw"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_DATA_MODE_RAW_IDX),
+                    ),
+                    "source_sheet_name": _td_first_text_from_values(
+                        condition_meta.get("source_sheet_name"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_SOURCE_SHEET_NAME_IDX),
+                    ),
+                    "extraction_status": _td_first_text_from_values(
+                        condition_meta.get("extraction_status"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_STATUS_IDX),
+                    ),
+                    "extraction_reason": _td_first_text_from_values(
+                        condition_meta.get("extraction_reason"),
+                        _td_unique_sequence_text(serial_sequence_rows, TD_SEQUENCE_OBS_EXTRACTION_REASON_IDX),
+                    ),
+                }
+            )
             obs_rows_to_write.append(
-                (
+                _td_build_impl_observation_row(
                     observation_id_calc,
                     serial_txt,
                     condition_key,
@@ -17878,6 +19234,8 @@ def _rebuild_test_data_project_calc_cache_from_raw(
                     valve_voltage_value,
                     source_mtime_max,
                     computed_epoch_ns,
+                    obs_metadata_row,
+                    fallback_display_name=run_display_name,
                 )
             )
             for y_name in sorted(condition_y_names.get(condition_key) or set()):
@@ -17938,7 +19296,14 @@ def _rebuild_test_data_project_calc_cache_from_raw(
         t0 = time.perf_counter()
         if run_rows_to_write:
             conn.executemany(
-                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
+                """
+                INSERT OR REPLACE INTO td_runs(
+                    run_name, default_x, display_name, run_type, control_period, pulse_width,
+                    condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                    pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                    valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status, extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 run_rows_to_write,
             )
         if column_rows_to_write:
@@ -17950,8 +19315,12 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period,
+                    suppression_voltage, valve_voltage, condition_display, feed_pressure, feed_pressure_units,
+                    feed_temperature, feed_temperature_units, pulse_width_units, off_time, off_time_units,
+                    suppression_voltage_units, valve_voltage_units, data_mode_raw, source_sheet_name,
+                    extraction_status, extraction_reason, source_mtime_ns, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 obs_rows_to_write,
             )
@@ -18007,8 +19376,12 @@ def _rebuild_test_data_project_calc_cache_from_raw(
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO td_condition_observations_sequences(
-                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period,
+                    suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns, condition_display, feed_pressure,
+                    feed_pressure_units, feed_temperature, feed_temperature_units, off_time, pulse_width_units,
+                    off_time_units, suppression_voltage_units, valve_voltage_units, data_mode_raw, source_sheet_name,
+                    extraction_status, extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 sequence_obs_rows_to_write,
             )
@@ -18264,7 +19637,28 @@ def _td_rebuild_raw_summary_tables(
     ).fetchall()
     obs_rows = raw_conn.execute(
         """
-        SELECT run_name, COALESCE(run_type, ''), pulse_width, control_period
+        SELECT
+            run_name,
+            COALESCE(source_run_name, ''),
+            COALESCE(run_type, ''),
+            pulse_width,
+            control_period,
+            suppression_voltage,
+            valve_voltage,
+            COALESCE(condition_display, ''),
+            feed_pressure,
+            COALESCE(feed_pressure_units, ''),
+            feed_temperature,
+            COALESCE(feed_temperature_units, ''),
+            COALESCE(pulse_width_units, ''),
+            off_time,
+            COALESCE(off_time_units, ''),
+            COALESCE(suppression_voltage_units, ''),
+            COALESCE(valve_voltage_units, ''),
+            COALESCE(data_mode_raw, ''),
+            COALESCE(source_sheet_name, ''),
+            COALESCE(extraction_status, ''),
+            COALESCE(extraction_reason, '')
         FROM td_raw_condition_observations
         ORDER BY run_name, observation_id
         """
@@ -18276,16 +19670,82 @@ def _td_rebuild_raw_summary_tables(
     raw_conn.execute("DELETE FROM td_columns_raw")
     raw_conn.execute("DELETE FROM td_raw_curve_catalog")
 
-    run_meta_by_run: dict[str, dict[str, object]] = {}
-    for run_name, run_type, pulse_width, control_period in obs_rows:
+    obs_payloads_by_run: dict[str, list[dict[str, object]]] = {}
+    source_run_names_by_run: dict[str, list[str]] = {}
+    for (
+        run_name,
+        source_run_name,
+        run_type,
+        pulse_width,
+        control_period,
+        suppression_voltage,
+        valve_voltage,
+        condition_display,
+        feed_pressure,
+        feed_pressure_units,
+        feed_temperature,
+        feed_temperature_units,
+        pulse_width_units,
+        off_time,
+        off_time_units,
+        suppression_voltage_units,
+        valve_voltage_units,
+        data_mode_raw,
+        source_sheet_name,
+        extraction_status,
+        extraction_reason,
+    ) in obs_rows:
         run = str(run_name or "").strip()
-        if not run or run in run_meta_by_run:
+        if not run:
             continue
+        obs_payloads_by_run.setdefault(run, []).append(
+            {
+                "run_type": str(run_type or "").strip(),
+                "pulse_width": pulse_width,
+                "control_period": control_period,
+                "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
+                "condition_display": str(condition_display or "").strip(),
+                "feed_pressure": feed_pressure,
+                "feed_pressure_units": str(feed_pressure_units or "").strip(),
+                "feed_temperature": feed_temperature,
+                "feed_temperature_units": str(feed_temperature_units or "").strip(),
+                "pulse_width_units": str(pulse_width_units or "").strip(),
+                "off_time": off_time,
+                "off_time_units": str(off_time_units or "").strip(),
+                "suppression_voltage_units": str(suppression_voltage_units or "").strip(),
+                "valve_voltage_units": str(valve_voltage_units or "").strip(),
+                "data_mode_raw": str(data_mode_raw or "").strip(),
+                "source_sheet_name": str(source_sheet_name or "").strip(),
+                "extraction_status": str(extraction_status or "").strip(),
+                "extraction_reason": str(extraction_reason or "").strip(),
+            }
+        )
+        source_run_text = str(source_run_name or "").strip()
+        if source_run_text:
+            source_run_names_by_run.setdefault(run, []).append(source_run_text)
+
+    def _td_unique_text(values: Sequence[object]) -> str:
+        values_by_key: dict[str, str] = {}
+        for value in values or []:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            values_by_key.setdefault(text.casefold(), text)
+        if len(values_by_key) == 1:
+            return next(iter(values_by_key.values()))
+        return ""
+
+    run_meta_by_run: dict[str, dict[str, object]] = {}
+    for run, payload_rows in obs_payloads_by_run.items():
         run_meta_by_run[run] = {
-            "run_type": str(run_type or "").strip(),
-            "pulse_width": pulse_width,
-            "control_period": control_period,
+            field_name: _td_condition_metadata_unique_value(
+                field_name,
+                [row.get(field_name) for row in payload_rows],
+            )
+            for field_name in TD_CONDITION_METADATA_FIELDS
         }
+        run_meta_by_run[run]["source_run_name"] = _td_unique_text(source_run_names_by_run.get(run) or [])
 
     x_priority = ["Time", "Pulse Number"]
     x_by_run: dict[str, set[str]] = {}
@@ -18307,32 +19767,47 @@ def _td_rebuild_raw_summary_tables(
         )
         default_x = xs[0] if xs else ""
         run_meta = dict(run_meta_by_run.get(run) or {})
-        display_name = str(display_by_run.get(run) or run).strip() or run
+        display_name = str(display_by_run.get(run) or run_meta.get("condition_display") or run).strip() or run
+        source_run_name = str(run_meta.get("source_run_name") or run).strip() or run
         raw_conn.execute(
-            "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-            (
+            """
+            INSERT OR REPLACE INTO td_runs(
+                run_name, default_x, display_name, run_type, control_period, pulse_width,
+                condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status, extraction_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            _td_build_impl_run_row(
                 run,
                 default_x,
                 display_name,
-                str(run_meta.get('run_type') or "").strip(),
+                str(run_meta.get("run_type") or "").strip(),
                 run_meta.get("control_period"),
                 run_meta.get("pulse_width"),
+                run_meta,
             ),
         )
         raw_conn.execute(
             """
-            INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO td_raw_sequences(
+                run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period,
+                condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status,
+                extraction_reason, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
+            _td_build_raw_sequence_row(
                 run,
                 display_name,
                 default_x,
-                run,
+                source_run_name,
                 run_meta.get("pulse_width"),
                 str(run_meta.get("run_type") or "").strip(),
                 run_meta.get("control_period"),
                 int(computed_epoch_ns),
+                run_meta,
             ),
         )
         for x_name in xs:
@@ -19093,17 +20568,26 @@ def rebuild_test_data_project_cache(
                     "sequence_name": str(seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                     "display_name": str(seq.get("display_name") or seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                     "source_run_name": str(source_run or "").strip(),
+                    "source_sheet_name": str(seq.get("source_sheet_name") or effective.get("source_sheet_name") or "").strip(),
                     "feed_pressure": seq.get("feed_pressure", effective.get("feed_pressure")),
                     "feed_pressure_units": str(seq.get("feed_pressure_units") or effective.get("feed_pressure_units") or "").strip(),
                     "feed_temperature": seq.get("feed_temperature", effective.get("feed_temperature")),
                     "feed_temperature_units": str(seq.get("feed_temperature_units") or effective.get("feed_temperature_units") or "").strip(),
                     "pulse_width": _td_support_sequence_pulse_width(seq),
+                    "pulse_width_units": str(seq.get("pulse_width_units") or effective.get("pulse_width_units") or "").strip(),
+                    "off_time": seq.get("off_time", effective.get("off_time")),
+                    "off_time_units": str(seq.get("off_time_units") or effective.get("off_time_units") or "").strip(),
                     "exclude_first_n": seq.get("exclude_first_n"),
                     "last_n_rows": seq.get("last_n_rows"),
                     "run_type": str(seq.get("run_type") or effective.get("run_type") or "").strip(),
                     "control_period": seq.get("control_period", effective.get("control_period")),
                     "suppression_voltage": seq.get("suppression_voltage", effective.get("suppression_voltage")),
+                    "suppression_voltage_units": str(seq.get("suppression_voltage_units") or effective.get("suppression_voltage_units") or "").strip(),
                     "valve_voltage": seq.get("valve_voltage", effective.get("valve_voltage")),
+                    "valve_voltage_units": str(seq.get("valve_voltage_units") or effective.get("valve_voltage_units") or "").strip(),
+                    "data_mode_raw": str(seq.get("data_mode_raw") or effective.get("data_mode_raw") or "").strip(),
+                    "extraction_status": str(seq.get("extraction_status") or effective.get("extraction_status") or "").strip(),
+                    "extraction_reason": str(seq.get("extraction_reason") or effective.get("extraction_reason") or "").strip(),
                     "program_title": str(program_title or "").strip(),
                     "matched_support": False,
                 }
@@ -19127,17 +20611,26 @@ def rebuild_test_data_project_cache(
                 "sequence_name": str(seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                 "display_name": str(seq.get("display_name") or seq.get("condition_key") or seq.get("sequence_name") or source_run).strip() or str(source_run or "").strip(),
                 "source_run_name": str(source_run or "").strip(),
+                "source_sheet_name": str(seq.get("source_sheet_name") or effective.get("source_sheet_name") or "").strip(),
                 "feed_pressure": seq.get("feed_pressure", effective.get("feed_pressure")),
                 "feed_pressure_units": str(seq.get("feed_pressure_units") or effective.get("feed_pressure_units") or "").strip(),
                 "feed_temperature": seq.get("feed_temperature", effective.get("feed_temperature")),
                 "feed_temperature_units": str(seq.get("feed_temperature_units") or effective.get("feed_temperature_units") or "").strip(),
                 "pulse_width": _td_support_sequence_pulse_width(seq),
+                "pulse_width_units": str(seq.get("pulse_width_units") or effective.get("pulse_width_units") or "").strip(),
+                "off_time": seq.get("off_time", effective.get("off_time")),
+                "off_time_units": str(seq.get("off_time_units") or effective.get("off_time_units") or "").strip(),
                 "exclude_first_n": seq.get("exclude_first_n"),
                 "last_n_rows": seq.get("last_n_rows"),
                 "run_type": str(seq.get("run_type") or effective.get("run_type") or "").strip(),
                 "control_period": seq.get("control_period", effective.get("control_period")),
                 "suppression_voltage": seq.get("suppression_voltage", effective.get("suppression_voltage")),
+                "suppression_voltage_units": str(seq.get("suppression_voltage_units") or effective.get("suppression_voltage_units") or "").strip(),
                 "valve_voltage": seq.get("valve_voltage", effective.get("valve_voltage")),
+                "valve_voltage_units": str(seq.get("valve_voltage_units") or effective.get("valve_voltage_units") or "").strip(),
+                "data_mode_raw": str(seq.get("data_mode_raw") or effective.get("data_mode_raw") or "").strip(),
+                "extraction_status": str(seq.get("extraction_status") or effective.get("extraction_status") or "").strip(),
+                "extraction_reason": str(seq.get("extraction_reason") or effective.get("extraction_reason") or "").strip(),
                 "program_title": str(program_title or "").strip(),
                 "matched_support": True,
             }
@@ -19146,6 +20639,23 @@ def rebuild_test_data_project_cache(
             current_source_sequence_context_by_run.get(_td_support_norm_name(source_run)),
             blank_unusable_defaults=False,
         )
+        effective_label = _td_effective_run_condition_label(
+            effective,
+            fallback_display_name=(effective.get("display_name") or source_run),
+        )
+        effective["condition_display"] = effective_label
+        if effective_label:
+            if _td_support_blankish(effective.get("condition_key")) or _td_support_name_is_default(
+                effective.get("condition_key"),
+                source_run,
+            ):
+                effective["condition_key"] = effective_label
+                effective["sequence_name"] = effective_label
+            if _td_support_blankish(effective.get("display_name")) or _td_support_name_is_default(
+                effective.get("display_name"),
+                source_run,
+            ):
+                effective["display_name"] = effective_label
         return effective
 
     def _filter_rows_for_metric(
@@ -19676,17 +21186,31 @@ def rebuild_test_data_project_cache(
                     pulse_width_value = run_info.get("pulse_width")
                     if pulse_width_value not in (None, "") and effective_run not in run_pulse_width_by_run:
                         run_pulse_width_by_run[effective_run] = pulse_width_value
-                    run_meta_by_run.setdefault(
-                        effective_run,
-                        {
-                            "display_name": run_display_name,
-                            "run_type": str(run_info.get("run_type") or "").strip(),
-                            "control_period": run_info.get("control_period"),
-                            "pulse_width": pulse_width_value,
-                            "suppression_voltage": run_info.get("suppression_voltage"),
-                            "valve_voltage": run_info.get("valve_voltage"),
-                        },
-                    )
+                    run_meta = run_meta_by_run.setdefault(effective_run, {})
+                    for key, value in {
+                        "display_name": run_display_name,
+                        "condition_display": str(run_info.get("condition_display") or run_display_name).strip(),
+                        "run_type": str(run_info.get("run_type") or "").strip(),
+                        "control_period": run_info.get("control_period"),
+                        "pulse_width": pulse_width_value,
+                        "feed_pressure": run_info.get("feed_pressure"),
+                        "feed_pressure_units": str(run_info.get("feed_pressure_units") or "").strip(),
+                        "feed_temperature": run_info.get("feed_temperature"),
+                        "feed_temperature_units": str(run_info.get("feed_temperature_units") or "").strip(),
+                        "pulse_width_units": str(run_info.get("pulse_width_units") or "").strip(),
+                        "off_time": run_info.get("off_time"),
+                        "off_time_units": str(run_info.get("off_time_units") or "").strip(),
+                        "suppression_voltage": run_info.get("suppression_voltage"),
+                        "suppression_voltage_units": str(run_info.get("suppression_voltage_units") or "").strip(),
+                        "valve_voltage": run_info.get("valve_voltage"),
+                        "valve_voltage_units": str(run_info.get("valve_voltage_units") or "").strip(),
+                        "data_mode_raw": str(run_info.get("data_mode_raw") or "").strip(),
+                        "source_sheet_name": str(run_info.get("source_sheet_name") or "").strip(),
+                        "extraction_status": str(run_info.get("extraction_status") or "").strip(),
+                        "extraction_reason": str(run_info.get("extraction_reason") or "").strip(),
+                    }.items():
+                        if run_meta.get(key) in (None, "") and value not in (None, ""):
+                            run_meta[key] = value
 
                     # Collect per-run variable values for optional user-defined condition labels.
                     if td_run_labeling_enabled and label_template and label_variables and label_value_pick == "most_common":
@@ -19884,7 +21408,25 @@ def rebuild_test_data_project_cache(
                             sequence_valve_voltage = _finite_float(run_info.get("valve_voltage"))
                             sequence_run_type = str(run_info.get("run_type") or "").strip()
                             sequence_source_mtime = int(mtime_ns or 0)
-                            calc_sequence_obs_rows_by_id[str(observation_id)] = (
+                            sequence_metadata_row = {
+                                "condition_display": str(run_info.get("condition_display") or run_display_name).strip(),
+                                "feed_pressure": run_info.get("feed_pressure"),
+                                "feed_pressure_units": str(run_info.get("feed_pressure_units") or "").strip(),
+                                "feed_temperature": run_info.get("feed_temperature"),
+                                "feed_temperature_units": str(run_info.get("feed_temperature_units") or "").strip(),
+                                "pulse_width_units": str(run_info.get("pulse_width_units") or "").strip(),
+                                "off_time": run_info.get("off_time"),
+                                "off_time_units": str(run_info.get("off_time_units") or "").strip(),
+                                "suppression_voltage": sequence_suppression_voltage,
+                                "suppression_voltage_units": str(run_info.get("suppression_voltage_units") or "").strip(),
+                                "valve_voltage": sequence_valve_voltage,
+                                "valve_voltage_units": str(run_info.get("valve_voltage_units") or "").strip(),
+                                "data_mode_raw": str(run_info.get("data_mode_raw") or "").strip(),
+                                "source_sheet_name": str(run_info.get("source_sheet_name") or "").strip(),
+                                "extraction_status": str(run_info.get("extraction_status") or "").strip(),
+                                "extraction_reason": str(run_info.get("extraction_reason") or "").strip(),
+                            }
+                            calc_sequence_obs_rows_by_id[str(observation_id)] = _td_build_sequence_observation_row(
                                 str(observation_id),
                                 str(sn),
                                 str(effective_run),
@@ -19897,6 +21439,8 @@ def rebuild_test_data_project_cache(
                                 sequence_valve_voltage,
                                 sequence_source_mtime,
                                 computed_epoch_ns,
+                                sequence_metadata_row,
+                                fallback_display_name=run_display_name,
                             )
                             for y_name in matched_y_names:
                                 curve_payload = serialized_curves.get(y_name)
@@ -19940,15 +21484,43 @@ def rebuild_test_data_project_cache(
                                         str(source_program_title or ""),
                                         str(source_run_name_text or ""),
                                     )
+                            for metric_name, metric_value, metric_units in _td_sequence_context_constant_metrics(
+                                sequence_metadata_row,
+                                measured_names=matched_y_names,
+                            ):
+                                calc_condition_y_names.setdefault(str(effective_run), set()).add(str(metric_name))
+                                if metric_name not in calc_units or not calc_units.get(metric_name):
+                                    calc_units[metric_name] = metric_units
+                                calc_aggregated_curve_values.setdefault((str(effective_run), str(sn), str(metric_name)), []).append(
+                                    float(metric_value)
+                                )
+                                constant_stats_map = _compute_constant_stats(float(metric_value))
+                                for stat in selected_stats:
+                                    calc_sequence_metric_rows_by_key[(str(observation_id), str(metric_name), str(stat))] = (
+                                        str(observation_id),
+                                        str(sn),
+                                        str(effective_run),
+                                        str(metric_name),
+                                        str(stat),
+                                        constant_stats_map.get(stat),
+                                        computed_epoch_ns,
+                                        sequence_source_mtime,
+                                        str(source_program_title or ""),
+                                        str(source_run_name_text or ""),
+                                    )
                         if actual_x and serialized_curves:
                             t_raw_write = time.perf_counter()
                             raw_conn.execute(
                                 """
                                 INSERT OR REPLACE INTO td_raw_condition_observations(
-                                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, valve_voltage, source_mtime_ns, computed_epoch_ns
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period,
+                                    suppression_voltage, valve_voltage, condition_display, feed_pressure, feed_pressure_units,
+                                    feed_temperature, feed_temperature_units, pulse_width_units, off_time, off_time_units,
+                                    suppression_voltage_units, valve_voltage_units, data_mode_raw, source_sheet_name,
+                                    extraction_status, extraction_reason, source_mtime_ns, computed_epoch_ns
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
-                                (
+                                _td_build_raw_observation_row(
                                     observation_id,
                                     effective_run,
                                     sn,
@@ -19961,6 +21533,25 @@ def rebuild_test_data_project_cache(
                                     valve_voltage_float,
                                     mtime_ns,
                                     computed_epoch_ns,
+                                    {
+                                        "condition_display": str(run_info.get("condition_display") or run_display_name).strip(),
+                                        "feed_pressure": run_info.get("feed_pressure"),
+                                        "feed_pressure_units": str(run_info.get("feed_pressure_units") or "").strip(),
+                                        "feed_temperature": run_info.get("feed_temperature"),
+                                        "feed_temperature_units": str(run_info.get("feed_temperature_units") or "").strip(),
+                                        "pulse_width_units": str(run_info.get("pulse_width_units") or "").strip(),
+                                        "off_time": run_info.get("off_time"),
+                                        "off_time_units": str(run_info.get("off_time_units") or "").strip(),
+                                        "suppression_voltage": suppression_voltage_float,
+                                        "suppression_voltage_units": str(run_info.get("suppression_voltage_units") or "").strip(),
+                                        "valve_voltage": valve_voltage_float,
+                                        "valve_voltage_units": str(run_info.get("valve_voltage_units") or "").strip(),
+                                        "data_mode_raw": str(run_info.get("data_mode_raw") or "").strip(),
+                                        "source_sheet_name": str(run_info.get("source_sheet_name") or "").strip(),
+                                        "extraction_status": str(run_info.get("extraction_status") or "").strip(),
+                                        "extraction_reason": str(run_info.get("extraction_reason") or "").strip(),
+                                    },
+                                    fallback_display_name=run_display_name,
                                 ),
                             )
                             timings["raw_db_write_s"] += time.perf_counter() - t_raw_write
@@ -20347,15 +21938,35 @@ def rebuild_test_data_project_cache(
             control_period = _finite_float(run_meta.get("control_period"))
             pulse_width = _finite_float(run_meta.get("pulse_width"))
             raw_conn.execute(
-                "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-                (run, default_x, display_name, run_type, control_period, pulse_width),
+                """
+                INSERT OR REPLACE INTO td_runs(
+                    run_name, default_x, display_name, run_type, control_period, pulse_width,
+                    condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                    pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                    valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status, extraction_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                _td_build_impl_run_row(
+                    run,
+                    default_x,
+                    display_name,
+                    run_type,
+                    control_period,
+                    pulse_width,
+                    run_meta,
+                ),
             )
             raw_conn.execute(
                 """
-                INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO td_raw_sequences(
+                    run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period,
+                    condition_display, feed_pressure, feed_pressure_units, feed_temperature, feed_temperature_units,
+                    pulse_width_units, off_time, off_time_units, suppression_voltage, suppression_voltage_units,
+                    valve_voltage, valve_voltage_units, data_mode_raw, source_sheet_name, extraction_status,
+                    extraction_reason, computed_epoch_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
+                _td_build_raw_sequence_row(
                     run,
                     display_name,
                     default_x,
@@ -20364,6 +21975,7 @@ def rebuild_test_data_project_cache(
                     run_type,
                     control_period,
                     computed_epoch_ns,
+                    run_meta,
                 ),
             )
             for x in sorted(xs, key=lambda k: x_priority.index(k) if k in x_priority else 999):
@@ -20426,8 +22038,30 @@ def rebuild_test_data_project_cache(
                 "run_type": str((run_meta_by_run.get(run) or {}).get("run_type") or "").strip(),
                 "control_period": (run_meta_by_run.get(run) or {}).get("control_period"),
                 "pulse_width": (run_meta_by_run.get(run) or {}).get("pulse_width"),
+                "condition_display": str(
+                    display_by_run.get(run)
+                    or (run_meta_by_run.get(run) or {}).get("condition_display")
+                    or (run_meta_by_run.get(run) or {}).get("display_name")
+                    or run
+                ).strip()
+                or str(run),
+                "feed_pressure": (run_meta_by_run.get(run) or {}).get("feed_pressure"),
+                "feed_pressure_units": str((run_meta_by_run.get(run) or {}).get("feed_pressure_units") or "").strip(),
+                "feed_temperature": (run_meta_by_run.get(run) or {}).get("feed_temperature"),
+                "feed_temperature_units": str((run_meta_by_run.get(run) or {}).get("feed_temperature_units") or "").strip(),
+                "pulse_width_units": str((run_meta_by_run.get(run) or {}).get("pulse_width_units") or "").strip(),
+                "off_time": (run_meta_by_run.get(run) or {}).get("off_time"),
+                "off_time_units": str((run_meta_by_run.get(run) or {}).get("off_time_units") or "").strip(),
                 "suppression_voltage": (run_meta_by_run.get(run) or {}).get("suppression_voltage"),
+                "suppression_voltage_units": str(
+                    (run_meta_by_run.get(run) or {}).get("suppression_voltage_units") or ""
+                ).strip(),
                 "valve_voltage": (run_meta_by_run.get(run) or {}).get("valve_voltage"),
+                "valve_voltage_units": str((run_meta_by_run.get(run) or {}).get("valve_voltage_units") or "").strip(),
+                "data_mode_raw": str((run_meta_by_run.get(run) or {}).get("data_mode_raw") or "").strip(),
+                "source_sheet_name": str((run_meta_by_run.get(run) or {}).get("source_sheet_name") or "").strip(),
+                "extraction_status": str((run_meta_by_run.get(run) or {}).get("extraction_status") or "").strip(),
+                "extraction_reason": str((run_meta_by_run.get(run) or {}).get("extraction_reason") or "").strip(),
             }
             for run in runs_all
             if str(run).strip()
@@ -24614,13 +26248,15 @@ def _td_perf_export_series_for_stat(
 
 
 def _td_perf_export_condition_label(row: Mapping[str, object], *, display_name: str = "") -> str:
-    parts: list[str] = []
-    for candidate in (display_name, row.get("program_title"), row.get("source_run_name")):
+    for candidate in (
+        row.get("condition_display"),
+        display_name,
+        row.get("display_name"),
+        row.get("run_name"),
+    ):
         text = str(candidate or "").strip()
-        if text and text not in parts:
-            parts.append(text)
-    if parts:
-        return " | ".join(parts)
+        if text:
+            return text
     return str(row.get("run_name") or "").strip()
 
 
@@ -36102,11 +37738,26 @@ def update_test_data_trending_project_workbook(
                 COALESCE(o.program_title, ''),
                 COALESCE(o.source_run_name, ''),
                 o.run_name,
-                COALESCE(s.display_name, ''),
+                COALESCE(o.condition_display, s.condition_display, s.display_name, ''),
                 COALESCE(s.x_axis_kind, ''),
                 COALESCE(o.run_type, ''),
                 o.pulse_width,
+                COALESCE(o.pulse_width_units, ''),
+                o.off_time,
+                COALESCE(o.off_time_units, ''),
                 o.control_period,
+                o.feed_pressure,
+                COALESCE(o.feed_pressure_units, ''),
+                o.feed_temperature,
+                COALESCE(o.feed_temperature_units, ''),
+                o.suppression_voltage,
+                COALESCE(o.suppression_voltage_units, ''),
+                o.valve_voltage,
+                COALESCE(o.valve_voltage_units, ''),
+                COALESCE(o.data_mode_raw, ''),
+                COALESCE(o.source_sheet_name, ''),
+                COALESCE(o.extraction_status, ''),
+                COALESCE(o.extraction_reason, ''),
                 o.source_mtime_ns
             FROM td_raw_condition_observations o
             LEFT JOIN td_raw_sequences s
@@ -36331,7 +37982,22 @@ def update_test_data_trending_project_workbook(
             "x_axis_kind",
             "run_type",
             "pulse_width",
+            "pulse_width_units",
+            "off_time",
+            "off_time_units",
             "control_period",
+            "feed_pressure",
+            "feed_pressure_units",
+            "feed_temperature",
+            "feed_temperature_units",
+            "suppression_voltage",
+            "suppression_voltage_units",
+            "valve_voltage",
+            "valve_voltage_units",
+            "data_mode_raw",
+            "source_sheet_name",
+            "extraction_status",
+            "extraction_reason",
             "source_mtime_ns",
         ],
     )

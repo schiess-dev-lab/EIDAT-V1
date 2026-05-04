@@ -134,7 +134,22 @@ TEST_RAW_CACHE_LONG_HEADER = [
     "x_axis_kind",
     "run_type",
     "pulse_width",
+    "pulse_width_units",
+    "off_time",
+    "off_time_units",
     "control_period",
+    "feed_pressure",
+    "feed_pressure_units",
+    "feed_temperature",
+    "feed_temperature_units",
+    "suppression_voltage",
+    "suppression_voltage_units",
+    "valve_voltage",
+    "valve_voltage_units",
+    "data_mode_raw",
+    "source_sheet_name",
+    "extraction_status",
+    "extraction_reason",
     "source_mtime_ns",
 ]
 
@@ -253,7 +268,96 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
 
     ws_raw_cache_long = wb.create_sheet("RawCache_long")
     ws_raw_cache_long.append(TEST_RAW_CACHE_LONG_HEADER)
-    ws_raw_cache_long.append(["obs1", "SN-001", "Program Alpha", "RunA", "RunA", "RunA", "time", "", None, None, 1])
+    ws_raw_cache_long.append(
+        [
+            "obs1",
+            "SN-001",
+            "Program Alpha",
+            "RunA",
+            "RunA",
+            "RunA",
+            "time",
+            "",
+            None,
+            "",
+            None,
+            "",
+            None,
+            None,
+            "",
+            None,
+            "",
+            None,
+            "",
+            None,
+            "",
+            "",
+            "RunA",
+            "ok",
+            "",
+            1,
+        ]
+    )
+
+    ws_life_metrics = wb.create_sheet("Life_metrics")
+    ws_life_metrics.append(
+        [
+            "observation_id",
+            "serial",
+            "sequence_index",
+            "sequence_label",
+            "condition_key",
+            "condition_display",
+            "program_title",
+            "source_run_name",
+            "parameter_name",
+            "stat",
+            "value_num",
+            "units",
+            "sequence_pulses",
+            "cumulative_pulses",
+            "sequence_on_time",
+            "cumulative_on_time",
+            "sequence_elapsed_time",
+            "cumulative_elapsed_time",
+            "sequence_throughput",
+            "cumulative_throughput",
+            "sequence_impulse",
+            "cumulative_impulse",
+            "diagnostics",
+            "source_mtime_ns",
+            "computed_epoch_ns",
+        ]
+    )
+    ws_life_metrics.append(
+        [
+            "obs1",
+            "SN-001",
+            1,
+            "Seq 1",
+            "RunA",
+            "RunA",
+            "Program Alpha",
+            "RunA",
+            "Pressure",
+            "mean",
+            1.23,
+            "psi",
+            1,
+            1,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            None,
+            None,
+            "",
+            1,
+            1,
+        ]
+    )
 
     wb.save(str(workbook_path))
     wb.close()
@@ -304,8 +408,13 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
             ("SN-001", str(source_db), "ok", "", "", "[]", 1, 2, ""),
         )
         conn.execute(
-            "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width) VALUES (?, ?, ?, ?, ?, ?)",
-            ("RunA", "time", "RunA", "", None, None),
+            """
+            INSERT OR REPLACE INTO td_runs(
+                run_name, default_x, display_name, run_type, control_period, pulse_width,
+                condition_display, source_sheet_name, extraction_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("RunA", "time", "RunA", "", None, None, "RunA", "RunA", "ok"),
         )
         conn.execute(
             "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
@@ -324,11 +433,23 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
         )
         conn.execute(
             """
-            INSERT OR REPLACE INTO td_condition_observations_sequences(
-                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO td_condition_observations(
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period,
+                suppression_voltage, valve_voltage, condition_display, source_sheet_name, extraction_status,
+                source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("obs1", "SN-001", "RunA", "Program Alpha", "RunA", "", None, None, None, 1, 1),
+            ("obs1", "SN-001", "RunA", "Program Alpha", "RunA", "", None, None, None, None, "RunA", "RunA", "ok", 1, 1),
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO td_condition_observations_sequences(
+                observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, control_period,
+                suppression_voltage, valve_voltage, condition_display, source_sheet_name, extraction_status,
+                source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("obs1", "SN-001", "RunA", "Program Alpha", "RunA", "", None, None, None, None, "RunA", "RunA", "ok", 1, 1),
         )
         conn.executemany(
             """
@@ -341,6 +462,153 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
                 ("obs1", "SN-001", "RunA", "Pressure", "max", 1.45, 1, 1, "Program Alpha", "RunA"),
             ],
         )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_LIFE_METRICS_TABLE}(
+                observation_id, serial, sequence_index, sequence_label, condition_key, condition_display,
+                program_title, source_run_name, parameter_name, stat, value_num, units, sequence_pulses,
+                cumulative_pulses, sequence_on_time, cumulative_on_time, sequence_elapsed_time,
+                cumulative_elapsed_time, sequence_throughput, cumulative_throughput, sequence_impulse,
+                cumulative_impulse, diagnostics, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "obs1",
+                "SN-001",
+                1,
+                "Seq 1",
+                "RunA",
+                "RunA",
+                "Program Alpha",
+                "RunA",
+                "Pressure",
+                "mean",
+                1.23,
+                "psi",
+                1,
+                1,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                None,
+                None,
+                None,
+                None,
+                "",
+                1,
+                1,
+            ),
+        )
+        canonical_id = backend._td_program_parameter_canonical_id("Pressure")
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_DISCOVERY_TABLE}(
+                surface, run_name, raw_name, raw_norm, units, program_title, asset_type, asset_specific_type,
+                source_run_name, source_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "metrics",
+                "RunA",
+                "Pressure",
+                backend._td_param_norm_name("Pressure"),
+                "psi",
+                "Program Alpha",
+                "Valve",
+                "Main",
+                "RunA",
+                "SN-001",
+            ),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_NORM_GROUPS_TABLE}(
+                canonical_id, display_name, preferred_units, explicit
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (canonical_id, "Pressure", "psi", 1),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_NORM_RULES_TABLE}(
+                raw_name, raw_norm, program_title, program_norm, asset_type, asset_norm, asset_specific_type,
+                asset_specific_norm, canonical_id, default_display_parameter, displayed_parameter,
+                preferred_units, enabled, edited
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "Pressure",
+                backend._td_param_norm_name("Pressure"),
+                "Program Alpha",
+                backend._td_param_norm_name("Program Alpha"),
+                "Valve",
+                backend._td_param_norm_name("Valve"),
+                "Main",
+                backend._td_param_norm_name("Main"),
+                canonical_id,
+                "Pressure",
+                "Pressure",
+                "psi",
+                1,
+                0,
+            ),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_RUNTIME_ENTRIES_TABLE}(
+                surface, run_name, raw_name, raw_norm, units, program_title, asset_type, asset_specific_type,
+                source_run_name, source_key, canonical_id, default_display_parameter
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "metrics",
+                "RunA",
+                "Pressure",
+                backend._td_param_norm_name("Pressure"),
+                "psi",
+                "Program Alpha",
+                "Valve",
+                "Main",
+                "RunA",
+                "SN-001",
+                canonical_id,
+                "Pressure",
+            ),
+        )
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {backend.TD_PARAM_RUNTIME_GROUPS_TABLE}(
+                canonical_id, display_name, preferred_units, raw_names_json, units_json, program_titles_json,
+                asset_types_json, asset_specific_types_json, source_run_names_json, surfaces_json, run_names_json,
+                unit_conflict, explicit
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                canonical_id,
+                "Pressure",
+                "psi",
+                '["Pressure"]',
+                '["psi"]',
+                '["Program Alpha"]',
+                '["Valve"]',
+                '["Main"]',
+                '["RunA"]',
+                '["metrics"]',
+                '["RunA"]',
+                0,
+                1,
+            ),
+        )
+        discovery_signature = backend._td_parameter_discovery_signature(conn)
+        runtime_signature = backend._td_parameter_runtime_signature(discovery_signature, [])
+        conn.executemany(
+            "INSERT OR REPLACE INTO td_meta(key, value) VALUES (?, ?)",
+            [
+                (backend.TD_PARAM_DISCOVERY_SIGNATURE_META_KEY, discovery_signature),
+                (backend.TD_PARAM_RUNTIME_SIGNATURE_META_KEY, runtime_signature),
+            ],
+        )
         conn.commit()
 
     with closing(sqlite3.connect(str(raw_db))) as conn:
@@ -348,18 +616,20 @@ def _create_ready_td_project_fixture(project_dir: Path) -> tuple[Path, Path, Pat
         conn.execute(
             """
             INSERT OR REPLACE INTO td_raw_sequences(
-                run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period,
+                condition_display, source_sheet_name, extraction_status, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("RunA", "RunA", "time", "RunA", None, "", None, 1),
+            ("RunA", "RunA", "time", "RunA", None, "", None, "RunA", "RunA", "ok", 1),
         )
         conn.execute(
             """
             INSERT OR REPLACE INTO td_raw_condition_observations(
-                observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, source_mtime_ns, computed_epoch_ns
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period,
+                condition_display, source_sheet_name, extraction_status, source_mtime_ns, computed_epoch_ns
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            ("obs1", "RunA", "SN-001", "Program Alpha", "RunA", "", None, None, 1, 1),
+            ("obs1", "RunA", "SN-001", "Program Alpha", "RunA", "", None, None, "RunA", "RunA", "ok", 1, 1),
         )
         conn.execute(
             """
@@ -851,21 +1121,10 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             impl_db = project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB
             raw_db = project_dir / backend.EIDAT_PROJECT_TD_RAW_CACHE_DB
             raw_points = project_dir / backend.EIDAT_PROJECT_TD_RAW_POINTS_XLSX
+            impl_db.write_text("impl", encoding="utf-8")
+            raw_db.write_text("raw", encoding="utf-8")
+            raw_points.write_text("points", encoding="utf-8")
             progress: list[str] = []
-
-            def fake_sync(project_dir_arg: Path, workbook_path_arg: Path, *, rebuild: bool = False, progress_cb=None) -> dict[str, object]:
-                self.assertEqual(Path(project_dir_arg), project_dir)
-                self.assertEqual(Path(workbook_path_arg), workbook_path)
-                self.assertFalse(rebuild)
-                impl_db.write_text("impl", encoding="utf-8")
-                raw_db.write_text("raw", encoding="utf-8")
-                raw_points.write_text("points", encoding="utf-8")
-                if progress_cb is not None:
-                    progress_cb("cache refreshed")
-                return {
-                    "db_path": str(impl_db),
-                    "raw_db_path": str(raw_db),
-                }
 
             def fake_validate(project_dir_arg: Path, workbook_path_arg: Path) -> Path:
                 self.assertEqual(Path(project_dir_arg), project_dir)
@@ -880,7 +1139,7 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 out_path.write_text(f"mirror:{Path(db_path).name}", encoding="utf-8")
                 return out_path
 
-            with patch.object(backend, "sync_test_data_project_cache", side_effect=fake_sync) as sync_mock, patch.object(
+            with patch.object(backend, "sync_test_data_project_cache") as sync_mock, patch.object(
                 backend,
                 "validate_existing_test_data_project_cache",
                 side_effect=fake_validate,
@@ -896,13 +1155,12 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                     progress_cb=progress.append,
                 )
 
-            sync_mock.assert_called_once()
+            sync_mock.assert_not_called()
             validate_mock.assert_called_once()
             self.assertEqual(mirror_mock.call_count, 2)
             self.assertEqual(generated["implementation_excel"], impl_db.with_suffix(".xlsx"))
             self.assertEqual(generated["raw_cache_excel"], raw_db.with_suffix(".xlsx"))
             self.assertEqual(generated["raw_points_excel"], raw_points)
-            self.assertIn("Ensuring project cache", progress)
             self.assertIn("Exporting implementation cache Excel mirror", progress)
             self.assertIn("Exporting raw cache Excel mirror", progress)
 
@@ -946,14 +1204,11 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                     progress_cb=progress.append,
                 )
 
-            sync_mock.assert_called_once()
+            sync_mock.assert_not_called()
             validate_mock.assert_called_once()
             self.assertEqual(mirror_mock.call_count, 2)
             self.assertEqual(generated["implementation_excel"], impl_db.with_suffix(".xlsx"))
             self.assertEqual(generated["raw_cache_excel"], raw_db.with_suffix(".xlsx"))
-            self.assertTrue(
-                any("Cache refresh failed; exporting existing SQLite files anyway" in msg for msg in progress)
-            )
             self.assertTrue(
                 any("Cache validation failed; exporting existing SQLite files anyway" in msg for msg in progress)
             )
@@ -1043,6 +1298,14 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 backend,
                 "_discover_td_runs_for_docs",
                 return_value=["Run1"],
+            ), patch.object(
+                backend,
+                "_sync_td_support_workbook_program_sheets",
+                return_value=None,
+            ), patch.object(
+                backend,
+                "_refresh_td_support_run_conditions_sheet",
+                return_value=None,
             ), patch.object(
                 backend,
                 "sync_test_data_project_cache",
@@ -1273,7 +1536,22 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
                 },
                 condition_y_names={condition_key: {"Pressure"}},
                 sequence_obs_rows=[
-                    ("obs1", "SN-001", condition_key, "Program Alpha", "RunCommon", "", None, None, None, None, 1, 1)
+                    backend._td_build_sequence_observation_row(
+                        "obs1",
+                        "SN-001",
+                        condition_key,
+                        "Program Alpha",
+                        "RunCommon",
+                        "",
+                        None,
+                        None,
+                        None,
+                        None,
+                        1,
+                        1,
+                        condition,
+                        fallback_display_name=str(condition.get("display_name") or condition_key),
+                    )
                 ],
                 sequence_metric_rows=[
                     ("obs1", "SN-001", condition_key, "Pressure", "mean", 1.5, 1, 1, "Program Alpha", "RunCommon")
@@ -1343,17 +1621,17 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             self.assertEqual(readiness["problems"], [])
             self.assertTrue(bool((readiness.get("summary") or {}).get("workbook_outputs_deferred")))
 
-    def test_open_validator_fails_fast_when_raw_cache_db_missing(self) -> None:
+    def test_open_validator_allows_missing_raw_cache_db(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
-            workbook_path, _impl_db, raw_db = _create_ready_td_project_fixture(project_dir)
+            workbook_path, impl_db, raw_db = _create_ready_td_project_fixture(project_dir)
             raw_db.unlink()
-            with self.assertRaises(RuntimeError) as ctx:
-                backend.validate_test_data_project_cache_for_open(project_dir, workbook_path)
-            self.assertIn("Project raw cache DB not found", str(ctx.exception))
-            self.assertIn("Update Project", str(ctx.exception))
+            self.assertEqual(
+                backend.validate_test_data_project_cache_for_open(project_dir, workbook_path),
+                impl_db,
+            )
 
     def test_open_validator_fails_fast_when_required_impl_table_missing(self) -> None:
         if Workbook is None:

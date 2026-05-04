@@ -434,7 +434,7 @@ class TestBackendPerfExportExcel(unittest.TestCase):
                         "source_run_name": "Run A",
                         "control_period": None,
                         "suppression_voltage": None,
-                        "condition_label": "Condition 2D | Program A | Run A",
+                        "condition_label": "Condition 2D",
                         "serial": "SN-001",
                         "input_1": 10.0,
                         "input_2": None,
