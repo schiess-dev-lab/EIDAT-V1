@@ -3,20 +3,34 @@ setlocal EnableExtensions EnableDelayedExpansion
 
 set "ROOT=%~dp0"
 set "APP_ROOT=%ROOT%EIDAT_App_Files\"
+set "REQ_FILE=%APP_ROOT%Production\requirements-node.txt"
 set "TOOLS_DIR=%ROOT%tools"
 set "TESS_ROOT=%TOOLS_DIR%\tesseract"
 set "TESS_EXE=%TESS_ROOT%\tesseract.exe"
 set "TESSDATA_DIR=%TESS_ROOT%\tessdata"
 set "TESS_INSTALLER=%TOOLS_DIR%\tesseract-ocr-w64-setup-5.4.0.20240606.exe"
 set "TESS_URL=https://digi.bib.uni-mannheim.de/tesseract/tesseract-ocr-w64-setup-5.4.0.20240606.exe"
-set "PY=py"
+set "LOCAL_SITE=%APP_ROOT%Lib\site-packages"
+set "VENDOR_MARKER=%LOCAL_SITE%\.eidat_vendor_python.txt"
 rem Optional first arg: custom venv directory. Defaults to %APP_ROOT%.venv
 set "VENV_DIR=%~1"
 if "%VENV_DIR%"=="" set "VENV_DIR=%APP_ROOT%.venv"
-where %PY% >nul 2>nul || set "PY=python"
+
+if not exist "%REQ_FILE%" (
+  echo [ERROR] Requirements file not found: "%REQ_FILE%"
+  endlocal & exit /b 1
+)
+
+call :resolve_system_python
+if errorlevel 1 (
+  echo [ERROR] Failed to locate a usable Python 3 interpreter.
+  endlocal & exit /b 1
+)
+
+echo [SETUP] Using system Python: "%SYS_PY%"
 
 echo [SETUP] Creating local virtual environment: "%VENV_DIR%" ...
-"%PY%" -m venv "%VENV_DIR%"
+"%SYS_PY%" -m venv "%VENV_DIR%"
 if errorlevel 1 (
   echo [ERROR] Failed to create venv. Ensure Python 3 is installed.
   endlocal & exit /b 1
@@ -32,19 +46,17 @@ echo [SETUP] Upgrading pip...
 "%VPY%" -m pip install --upgrade pip
 if errorlevel 1 echo [WARN] pip upgrade had warnings.
 
-echo [SETUP] Installing required Python packages (minimal + UI)...
-"%VPY%" -m pip install ^
-  pymupdf ^
-  pandas ^
-  openpyxl ^
-  xlrd ^
-  XlsxWriter ^
-  matplotlib ^
-  opencv-python-headless ^
-  reportlab ^
-  PySide6
+echo [SETUP] Installing required Python packages from "%REQ_FILE%" ...
+"%VPY%" -m pip install -r "%REQ_FILE%"
 if errorlevel 1 (
   echo [ERROR] Package install failed.
+  endlocal & exit /b 1
+)
+
+echo [SETUP] Verifying venv imports...
+"%VPY%" -c "import PySide6, pandas, openpyxl, reportlab, scipy; print('ok')"
+if errorlevel 1 (
+  echo [ERROR] Post-install import smoke test failed in the repo-local venv.
   endlocal & exit /b 1
 )
 
@@ -74,15 +86,28 @@ if exist "%TESS_EXE%" (
 )
 
 rem Also vendor runtime deps into repo-local Lib\site-packages (for non-venv runs)
-set "LOCAL_SITE=%APP_ROOT%Lib\site-packages"
 if not exist "%LOCAL_SITE%" mkdir "%LOCAL_SITE%"
-echo [SETUP] Vendoring Python deps to Lib\site-packages (minimal):
-echo         pymupdf, pandas, openpyxl, xlrd, XlsxWriter, matplotlib, opencv-python-headless, reportlab, PySide6
-"%VPY%" -m pip install --upgrade --no-warn-script-location --target "%LOCAL_SITE%" ^
-  pymupdf pandas openpyxl xlrd XlsxWriter matplotlib opencv-python-headless reportlab PySide6
+echo [SETUP] Vendoring Python deps to Lib\site-packages from "%REQ_FILE%" ...
+"%VPY%" -m pip install --upgrade --no-warn-script-location --target "%LOCAL_SITE%" -r "%REQ_FILE%"
 if errorlevel 1 (
-  echo [WARN] Vendoring had warnings/failures. Non-venv runs may miss some features.
+  echo [ERROR] Vendoring package install failed.
+  endlocal & exit /b 1
 )
+
+call :write_vendor_marker
+if errorlevel 1 (
+  echo [ERROR] Failed to write the vendored Python compatibility marker.
+  endlocal & exit /b 1
+)
+
+echo [SETUP] Verifying vendored imports with "%SYS_PY%" ...
+set "PYTHONPATH=%LOCAL_SITE%"
+"%SYS_PY%" -c "import PySide6, pandas, openpyxl, reportlab, scipy; print('ok')"
+if errorlevel 1 (
+  echo [ERROR] Post-install import smoke test failed for vendored site-packages.
+  endlocal & exit /b 1
+)
+set "PYTHONPATH="
 
 rem --- Scaffold expected folders and sample terms file ---
 if not exist "%ROOT%user_inputs" mkdir "%ROOT%user_inputs"
@@ -144,3 +169,48 @@ echo   2) Edit user_inputs\terms.schema.simple.xlsx (or .csv)
 echo   3) Run: run_gui.bat   or  "%VENV_DIR%\Scripts\python.exe" EIDAT_App_Files\ui_next\qt_main.py
 
 endlocal & exit /b 0
+
+:resolve_system_python
+set "SYS_PY="
+for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable)" 2^>nul`) do (
+  if not defined SYS_PY set "SYS_PY=%%P"
+)
+if defined SYS_PY (
+  call :validate_python "%SYS_PY%"
+  if not errorlevel 1 exit /b 0
+  echo [WARN] Interpreter returned by py -3 is not directly runnable: "%SYS_PY%"
+  set "SYS_PY="
+)
+for /f "usebackq delims=" %%P in (`python -c "import sys; print(sys.executable)" 2^>nul`) do (
+  if not defined SYS_PY set "SYS_PY=%%P"
+)
+if defined SYS_PY (
+  call :validate_python "%SYS_PY%"
+  if not errorlevel 1 exit /b 0
+  echo [WARN] Interpreter returned by python is not directly runnable: "%SYS_PY%"
+  set "SYS_PY="
+)
+exit /b 1
+
+:validate_python
+set "CHECK_PY=%~1"
+if not defined CHECK_PY exit /b 1
+"%CHECK_PY%" -c "import sys" >nul 2>nul
+exit /b %ERRORLEVEL%
+
+:write_vendor_marker
+set "VENDOR_MM="
+set "VENDOR_VER="
+for /f "usebackq delims=" %%P in (`"%VPY%" -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"`) do (
+  if not defined VENDOR_MM set "VENDOR_MM=%%P"
+)
+for /f "usebackq delims=" %%P in (`"%VPY%" -c "import sys; print(sys.version.split()[0])"`) do (
+  if not defined VENDOR_VER set "VENDOR_VER=%%P"
+)
+if not defined VENDOR_MM exit /b 1
+if not defined VENDOR_VER exit /b 1
+> "%VENDOR_MARKER%" echo major_minor=!VENDOR_MM!
+>> "%VENDOR_MARKER%" echo version=!VENDOR_VER!
+>> "%VENDOR_MARKER%" echo executable=%SYS_PY%
+>> "%VENDOR_MARKER%" echo venv_python=%VPY%
+exit /b 0

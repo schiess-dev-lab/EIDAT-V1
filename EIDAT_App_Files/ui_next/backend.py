@@ -121,6 +121,10 @@ LEGACY_REG_XLSX = LEGACY_MASTER_ROOT / "run_registry.xlsx"
 LEGACY_REG_CSV = LEGACY_MASTER_ROOT / "run_registry.csv"
 MASTER_BASE_COLUMNS = {"Term Label", "Data Group", "Units", "Min", "Max"}
 REPO_NAME_FILE = DATA_ROOT / "user_inputs" / "repo_root_name.txt"
+VENDORED_SITE_PACKAGES = APP_ROOT / "Lib" / "site-packages"
+VENDORED_SITE_PACKAGES_MARKER = VENDORED_SITE_PACKAGES / ".eidat_vendor_python.txt"
+_VENDOR_MARKER_VERSION_RE = re.compile(r"^\d+\.\d+$")
+_runtime_warning_cache: set[str] = set()
 
 
 def _td_normalize_selected_stats(stats: object) -> list[str]:
@@ -1567,20 +1571,163 @@ def _venv_python_from(path: Path) -> Path:
     return path / "bin" / "python"
 
 
+@lru_cache(maxsize=32)
+def _python_executable_is_usable(executable: str) -> bool:
+    candidate = str(executable or "").strip()
+    if not candidate:
+        return False
+    try:
+        proc = subprocess.run(
+            [candidate, "-c", "import sys"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=32)
+def _python_major_minor(executable: str) -> str | None:
+    candidate = str(executable or "").strip()
+    if not candidate:
+        return None
+    try:
+        proc = subprocess.run(
+            [candidate, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    value = str(proc.stdout or "").strip().splitlines()
+    mm = value[-1].strip() if value else ""
+    return mm if _VENDOR_MARKER_VERSION_RE.match(mm) else None
+
+
+def _emit_runtime_warning_once(message: str) -> None:
+    text = str(message or "").strip()
+    if not text or text in _runtime_warning_cache:
+        return
+    _runtime_warning_cache.add(text)
+    print(f"[WARN] {text}", file=sys.stderr)
+
+
+def _read_vendored_site_packages_marker(marker_path: Path | None = None) -> dict[str, str]:
+    path = marker_path or VENDORED_SITE_PACKAGES_MARKER
+    data: dict[str, str] = {}
+    try:
+        if not path.exists():
+            return data
+        for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key:
+                data[key] = value
+    except Exception:
+        return {}
+    return data
+
+
+def _normalize_pythonpath_entry(path: str) -> str:
+    raw = str(path or "").strip().strip('"')
+    if not raw:
+        return ""
+    try:
+        return str(Path(raw).expanduser().resolve()).lower()
+    except Exception:
+        try:
+            return str(Path(raw).expanduser().absolute()).lower()
+        except Exception:
+            return raw.lower()
+
+
+def _remove_pythonpath_entry(value: str, entry: str) -> str:
+    target = _normalize_pythonpath_entry(entry)
+    parts = []
+    for part in str(value or "").split(os.pathsep):
+        text = str(part or "").strip()
+        if not text:
+            continue
+        if _normalize_pythonpath_entry(text) == target:
+            continue
+        parts.append(text)
+    return os.pathsep.join(parts)
+
+
+def _vendored_site_packages_for_python(python_executable: str | None) -> tuple[str | None, str | None]:
+    if not VENDORED_SITE_PACKAGES.exists():
+        return None, None
+    marker = _read_vendored_site_packages_marker()
+    want_mm = str(marker.get("major_minor") or "").strip()
+    if not want_mm:
+        return None, (
+            f"Vendored site-packages at {VENDORED_SITE_PACKAGES} are missing "
+            f"{VENDORED_SITE_PACKAGES_MARKER.name}. Re-run install.bat to rebuild local dependencies."
+        )
+    runtime_python = str(python_executable or "").strip() or sys.executable
+    have_mm = _python_major_minor(runtime_python) if runtime_python else None
+    if not have_mm:
+        return None, (
+            f"Could not determine the Python version for runtime '{runtime_python}'. "
+            f"Skipping vendored site-packages at {VENDORED_SITE_PACKAGES}."
+        )
+    if have_mm != want_mm:
+        return None, (
+            f"Vendored site-packages at {VENDORED_SITE_PACKAGES} were built for Python {want_mm}, "
+            f"but runtime '{runtime_python}' is Python {have_mm}. Re-run install.bat for this interpreter."
+        )
+    return str(VENDORED_SITE_PACKAGES), None
+
+
+def _spawn_target_python(cmd: Sequence[str]) -> str | None:
+    if not cmd:
+        return None
+    raw = str(cmd[0] or "").strip()
+    if not raw:
+        return None
+    leaf = Path(raw).name.lower()
+    if leaf in {"python", "python.exe", "py", "py.exe"}:
+        return raw
+    if leaf.startswith("python"):
+        return raw
+    return raw if raw.lower().endswith("python.exe") else None
+
+
 def resolve_project_python() -> str:
     env = load_scanner_env()
     vdir = env.get("VENV_DIR", "").strip()
     if vdir:
         cand = _venv_python_from(Path(vdir))
-        if cand.exists():
+        if _python_executable_is_usable(str(cand)):
             return str(cand)
+        if cand.exists():
+            _emit_runtime_warning_once(
+                f"Configured virtualenv is not runnable and will be ignored: {cand}. "
+                "Re-run install.bat to rebuild it."
+            )
     cand = _venv_python_from(APP_ROOT / ".venv")
-    if cand.exists():
+    if _python_executable_is_usable(str(cand)):
         return str(cand)
+    if cand.exists():
+        _emit_runtime_warning_once(
+            f"Repo-local virtualenv is not runnable and will be ignored: {cand}. "
+            "Re-run install.bat to rebuild it."
+        )
     return sys.executable
 
 
-def _base_env() -> Dict[str, str]:
+def _base_env(python_executable: str | None = None) -> Dict[str, str]:
     env = os.environ.copy()
     # Merge env files for direct Python invocations.
     #
@@ -1604,8 +1751,21 @@ def _base_env() -> Dict[str, str]:
         "EIDAT_FORCE_CELL_INTERIOR",
     ):
         env.pop(key, None)
-    # Ensure vendored site-packages are importable as fallback
-    env["PYTHONPATH"] = str(APP_ROOT / "Lib" / "site-packages") + os.pathsep + env.get("PYTHONPATH", "")
+    existing_pythonpath = _remove_pythonpath_entry(env.get("PYTHONPATH", ""), str(VENDORED_SITE_PACKAGES))
+    vendored_path, vendored_warning = _vendored_site_packages_for_python(python_executable)
+    if vendored_path:
+        env["PYTHONPATH"] = vendored_path + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+        env.pop("EIDAT_VENDORED_SITE_PACKAGES_WARNING", None)
+    else:
+        if existing_pythonpath:
+            env["PYTHONPATH"] = existing_pythonpath
+        else:
+            env.pop("PYTHONPATH", None)
+        if vendored_warning:
+            env["EIDAT_VENDORED_SITE_PACKAGES_WARNING"] = vendored_warning
+            _emit_runtime_warning_once(vendored_warning)
+        else:
+            env.pop("EIDAT_VENDORED_SITE_PACKAGES_WARNING", None)
     env.setdefault("QUIET", "1")
     # GUI: charts are experimental and slow; keep disabled unless explicitly enabled.
     env.setdefault("EIDAT_ENABLE_CHART_EXTRACTION", "0")
@@ -1617,10 +1777,12 @@ def _base_env() -> Dict[str, str]:
 
 
 def spawn(cmd: Iterable[str], *, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
+    cmd_list = list(cmd)
+    target_python = _spawn_target_python(cmd_list)
     return subprocess.Popen(
-        list(cmd),
+        cmd_list,
         cwd=str(cwd or ROOT),
-        env=env or _base_env(),
+        env=env or _base_env(target_python),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

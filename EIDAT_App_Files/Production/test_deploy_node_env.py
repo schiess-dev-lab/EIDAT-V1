@@ -96,6 +96,15 @@ class TestDeployNodeEnv(unittest.TestCase):
             self.assertIn("reportlab", seen_imports)
             install_mock.assert_called_once()
 
+    def test_repo_install_batch_uses_requirements_file(self) -> None:
+        install_bat = APP_ROOT.parent / "install.bat"
+        text = install_bat.read_text(encoding="utf-8")
+
+        self.assertIn(r'requirements-node.txt', text)
+        self.assertIn(r'"%VPY%" -m pip install -r "%REQ_FILE%"', text)
+        self.assertIn(r'"%VPY%" -m pip install --upgrade --no-warn-script-location --target "%LOCAL_SITE%" -r "%REQ_FILE%"', text)
+        self.assertNotIn('pymupdf ^', text)
+
 
 if __name__ == "__main__":
     unittest.main()

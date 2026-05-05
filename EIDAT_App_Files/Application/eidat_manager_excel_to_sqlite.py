@@ -467,11 +467,18 @@ def _safe_table_name(sheet_name: str) -> str:
     return f"sheet__{base}"
 
 
+def _python_runtime_identity() -> str:
+    return f"{sys.executable} (Python {sys.version.split()[0]})"
+
+
 def _load_mat_payload(mat_path: Path) -> dict[str, Any]:
     try:
         from scipy.io import loadmat  # type: ignore
     except Exception as exc:
-        raise RuntimeError("scipy is required to read MATLAB `.mat` files.") from exc
+        raise RuntimeError(
+            "scipy is required to read MATLAB `.mat` files. "
+            f"Failed to import `scipy.io.loadmat` under {_python_runtime_identity()}: {exc}"
+        ) from exc
 
     try:
         data = loadmat(str(mat_path), simplify_cells=True)

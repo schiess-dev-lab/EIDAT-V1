@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -94,6 +95,27 @@ class TestEidatManagerExcelToSqlite(unittest.TestCase):
             finally:
                 conn.close()
             self.assertEqual(rows, [("Seq 1", 11)])
+
+    def test_load_mat_payload_reports_scipy_import_context(self) -> None:
+        import builtins
+        import eidat_manager_excel_to_sqlite as mod
+
+        original_import = builtins.__import__
+
+        def _blocked_import(name, globals=None, locals=None, fromlist=(), level=0):  # type: ignore[no-untyped-def]
+            if name == "scipy.io" or str(name).startswith("scipy"):
+                raise ImportError("DLL load failed while importing scipy.io")
+            return original_import(name, globals, locals, fromlist, level)
+
+        with mock.patch("builtins.__import__", side_effect=_blocked_import):
+            with self.assertRaises(RuntimeError) as ctx:
+                mod._load_mat_payload(Path("sample.mat"))
+
+        message = str(ctx.exception)
+        self.assertIn("Failed to import `scipy.io.loadmat`", message)
+        self.assertIn("DLL load failed while importing scipy.io", message)
+        self.assertIn(sys.executable, message)
+        self.assertIn(sys.version.split()[0], message)
 
 
 if __name__ == "__main__":

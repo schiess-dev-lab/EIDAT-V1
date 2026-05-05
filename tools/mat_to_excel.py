@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +36,18 @@ def _sanitize_sheet_name(name: str, used: set[str]) -> str:
     return clean
 
 
+def _python_runtime_identity() -> str:
+    return f"{sys.executable} (Python {sys.version.split()[0]})"
+
+
 def _load_mat(path: Path) -> dict[str, Any]:
     try:
         from scipy.io import loadmat  # type: ignore
     except Exception as exc:
-        raise RuntimeError("scipy is required to read MATLAB `.mat` files.") from exc
+        raise RuntimeError(
+            "scipy is required to read MATLAB `.mat` files. "
+            f"Failed to import `scipy.io.loadmat` under {_python_runtime_identity()}: {exc}"
+        ) from exc
 
     try:
         data = loadmat(str(path), simplify_cells=True)
