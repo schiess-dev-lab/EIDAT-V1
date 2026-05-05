@@ -4669,6 +4669,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._auto_plots: list[dict] = []
         self._auto_plot_global_selection: dict[str, object] = {}
         self._last_plot_def: dict | None = None
+        self._pending_legend_highlight_labels: list[str] | None = None
         self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
         self._plot_base_xlim: tuple[float, float] | None = None
         self._plot_base_ylim: tuple[float, float] | None = None
@@ -7072,6 +7073,309 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return text
         return "#64748b"
 
+    @staticmethod
+    def _normalize_legend_highlight_labels(raw: object) -> list[str]:
+        if not isinstance(raw, (list, tuple, set)):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in raw:
+            label = str(value or "").strip()
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            out.append(label)
+        return out
+
+    def _legend_highlight_labels_from_plot_def(self, plot_definition: Mapping[str, object] | None) -> list[str]:
+        if not isinstance(plot_definition, Mapping):
+            return []
+        return self._normalize_legend_highlight_labels(plot_definition.get("legend_highlight_labels"))
+
+    def _current_plot_legend_highlight_labels(self) -> list[str]:
+        return self._legend_highlight_labels_from_plot_def(self._last_plot_def)
+
+    def _legend_highlight_seed_labels(self) -> list[str]:
+        pending = getattr(self, "_pending_legend_highlight_labels", None)
+        if pending is not None:
+            return self._normalize_legend_highlight_labels(pending)
+        return self._current_plot_legend_highlight_labels()
+
+    @staticmethod
+    def _artist_legend_base_style(artist) -> dict[str, object]:
+        snapshot: dict[str, object] = {}
+        for key, getter_name in (
+            ("alpha", "get_alpha"),
+            ("zorder", "get_zorder"),
+            ("linewidth", "get_linewidth"),
+            ("linewidths", "get_linewidths"),
+            ("markersize", "get_markersize"),
+            ("markeredgewidth", "get_markeredgewidth"),
+            ("sizes", "get_sizes"),
+        ):
+            getter = getattr(artist, getter_name, None)
+            if not callable(getter):
+                continue
+            try:
+                snapshot[key] = getter()
+            except Exception:
+                continue
+        return snapshot
+
+    @staticmethod
+    def _legend_style_numeric_sequence(raw: object) -> list[float] | None:
+        if raw is None or isinstance(raw, (str, bytes)):
+            return None
+        if hasattr(raw, "tolist"):
+            try:
+                raw = raw.tolist()
+            except Exception:
+                pass
+        if isinstance(raw, (int, float)):
+            try:
+                value = float(raw)
+            except Exception:
+                return None
+            return [value] if math.isfinite(value) else None
+        if isinstance(raw, tuple):
+            raw = list(raw)
+        if not isinstance(raw, list):
+            try:
+                raw = list(raw)
+            except Exception:
+                return None
+        out: list[float] = []
+        for value in raw:
+            try:
+                number = float(value)
+            except Exception:
+                continue
+            if math.isfinite(number):
+                out.append(number)
+        return out
+
+    @staticmethod
+    def _legend_highlight_scalar_value(
+        raw: object,
+        *,
+        floor: float,
+        scale: float,
+        increment: float,
+    ) -> float | None:
+        try:
+            value = float(raw)
+        except Exception:
+            return None
+        if not math.isfinite(value):
+            return None
+        return max(float(floor), value * float(scale), value + float(increment))
+
+    @staticmethod
+    def _legend_artist_groups(ax) -> dict[str, list[object]]:
+        if ax is None:
+            return {}
+        out: dict[str, list[object]] = {}
+        seen_ids: dict[str, set[int]] = {}
+        for attr_name in ("lines", "collections", "patches", "containers", "artists"):
+            artists = getattr(ax, attr_name, None)
+            if not artists:
+                continue
+            try:
+                iterator = list(artists)
+            except Exception:
+                continue
+            for artist in iterator:
+                get_label = getattr(artist, "get_label", None)
+                if not callable(get_label):
+                    continue
+                try:
+                    label = str(get_label() or "").strip()
+                except Exception:
+                    continue
+                if not label or label.startswith("_"):
+                    continue
+                artist_id = id(artist)
+                seen_for_label = seen_ids.setdefault(label, set())
+                if artist_id in seen_for_label:
+                    continue
+                seen_for_label.add(artist_id)
+                out.setdefault(label, []).append(artist)
+        return out
+
+    def _filtered_legend_highlight_labels(
+        self,
+        labels: object,
+        *,
+        entries: list[dict[str, str]] | tuple[dict[str, str], ...] | None = None,
+        ax=None,
+    ) -> list[str]:
+        requested = self._normalize_legend_highlight_labels(labels)
+        if not requested:
+            return []
+        if entries is None:
+            entries = self._collect_legend_entries(ax) if ax is not None else []
+        allowed = {
+            str((entry or {}).get("label") or "").strip()
+            for entry in (entries or [])
+            if isinstance(entry, Mapping) and str((entry or {}).get("label") or "").strip()
+        }
+        return [label for label in requested if label in allowed]
+
+    @staticmethod
+    def _set_artist_style_value(artist, setter_name: str, value: object) -> None:
+        setter = getattr(artist, setter_name, None)
+        if not callable(setter):
+            return
+        try:
+            setter(value)
+        except Exception:
+            return
+
+    def _restore_legend_artist_style(self, artist, snapshot: Mapping[str, object] | None) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        for key, setter_name in (
+            ("alpha", "set_alpha"),
+            ("zorder", "set_zorder"),
+            ("linewidth", "set_linewidth"),
+            ("linewidths", "set_linewidths"),
+            ("markersize", "set_markersize"),
+            ("markeredgewidth", "set_markeredgewidth"),
+            ("sizes", "set_sizes"),
+        ):
+            if key in snapshot:
+                self._set_artist_style_value(artist, setter_name, snapshot.get(key))
+
+    def _highlight_legend_artist(self, artist, snapshot: Mapping[str, object] | None) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        linewidth = self._legend_highlight_scalar_value(
+            snapshot.get("linewidth"),
+            floor=2.2,
+            scale=1.9,
+            increment=1.0,
+        )
+        if linewidth is not None:
+            self._set_artist_style_value(artist, "set_linewidth", linewidth)
+        linewidths = self._legend_style_numeric_sequence(snapshot.get("linewidths"))
+        if linewidths is not None:
+            self._set_artist_style_value(
+                artist,
+                "set_linewidths",
+                [
+                    self._legend_highlight_scalar_value(value, floor=1.6, scale=1.9, increment=0.9) or 1.6
+                    for value in linewidths
+                ],
+            )
+        markersize = self._legend_highlight_scalar_value(
+            snapshot.get("markersize"),
+            floor=7.0,
+            scale=1.45,
+            increment=1.8,
+        )
+        if markersize is not None:
+            self._set_artist_style_value(artist, "set_markersize", markersize)
+        markeredgewidth = self._legend_highlight_scalar_value(
+            snapshot.get("markeredgewidth"),
+            floor=1.4,
+            scale=1.6,
+            increment=0.8,
+        )
+        if markeredgewidth is not None:
+            self._set_artist_style_value(artist, "set_markeredgewidth", markeredgewidth)
+        sizes = self._legend_style_numeric_sequence(snapshot.get("sizes"))
+        if sizes is not None:
+            self._set_artist_style_value(
+                artist,
+                "set_sizes",
+                [
+                    self._legend_highlight_scalar_value(value, floor=36.0, scale=1.6, increment=12.0) or 36.0
+                    for value in sizes
+                ],
+            )
+        alpha_value = snapshot.get("alpha")
+        if alpha_value is None:
+            self._set_artist_style_value(artist, "set_alpha", 1.0)
+        else:
+            try:
+                alpha = float(alpha_value)
+            except Exception:
+                alpha = None
+            if alpha is not None and math.isfinite(alpha):
+                self._set_artist_style_value(artist, "set_alpha", max(alpha, 1.0))
+        zorder_value = snapshot.get("zorder")
+        try:
+            zorder = float(zorder_value)
+        except Exception:
+            zorder = None
+        if zorder is not None and math.isfinite(zorder):
+            self._set_artist_style_value(artist, "set_zorder", zorder + 10.0)
+
+    def _apply_legend_highlight_labels_to_axes(
+        self,
+        ax,
+        labels: object,
+        *,
+        entries: list[dict[str, str]] | tuple[dict[str, str], ...] | None = None,
+    ) -> list[str]:
+        if ax is None:
+            return []
+        legend_entries = list(entries or self._collect_legend_entries(ax))
+        filtered = self._filtered_legend_highlight_labels(labels, entries=legend_entries, ax=ax)
+        selected = set(filtered)
+        for label, artists in self._legend_artist_groups(ax).items():
+            for artist in artists:
+                snapshot = getattr(artist, "_td_legend_base_style", None)
+                if not isinstance(snapshot, Mapping):
+                    snapshot = self._artist_legend_base_style(artist)
+                    try:
+                        setattr(artist, "_td_legend_base_style", snapshot)
+                    except Exception:
+                        pass
+                self._restore_legend_artist_style(artist, snapshot)
+                if label in selected:
+                    self._highlight_legend_artist(artist, snapshot)
+        try:
+            setattr(ax, "_td_legend_highlight_labels", list(filtered))
+        except Exception:
+            pass
+        return filtered
+
+    @staticmethod
+    def _legend_highlight_labels_for_axes(ax) -> list[str]:
+        if ax is None:
+            return []
+        raw = getattr(ax, "_td_legend_highlight_labels", [])
+        if not isinstance(raw, (list, tuple, set)):
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in raw:
+            label = str(value or "").strip()
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            out.append(label)
+        return out
+
+    def _apply_main_plot_legend_highlights(self, labels: object) -> list[str]:
+        filtered = self._apply_legend_highlight_labels_to_axes(
+            getattr(self, "_axes", None),
+            labels,
+            entries=list(getattr(self, "_main_plot_legend_entries", []) or []),
+        )
+        if isinstance(self._last_plot_def, dict):
+            self._last_plot_def["legend_highlight_labels"] = list(filtered)
+        if getattr(self, "_canvas", None) is not None:
+            try:
+                self._canvas.draw_idle()
+            except Exception:
+                try:
+                    self._canvas.draw()
+                except Exception:
+                    pass
+        return filtered
+
     def _collect_legend_entries(self, ax) -> list[dict[str, str]]:
         if ax is None or not hasattr(ax, "get_legend_handles_labels"):
             return []
@@ -7096,6 +7400,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ax,
         *,
         overflow_button: QtWidgets.QPushButton | None = None,
+        highlighted_labels: object = None,
     ) -> list[dict[str, str]]:
         entries = self._collect_legend_entries(ax)
         try:
@@ -7114,8 +7419,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 pass
         if overflow_button is not None:
-            overflow_button.setVisible(bool(entries) and overflow)
-            overflow_button.setEnabled(bool(entries) and overflow)
+            overflow_button.setVisible(bool(entries))
+            overflow_button.setEnabled(bool(entries))
+        self._apply_legend_highlight_labels_to_axes(ax, highlighted_labels, entries=entries)
         return entries
 
     def _open_legend_popup(
@@ -7123,10 +7429,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         entries: list[dict[str, str]] | tuple[dict[str, str], ...] | None,
         *,
         title: str,
+        selected_labels: object = None,
+        apply_callback: Callable[[list[str]], object] | None = None,
     ) -> None:
         legend_entries = [dict(entry) for entry in (entries or []) if isinstance(entry, dict)]
         if not legend_entries:
             return
+        selected_set = set(self._normalize_legend_highlight_labels(selected_labels))
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle(title)
         dlg.resize(460, 520)
@@ -7147,10 +7456,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not label_text:
                 continue
             item = QtWidgets.QListWidgetItem(label_text)
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked if label_text in selected_set else QtCore.Qt.CheckState.Unchecked
+            )
             color_text = str(entry.get("color") or "#64748b").strip() or "#64748b"
             pixmap = QtGui.QPixmap(12, 12)
             pixmap.fill(QtGui.QColor(color_text))
             item.setIcon(QtGui.QIcon(pixmap))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, label_text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, label_text.lower())
             listw.addItem(item)
 
@@ -7164,10 +7478,39 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ed_filter.textChanged.connect(_apply_filter)
         _apply_filter()
 
+        def _checked_labels() -> list[str]:
+            out: list[str] = []
+            for idx in range(listw.count()):
+                item = listw.item(idx)
+                if item is None or item.checkState() != QtCore.Qt.CheckState.Checked:
+                    continue
+                label = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "").strip()
+                if label:
+                    out.append(label)
+            return self._normalize_legend_highlight_labels(out)
+
+        def _apply_checked() -> None:
+            if callable(apply_callback):
+                apply_callback(_checked_labels())
+
+        def _clear_highlights() -> None:
+            for idx in range(listw.count()):
+                item = listw.item(idx)
+                if item is not None:
+                    item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            if callable(apply_callback):
+                apply_callback([])
+
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addStretch(1)
+        btn_highlight = QtWidgets.QPushButton("Highlight")
+        btn_highlight.clicked.connect(_apply_checked)
+        btn_clear = QtWidgets.QPushButton("Clear Highlights")
+        btn_clear.clicked.connect(_clear_highlights)
         btn_close = QtWidgets.QPushButton("Close")
         btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_highlight)
+        btn_row.addWidget(btn_clear)
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
@@ -7175,7 +7518,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         dlg.exec()
 
     def _open_main_plot_legend_popup(self) -> None:
-        self._open_legend_popup(self._main_plot_legend_entries, title="Plot Legend")
+        self._open_legend_popup(
+            self._main_plot_legend_entries,
+            title="Plot Legend",
+            selected_labels=self._current_plot_legend_highlight_labels(),
+            apply_callback=self._apply_main_plot_legend_highlights,
+        )
 
     def _ensure_plot_band_popup(self) -> QtWidgets.QDialog:
         popup = getattr(self, "_plot_band_popup", None)
@@ -8271,8 +8619,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self._apply_plot_view_bands_to_axes(ax, mode=plot_mode)
             except ValueError:
                 pass
-        popup_legend_entries = self._apply_interactive_legend_policy(ax, overflow_button=btn_legend)
-        btn_legend.clicked.connect(lambda: self._open_legend_popup(popup_legend_entries, title="Plot Legend"))
+        popup_state = {
+            "entries": self._apply_interactive_legend_policy(
+                ax,
+                overflow_button=btn_legend,
+                highlighted_labels=self._current_plot_legend_highlight_labels(),
+            )
+        }
+
+        def _apply_popup_legend_highlights(labels: list[str]) -> None:
+            filtered = self._apply_legend_highlight_labels_to_axes(
+                ax,
+                labels,
+                entries=list(popup_state.get("entries") or []),
+            )
+            self._apply_main_plot_legend_highlights(filtered)
+            try:
+                canvas.draw_idle()
+            except Exception:
+                try:
+                    canvas.draw()
+                except Exception:
+                    pass
+
+        btn_legend.clicked.connect(
+            lambda: self._open_legend_popup(
+                popup_state.get("entries"),
+                title="Plot Legend",
+                selected_labels=self._current_plot_legend_highlight_labels(),
+                apply_callback=_apply_popup_legend_highlights,
+            )
+        )
         base_xlim = ax.get_xlim()
         base_ylim = ax.get_ylim()
 
@@ -15092,7 +15469,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._main_plot_legend_entries = self._apply_interactive_legend_policy(
             self._axes,
             overflow_button=getattr(self, "btn_plot_legend", None),
+            highlighted_labels=self._legend_highlight_seed_labels(),
         )
+        legend_highlight_labels = self._legend_highlight_labels_for_axes(self._axes)
         diagnostics_count = len(
             [
                 row
@@ -15143,6 +15522,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "member_sequences": list(selection.get("member_sequences") or []),
             "member_runs": list(runs),
             "plot_type": plot_type,
+            "legend_highlight_labels": list(legend_highlight_labels),
             **last_plot_extra,
         }
         self._update_plot_zoom_actions()
@@ -15334,7 +15714,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._main_plot_legend_entries = self._apply_interactive_legend_policy(
             self._axes,
             overflow_button=getattr(self, "btn_plot_legend", None),
+            highlighted_labels=self._legend_highlight_seed_labels(),
         )
+        legend_highlight_labels = self._legend_highlight_labels_for_axes(self._axes)
         if average_summaries:
             prefix = "Average value: " if len(average_summaries) == 1 else "Average values: "
             self._set_plot_note(prefix + " | ".join(average_summaries))
@@ -15371,6 +15753,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "y_labels": [y_display_names.get(value, value) for value in y_cols],
             "plot_bounds": bool(plot_bounds),
             "metric_plot_source": metric_source,
+            "legend_highlight_labels": list(legend_highlight_labels),
         }
         self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
@@ -15461,7 +15844,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._main_plot_legend_entries = self._apply_interactive_legend_policy(
             self._axes,
             overflow_button=getattr(self, "btn_plot_legend", None),
+            highlighted_labels=self._legend_highlight_seed_labels(),
         )
+        legend_highlight_labels = self._legend_highlight_labels_for_axes(self._axes)
         self._apply_plot_view_bands_to_axes(self._axes, mode="curves")
         try:
             self._figure.tight_layout()
@@ -15491,6 +15876,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "x": (x_label or x_col_title),
             "y": list(y_cols),
             "y_labels": [y_display_names.get(value, value) for value in y_cols],
+            "legend_highlight_labels": list(legend_highlight_labels),
         }
         self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
@@ -18994,7 +19380,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._main_plot_legend_entries = self._apply_interactive_legend_policy(
             self._axes,
             overflow_button=getattr(self, "btn_plot_legend", None),
+            highlighted_labels=self._legend_highlight_seed_labels(),
         )
+        if isinstance(self._last_plot_def, dict):
+            self._last_plot_def["legend_highlight_labels"] = list(self._legend_highlight_labels_for_axes(self._axes))
         self._apply_plot_view_bands_to_axes(self._axes, mode="performance")
         self._refresh_plot_note()
         try:
@@ -19457,6 +19846,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         current_stat = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""
         master_result = (self._perf_results_by_stat or {}).get(current_stat) or {}
         master_model = (master_result or {}).get("master_model") or {}
+        legend_highlight_labels = self._legend_highlight_labels_for_axes(self._axes)
         self._last_plot_def = {
             "mode": "performance",
             "performance_plot_method": "legacy_serial_curves",
@@ -19481,6 +19871,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "performance_filter_mode": perf_filter_mode,
             "selected_control_period": control_period_filter,
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
+            "legend_highlight_labels": list(legend_highlight_labels),
         }
         self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
@@ -19617,6 +20008,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         current_stat = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""
         master_result = (self._perf_results_by_stat or {}).get(current_stat) or {}
         master_model = (master_result or {}).get("master_model") or {}
+        legend_highlight_labels = self._legend_highlight_labels_for_axes(self._axes)
         self._last_plot_def = {
             "mode": "performance",
             "performance_plot_method": "cached_condition_means",
@@ -19641,6 +20033,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "performance_filter_mode": perf_filter_mode,
             "selected_control_period": control_period_filter,
             "highlight_serial": str(getattr(self, "_highlight_sn", "") or "").strip(),
+            "legend_highlight_labels": list(legend_highlight_labels),
         }
         self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
@@ -23177,6 +23570,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 ),
             )
 
+        legend_highlight_labels = self._apply_legend_highlight_labels_to_axes(
+            ax,
+            self._legend_highlight_labels_from_plot_def(d),
+        )
+        d["legend_highlight_labels"] = list(legend_highlight_labels)
         try:
             fig.tight_layout()
         except Exception:
@@ -24179,6 +24577,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         normalized_plot_definition = dict(plot_definition)
         normalized_plot_definition["mode"] = mode
+        normalized_plot_definition["legend_highlight_labels"] = self._normalize_legend_highlight_labels(
+            plot_definition.get("legend_highlight_labels")
+        )
         if mode == "curves":
             y_values = (
                 [str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()]
@@ -25514,6 +25915,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "padding: 8px 10px; color: #991b1b; font-size: 11px; }"
         )
         right_layout.addWidget(warning_label)
+        plot_ctrl = QtWidgets.QHBoxLayout()
+        plot_ctrl.setSpacing(8)
+        btn_plot_legend = QtWidgets.QPushButton("Legend...")
+        btn_plot_legend.setVisible(False)
+        btn_plot_legend.setEnabled(False)
+        btn_plot_legend.setStyleSheet(
+            """
+            QPushButton {
+                padding: 6px 10px;
+                border-radius: 8px;
+                background: #ffffff;
+                border: 1px solid #e2e8f0;
+                font-size: 12px;
+                font-weight: 800;
+                color: #0f172a;
+            }
+            QPushButton:hover { background: #f8fafc; }
+            """
+        )
+        plot_ctrl.addWidget(btn_plot_legend)
+        plot_ctrl.addStretch(1)
+        right_layout.addLayout(plot_ctrl)
         canvas_host = QtWidgets.QWidget()
         canvas_layout = QtWidgets.QVBoxLayout(canvas_host)
         canvas_layout.setContentsMargins(0, 0, 0, 0)
@@ -25522,6 +25945,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
+        viewer_state: dict[str, object] = {"axes": None, "canvas": None, "entries": []}
 
         def _plots() -> list[dict[str, object]]:
             return self._auto_graph_file_plot_entries(current_file["value"])
@@ -25574,11 +25998,61 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     widget.deleteLater()
             warning_label.setVisible(bool(warning_text))
             warning_label.setText(warning_text)
-            canvas_layout.addWidget(FigureCanvas(fig), 1)
+            canvas = FigureCanvas(fig)
+            canvas_layout.addWidget(canvas, 1)
+            ax = fig.axes[0] if getattr(fig, "axes", None) else None
+            viewer_state["axes"] = ax
+            viewer_state["canvas"] = canvas
+            if ax is not None:
+                viewer_state["entries"] = self._apply_interactive_legend_policy(
+                    ax,
+                    overflow_button=btn_plot_legend,
+                    highlighted_labels=self._legend_highlight_labels_from_plot_def(
+                        self._auto_plot_entry_plot_definition(plot_entry)
+                    ),
+                )
+            else:
+                viewer_state["entries"] = []
+                btn_plot_legend.setVisible(False)
+                btn_plot_legend.setEnabled(False)
+
+        def _apply_selected_plot_legend_highlights(labels: list[str]) -> None:
+            filtered = self._apply_legend_highlight_labels_to_axes(
+                viewer_state.get("axes"),
+                labels,
+                entries=list(viewer_state.get("entries") or []),
+            )
+            selected_items = plot_list.selectedItems()
+            if selected_items:
+                item = selected_items[0]
+                payload = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(payload, Mapping):
+                    payload_dict = dict(payload)
+                    plot_definition = self._auto_plot_entry_plot_definition(payload_dict)
+                    plot_definition["legend_highlight_labels"] = list(filtered)
+                    payload_dict["plot_definition"] = plot_definition
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, payload_dict)
+            canvas = viewer_state.get("canvas")
+            if canvas is not None:
+                try:
+                    canvas.draw_idle()
+                except Exception:
+                    try:
+                        canvas.draw()
+                    except Exception:
+                        pass
 
         _refresh_file_summary(current_file["value"])
         _refresh_plot_list()
         plot_list.itemSelectionChanged.connect(_render_selected)
+        btn_plot_legend.clicked.connect(
+            lambda: self._open_legend_popup(
+                viewer_state.get("entries"),
+                title="Plot Legend",
+                selected_labels=self._legend_highlight_labels_for_axes(viewer_state.get("axes")),
+                apply_callback=_apply_selected_plot_legend_highlights,
+            )
+        )
         _render_selected()
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -26575,156 +27049,162 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode not in {"curves", "metrics", "life_metrics", "performance"}:
             return
-        want_mode = str(plot_definition.get("selector_mode") or ("condition" if mode == "life_metrics" else "sequence")).strip().lower()
-        if hasattr(self, "cb_run_mode"):
-            idx = self.cb_run_mode.findData(want_mode)
-            if idx >= 0:
-                self.cb_run_mode.setCurrentIndex(idx)
-        selection = self._selection_from_plot_def(plot_definition)
-        selection_ids = (
-            [str(value).strip() for value in (plot_definition.get("selection_ids") or []) if str(value).strip()]
-            if isinstance(plot_definition.get("selection_ids"), list)
-            else []
+        self._pending_legend_highlight_labels = self._normalize_legend_highlight_labels(
+            plot_definition.get("legend_highlight_labels")
         )
-        selection_id = str(selection.get("id") or plot_definition.get("selection_id") or "").strip()
-        if mode in {"curves", "metrics", "life_metrics"} and want_mode == "condition":
-            self._set_mode(mode)
-            restore_ids = list(selection_ids)
-            if not restore_ids and selection_id:
-                restore_ids = [selection_id]
-            self._set_metric_condition_selection_ids(restore_ids)
-        elif selection_id:
-            self._select_run_by_id(selection_id)
-
-        self._set_mode(mode)
-        if mode == "curves":
-            y_values = self._curve_plot_y_values(plot_definition)
-            if y_values:
-                self._set_curve_y_selection(y_values)
-            x_value = str(plot_definition.get("x") or "").strip()
-            if x_value:
-                def _norm_name(s: str) -> str:
-                    return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
-
-                time_norms = {_norm_name(value) for value in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
-                pulse_norms = {_norm_name(value) for value in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
-                wanted_x = x_value
-                if _norm_name(wanted_x) in time_norms:
-                    wanted_x = "Time"
-                elif _norm_name(wanted_x) in pulse_norms:
-                    wanted_x = "Pulse Number"
-                self._set_combo_to_value(self.cb_x, wanted_x)
-            self._plot_curves()
-            return
-
-        if mode == "metrics":
-            stats_value = plot_definition.get("stats")
-            stats = [str(value).strip().lower() for value in stats_value if str(value).strip()] if isinstance(stats_value, list) else []
-            if not stats:
-                stat = str(plot_definition.get("stat") or "").strip().lower()
-                if stat:
-                    stats = [stat]
-            if not stats:
-                stats = ["mean"]
-            want_stats = {value for value in stats if value}
-            want_average = "average" in want_stats
-            want_stats.discard("average")
-            if hasattr(self, "cb_metric_average"):
-                self.cb_metric_average.setChecked(want_average)
-            self._set_metric_plot_source(plot_definition.get("metric_plot_source"))
-            if hasattr(self, "list_stats"):
-                self.list_stats.clearSelection()
-                for index in range(self.list_stats.count()):
-                    item = self.list_stats.item(index)
-                    if item.text().strip().lower() in want_stats:
-                        item.setSelected(True)
-            y_values = (
-                {str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()}
-                if isinstance(plot_definition.get("y"), list)
-                else set()
+        try:
+            want_mode = str(plot_definition.get("selector_mode") or ("condition" if mode == "life_metrics" else "sequence")).strip().lower()
+            if hasattr(self, "cb_run_mode"):
+                idx = self.cb_run_mode.findData(want_mode)
+                if idx >= 0:
+                    self.cb_run_mode.setCurrentIndex(idx)
+            selection = self._selection_from_plot_def(plot_definition)
+            selection_ids = (
+                [str(value).strip() for value in (plot_definition.get("selection_ids") or []) if str(value).strip()]
+                if isinstance(plot_definition.get("selection_ids"), list)
+                else []
             )
-            if y_values and hasattr(self, "list_y_metrics"):
-                self.list_y_metrics.clearSelection()
-                for index in range(self.list_y_metrics.count()):
-                    item = self.list_y_metrics.item(index)
-                    if item.text() in y_values:
-                        item.setSelected(True)
-            if hasattr(self, "cb_plot_metric_bounds"):
-                self.cb_plot_metric_bounds.setChecked(bool(plot_definition.get("plot_bounds")))
-            self._plot_metrics()
-            return
+            selection_id = str(selection.get("id") or plot_definition.get("selection_id") or "").strip()
+            if mode in {"curves", "metrics", "life_metrics"} and want_mode == "condition":
+                self._set_mode(mode)
+                restore_ids = list(selection_ids)
+                if not restore_ids and selection_id:
+                    restore_ids = [selection_id]
+                self._set_metric_condition_selection_ids(restore_ids)
+            elif selection_id:
+                self._select_run_by_id(selection_id)
 
-        if mode == "life_metrics":
-            plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
-            stats = self._life_plot_stats_from_definition(plot_definition)
-            y_values = self._life_plot_y_values(plot_definition)
-            self._set_mode("life_metrics")
-            self._set_combo_to_value(getattr(self, "cb_life_plot_type", None), plot_type)
-            self._set_life_y_parameter_selection(y_values)
-            if hasattr(self, "list_life_stats"):
-                self._set_list_widget_selection(self.list_life_stats, stats)
-                if not self.list_life_stats.selectedItems() and self.list_life_stats.count() > 0:
-                    self.list_life_stats.item(0).setSelected(True)
-            if plot_type == "metric_xy":
-                self._set_combo_to_value(getattr(self, "cb_life_x_param", None), str(plot_definition.get("x_parameter") or "").strip())
+            self._set_mode(mode)
+            if mode == "curves":
+                y_values = self._curve_plot_y_values(plot_definition)
+                if y_values:
+                    self._set_curve_y_selection(y_values)
+                x_value = str(plot_definition.get("x") or "").strip()
+                if x_value:
+                    def _norm_name(s: str) -> str:
+                        return "".join(ch.lower() for ch in str(s or "") if ch.isalnum())
+
+                    time_norms = {_norm_name(value) for value in ("time", "time_s", "time(sec)", "time(s)", "time (s)", "time_sec", "times")}
+                    pulse_norms = {_norm_name(value) for value in ("pulse number", "pulse#", "pulse #", "pulse_number", "pulsenumber", "cycle")}
+                    wanted_x = x_value
+                    if _norm_name(wanted_x) in time_norms:
+                        wanted_x = "Time"
+                    elif _norm_name(wanted_x) in pulse_norms:
+                        wanted_x = "Pulse Number"
+                    self._set_combo_to_value(self.cb_x, wanted_x)
+                self._plot_curves()
+                return
+
+            if mode == "metrics":
+                stats_value = plot_definition.get("stats")
+                stats = [str(value).strip().lower() for value in stats_value if str(value).strip()] if isinstance(stats_value, list) else []
+                if not stats:
+                    stat = str(plot_definition.get("stat") or "").strip().lower()
+                    if stat:
+                        stats = [stat]
+                if not stats:
+                    stats = ["mean"]
+                want_stats = {value for value in stats if value}
+                want_average = "average" in want_stats
+                want_stats.discard("average")
+                if hasattr(self, "cb_metric_average"):
+                    self.cb_metric_average.setChecked(want_average)
+                self._set_metric_plot_source(plot_definition.get("metric_plot_source"))
+                if hasattr(self, "list_stats"):
+                    self.list_stats.clearSelection()
+                    for index in range(self.list_stats.count()):
+                        item = self.list_stats.item(index)
+                        if item.text().strip().lower() in want_stats:
+                            item.setSelected(True)
+                y_values = (
+                    {str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()}
+                    if isinstance(plot_definition.get("y"), list)
+                    else set()
+                )
+                if y_values and hasattr(self, "list_y_metrics"):
+                    self.list_y_metrics.clearSelection()
+                    for index in range(self.list_y_metrics.count()):
+                        item = self.list_y_metrics.item(index)
+                        if item.text() in y_values:
+                            item.setSelected(True)
+                if hasattr(self, "cb_plot_metric_bounds"):
+                    self.cb_plot_metric_bounds.setChecked(bool(plot_definition.get("plot_bounds")))
+                self._plot_metrics()
+                return
+
+            if mode == "life_metrics":
+                plot_type = str(plot_definition.get("plot_type") or "life_axis").strip().lower()
+                stats = self._life_plot_stats_from_definition(plot_definition)
+                y_values = self._life_plot_y_values(plot_definition)
+                self._set_mode("life_metrics")
+                self._set_combo_to_value(getattr(self, "cb_life_plot_type", None), plot_type)
+                self._set_life_y_parameter_selection(y_values)
+                if hasattr(self, "list_life_stats"):
+                    self._set_list_widget_selection(self.list_life_stats, stats)
+                    if not self.list_life_stats.selectedItems() and self.list_life_stats.count() > 0:
+                        self.list_life_stats.item(0).setSelected(True)
+                if plot_type == "metric_xy":
+                    self._set_combo_to_value(getattr(self, "cb_life_x_param", None), str(plot_definition.get("x_parameter") or "").strip())
+                else:
+                    self._set_combo_to_value(getattr(self, "cb_life_axis", None), str(plot_definition.get("life_axis") or "sequence_index").strip())
+                self._refresh_life_stats_summary()
+                self._refresh_life_controls()
+                self._plot_life_metrics()
+                return
+
+            self._set_mode("performance")
+            self._refresh_performance_ui()
+            performance_plot_method = self._perf_normalize_plot_method(plot_definition.get("performance_plot_method"))
+            run_type_mode = str(plot_definition.get("performance_run_type_mode") or "").strip().lower()
+            if run_type_mode:
+                self._set_perf_run_type_mode(run_type_mode)
+            filter_mode = str(plot_definition.get("performance_filter_mode") or "all_conditions").strip().lower()
+            if hasattr(self, "cb_perf_filter_mode"):
+                idx = self.cb_perf_filter_mode.findData(filter_mode)
+                if idx >= 0:
+                    self.cb_perf_filter_mode.setCurrentIndex(idx)
+            selected_cp = plot_definition.get("selected_control_period")
+            if selected_cp not in (None, "") and hasattr(self, "cb_perf_control_period"):
+                idx = self.cb_perf_control_period.findData(selected_cp)
+                if idx >= 0:
+                    self.cb_perf_control_period.setCurrentIndex(idx)
+            self._update_perf_control_period_state()
+            self._set_combo_to_value(self.cb_perf_y_col, str(plot_definition.get("output") or ""))
+            self._set_combo_to_value(self.cb_perf_x_col, str(plot_definition.get("input1") or ""))
+            self._set_combo_to_value(self.cb_perf_z_col, str(plot_definition.get("input2") or ""))
+            self._on_perf_axis_changed("z" if str(plot_definition.get("input2") or "").strip() else "x")
+            if hasattr(self, "cb_perf_fit"):
+                self.cb_perf_fit.setChecked(bool(plot_definition.get("fit_enabled", True)))
+            fit_mode = str(plot_definition.get("fit_mode") or "").strip().lower()
+            if fit_mode and hasattr(self, "cb_perf_fit_model"):
+                idx = self.cb_perf_fit_model.findData(fit_mode)
+                if idx >= 0:
+                    self.cb_perf_fit_model.setCurrentIndex(idx)
+            surface_fit_family = str(
+                plot_definition.get("surface_fit_family")
+                or ("auto_surface" if bool(plot_definition.get("auto_surface_families")) else "quadratic_surface")
+            ).strip().lower()
+            if hasattr(self, "cb_perf_surface_model"):
+                idx = self.cb_perf_surface_model.findData(surface_fit_family)
+                if idx >= 0:
+                    self.cb_perf_surface_model.setCurrentIndex(idx)
+            if performance_plot_method == "cached_condition_means":
+                self._plot_performance_cached_condition_means()
             else:
-                self._set_combo_to_value(getattr(self, "cb_life_axis", None), str(plot_definition.get("life_axis") or "sequence_index").strip())
-            self._refresh_life_stats_summary()
-            self._refresh_life_controls()
-            self._plot_life_metrics()
-            return
-
-        self._set_mode("performance")
-        self._refresh_performance_ui()
-        performance_plot_method = self._perf_normalize_plot_method(plot_definition.get("performance_plot_method"))
-        run_type_mode = str(plot_definition.get("performance_run_type_mode") or "").strip().lower()
-        if run_type_mode:
-            self._set_perf_run_type_mode(run_type_mode)
-        filter_mode = str(plot_definition.get("performance_filter_mode") or "all_conditions").strip().lower()
-        if hasattr(self, "cb_perf_filter_mode"):
-            idx = self.cb_perf_filter_mode.findData(filter_mode)
-            if idx >= 0:
-                self.cb_perf_filter_mode.setCurrentIndex(idx)
-        selected_cp = plot_definition.get("selected_control_period")
-        if selected_cp not in (None, "") and hasattr(self, "cb_perf_control_period"):
-            idx = self.cb_perf_control_period.findData(selected_cp)
-            if idx >= 0:
-                self.cb_perf_control_period.setCurrentIndex(idx)
-        self._update_perf_control_period_state()
-        self._set_combo_to_value(self.cb_perf_y_col, str(plot_definition.get("output") or ""))
-        self._set_combo_to_value(self.cb_perf_x_col, str(plot_definition.get("input1") or ""))
-        self._set_combo_to_value(self.cb_perf_z_col, str(plot_definition.get("input2") or ""))
-        self._on_perf_axis_changed("z" if str(plot_definition.get("input2") or "").strip() else "x")
-        if hasattr(self, "cb_perf_fit"):
-            self.cb_perf_fit.setChecked(bool(plot_definition.get("fit_enabled", True)))
-        fit_mode = str(plot_definition.get("fit_mode") or "").strip().lower()
-        if fit_mode and hasattr(self, "cb_perf_fit_model"):
-            idx = self.cb_perf_fit_model.findData(fit_mode)
-            if idx >= 0:
-                self.cb_perf_fit_model.setCurrentIndex(idx)
-        surface_fit_family = str(
-            plot_definition.get("surface_fit_family")
-            or ("auto_surface" if bool(plot_definition.get("auto_surface_families")) else "quadratic_surface")
-        ).strip().lower()
-        if hasattr(self, "cb_perf_surface_model"):
-            idx = self.cb_perf_surface_model.findData(surface_fit_family)
-            if idx >= 0:
-                self.cb_perf_surface_model.setCurrentIndex(idx)
-        if performance_plot_method == "cached_condition_means":
-            self._plot_performance_cached_condition_means()
-        else:
-            self._plot_performance()
-        view_stat = str(plot_definition.get("view_stat") or "").strip().lower()
-        if view_stat and hasattr(self, "cb_perf_view_stat"):
-            idx = self.cb_perf_view_stat.findData(view_stat)
-            if idx >= 0:
-                self.cb_perf_view_stat.setCurrentIndex(idx)
-            elif self.cb_perf_view_stat.count() > 0:
-                for index in range(self.cb_perf_view_stat.count()):
-                    if str(self.cb_perf_view_stat.itemText(index) or "").strip().lower() == view_stat:
-                        self.cb_perf_view_stat.setCurrentIndex(index)
-                        break
-        self._redraw_performance_view()
+                self._plot_performance()
+            view_stat = str(plot_definition.get("view_stat") or "").strip().lower()
+            if view_stat and hasattr(self, "cb_perf_view_stat"):
+                idx = self.cb_perf_view_stat.findData(view_stat)
+                if idx >= 0:
+                    self.cb_perf_view_stat.setCurrentIndex(idx)
+                elif self.cb_perf_view_stat.count() > 0:
+                    for index in range(self.cb_perf_view_stat.count()):
+                        if str(self.cb_perf_view_stat.itemText(index) or "").strip().lower() == view_stat:
+                            self.cb_perf_view_stat.setCurrentIndex(index)
+                            break
+            self._redraw_performance_view()
+        finally:
+            self._pending_legend_highlight_labels = None
 
     def _open_auto_graph_quickcheck_rule_editor(
         self,

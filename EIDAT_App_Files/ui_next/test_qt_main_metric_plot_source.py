@@ -18,10 +18,11 @@ if str(APP_ROOT) not in sys.path:
 
 
 try:
-    from PySide6 import QtWidgets
+    from PySide6 import QtCore, QtWidgets
     from ui_next import backend
     from ui_next.qt_main import TestDataTrendDialog
 except Exception:  # pragma: no cover - optional dependency guard for local runs
+    QtCore = None  # type: ignore[assignment]
     QtWidgets = None  # type: ignore[assignment]
     backend = None  # type: ignore[assignment]
     TestDataTrendDialog = None  # type: ignore[assignment]
@@ -90,6 +91,105 @@ class _DummyComboBox:
 
     def currentText(self) -> str:
         return "sequence"
+
+
+class _LegendStub:
+    def __init__(self) -> None:
+        self.removed = False
+
+    def remove(self) -> None:
+        self.removed = True
+
+
+class _LegendArtist:
+    def __init__(
+        self,
+        *,
+        label: str,
+        linewidth: float = 1.0,
+        alpha: float | None = None,
+        color: str = "#1f77b4",
+        markersize: float = 6.0,
+        markeredgewidth: float = 1.0,
+        zorder: float = 2.0,
+    ) -> None:
+        self._label = str(label)
+        self._linewidth = float(linewidth)
+        self._alpha = alpha
+        self._color = str(color)
+        self._markersize = float(markersize)
+        self._markeredgewidth = float(markeredgewidth)
+        self._zorder = float(zorder)
+
+    def get_label(self) -> str:
+        return self._label
+
+    def get_color(self) -> str:
+        return self._color
+
+    def get_alpha(self) -> float | None:
+        return self._alpha
+
+    def set_alpha(self, value: float | None) -> None:
+        self._alpha = value
+
+    def get_zorder(self) -> float:
+        return self._zorder
+
+    def set_zorder(self, value: float) -> None:
+        self._zorder = float(value)
+
+    def get_linewidth(self) -> float:
+        return self._linewidth
+
+    def set_linewidth(self, value: float) -> None:
+        self._linewidth = float(value)
+
+    def get_markersize(self) -> float:
+        return self._markersize
+
+    def set_markersize(self, value: float) -> None:
+        self._markersize = float(value)
+
+    def get_markeredgewidth(self) -> float:
+        return self._markeredgewidth
+
+    def set_markeredgewidth(self, value: float) -> None:
+        self._markeredgewidth = float(value)
+
+
+class _LegendAxes:
+    def __init__(self) -> None:
+        self.lines: list[_LegendArtist] = []
+        self.collections: list[object] = []
+        self.patches: list[object] = []
+        self.containers: list[object] = []
+        self.artists: list[object] = []
+        self._legend: _LegendStub | None = None
+
+    def plot(self, *_args: object, **kwargs: object) -> list[_LegendArtist]:
+        artist = _LegendArtist(
+            label=str(kwargs.get("label") or ""),
+            linewidth=float(kwargs.get("linewidth") or 1.0),
+            alpha=(float(kwargs["alpha"]) if kwargs.get("alpha") is not None else None),
+            color=str(kwargs.get("color") or "#1f77b4"),
+            markersize=float(kwargs.get("markersize") or 6.0),
+        )
+        self.lines.append(artist)
+        return [artist]
+
+    def get_legend_handles_labels(self) -> tuple[list[_LegendArtist], list[str]]:
+        return list(self.lines), [artist.get_label() for artist in self.lines]
+
+    def get_legend(self) -> _LegendStub | None:
+        return self._legend
+
+    def legend(self, **_kwargs: object) -> _LegendStub:
+        self._legend = _LegendStub()
+        return self._legend
+
+    def grid(self, *_args: object, **_kwargs: object) -> None:
+        return None
 
 
 class _ResetAxes:
@@ -350,6 +450,10 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
             }
         ]
         return axes
+
+    @staticmethod
+    def _make_real_legend_axes():
+        return object(), _LegendAxes()
 
     def test_reset_main_plot_zoom_restores_saved_inline_limits(self) -> None:
         harness = _ResetHarness(_ResetAxes())
@@ -987,6 +1091,203 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                 window._populate_stats_table("CondA", "Pressure", composite_serial)
 
             self.assertEqual(window._stats_values["serial"].text(), "SN-001")
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_interactive_legend_policy_shows_button_without_overflow(self) -> None:
+        window = self._make_window()
+        try:
+            _fig, ax = self._make_real_legend_axes()
+            btn = QtWidgets.QPushButton()
+            btn.setVisible(False)
+            btn.setEnabled(False)
+            ax.plot([0.0, 1.0], [1.0, 2.0], label="SN-001")
+            ax.plot([0.0, 1.0], [2.0, 3.0], label="SN-002")
+
+            entries = window._apply_interactive_legend_policy(ax, overflow_button=btn)
+
+            self.assertEqual([str(entry.get("label") or "") for entry in entries], ["SN-001", "SN-002"])
+            self.assertFalse(btn.isHidden())
+            self.assertTrue(btn.isEnabled())
+            self.assertIsNotNone(ax.get_legend())
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_apply_legend_highlight_labels_emphasizes_selected_labels_only(self) -> None:
+        window = self._make_window()
+        try:
+            _fig, ax = self._make_real_legend_axes()
+            line_a = ax.plot([0.0, 1.0], [1.0, 2.0], linewidth=1.1, alpha=0.72, label="SN-001")[0]
+            line_b = ax.plot([0.0, 1.0], [2.0, 3.0], linewidth=1.2, alpha=0.74, label="SN-002")[0]
+            base_a = line_a.get_linewidth()
+            base_b = line_b.get_linewidth()
+
+            filtered = window._apply_legend_highlight_labels_to_axes(ax, ["Missing", "SN-002"])
+
+            self.assertEqual(filtered, ["SN-002"])
+            self.assertAlmostEqual(line_a.get_linewidth(), base_a)
+            self.assertGreater(line_b.get_linewidth(), base_b)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_main_plot_legend_popup_seeds_checks_and_highlights_multiple_labels(self) -> None:
+        window = self._make_window()
+        try:
+            _fig, ax = self._make_real_legend_axes()
+            line_a = ax.plot([0.0, 1.0], [1.0, 2.0], linewidth=1.0, alpha=0.75, label="SN-001")[0]
+            line_b = ax.plot([0.0, 1.0], [2.0, 3.0], linewidth=1.0, alpha=0.75, label="SN-002")[0]
+            base_a = line_a.get_linewidth()
+            base_b = line_b.get_linewidth()
+            window._axes = ax
+            window._canvas = _DummyCanvas()
+            window._last_plot_def = {"mode": "curves", "legend_highlight_labels": ["SN-001"]}
+            window._main_plot_legend_entries = window._apply_interactive_legend_policy(
+                ax,
+                overflow_button=QtWidgets.QPushButton(),
+                highlighted_labels=["SN-001"],
+            )
+            interaction: dict[str, object] = {"found": False, "checks": {}}
+
+            def _interact() -> None:
+                dialogs = [
+                    widget
+                    for widget in QtWidgets.QApplication.topLevelWidgets()
+                    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Plot Legend"
+                ]
+                if not dialogs:
+                    return
+                interaction["found"] = True
+                dlg = dialogs[-1]
+                listw = dlg.findChild(QtWidgets.QListWidget)
+                if listw is not None:
+                    checks: dict[str, bool] = {}
+                    for idx in range(listw.count()):
+                        item = listw.item(idx)
+                        if item is None:
+                            continue
+                        checks[str(item.text() or "")] = item.checkState() == QtCore.Qt.CheckState.Checked
+                        if str(item.text() or "") == "SN-002":
+                            item.setCheckState(QtCore.Qt.CheckState.Checked)
+                    interaction["checks"] = checks
+                for button in dlg.findChildren(QtWidgets.QPushButton):
+                    if button.text() == "Highlight":
+                        button.click()
+                    if button.text() == "Close":
+                        button.click()
+
+            QtCore.QTimer.singleShot(0, _interact)
+            window._open_main_plot_legend_popup()
+
+            self.assertTrue(interaction["found"])
+            self.assertEqual(interaction["checks"], {"SN-001": True, "SN-002": False})
+            self.assertEqual(window._last_plot_def.get("legend_highlight_labels"), ["SN-001", "SN-002"])
+            self.assertGreater(line_a.get_linewidth(), base_a)
+            self.assertGreater(line_b.get_linewidth(), base_b)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_main_plot_legend_popup_clear_restores_base_style(self) -> None:
+        window = self._make_window()
+        try:
+            _fig, ax = self._make_real_legend_axes()
+            line_a = ax.plot([0.0, 1.0], [1.0, 2.0], linewidth=1.05, alpha=0.72, label="SN-001")[0]
+            line_b = ax.plot([0.0, 1.0], [2.0, 3.0], linewidth=1.05, alpha=0.72, label="SN-002")[0]
+            base_a = line_a.get_linewidth()
+            base_b = line_b.get_linewidth()
+            window._axes = ax
+            window._canvas = _DummyCanvas()
+            window._last_plot_def = {"mode": "curves", "legend_highlight_labels": ["SN-001", "SN-002"]}
+            window._main_plot_legend_entries = window._apply_interactive_legend_policy(
+                ax,
+                overflow_button=QtWidgets.QPushButton(),
+                highlighted_labels=["SN-001", "SN-002"],
+            )
+            self.assertGreater(line_a.get_linewidth(), base_a)
+            self.assertGreater(line_b.get_linewidth(), base_b)
+            interaction = {"found": False}
+
+            def _interact() -> None:
+                dialogs = [
+                    widget
+                    for widget in QtWidgets.QApplication.topLevelWidgets()
+                    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Plot Legend"
+                ]
+                if not dialogs:
+                    return
+                interaction["found"] = True
+                dlg = dialogs[-1]
+                for button in dlg.findChildren(QtWidgets.QPushButton):
+                    if button.text() == "Clear Highlights":
+                        button.click()
+                    if button.text() == "Close":
+                        button.click()
+
+            QtCore.QTimer.singleShot(0, _interact)
+            window._open_main_plot_legend_popup()
+
+            self.assertTrue(interaction["found"])
+            self.assertEqual(window._last_plot_def.get("legend_highlight_labels"), [])
+            self.assertAlmostEqual(line_a.get_linewidth(), base_a)
+            self.assertAlmostEqual(line_b.get_linewidth(), base_b)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_apply_auto_graph_quickcheck_plot_to_live_gui_seeds_legend_highlights(self) -> None:
+        window = self._make_window()
+        try:
+            db_path = Path(getattr(window, "_test_tmpdir", "")) / "cache.sqlite3"
+            db_path.write_text("", encoding="utf-8")
+            window._db_path = db_path
+            window._plot_ready = True
+            captured: dict[str, object] = {}
+
+            def _fake_plot_metrics() -> None:
+                captured["labels"] = window._legend_highlight_seed_labels()
+                window._last_plot_def = {
+                    "mode": "metrics",
+                    "legend_highlight_labels": window._legend_highlight_seed_labels(),
+                }
+
+            plot_entry = {
+                "plot_definition": {
+                    "mode": "metrics",
+                    "selector_mode": "sequence",
+                    "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                    "stats": ["mean"],
+                    "y": ["Pressure"],
+                    "legend_highlight_labels": ["Pressure.mean", "Bounds"],
+                }
+            }
+
+            with patch.object(window, "_selection_from_plot_def", return_value={"id": "sequence:CondA|Program Alpha|Seq-1"}), patch.object(
+                window, "_set_mode", return_value=None
+            ), patch.object(
+                window, "_select_run_by_id", return_value=None
+            ), patch.object(
+                window, "_set_metric_plot_source", return_value=None
+            ), patch.object(
+                window, "_plot_metrics", side_effect=_fake_plot_metrics
+            ):
+                window._apply_auto_graph_quickcheck_plot_to_live_gui(plot_entry)
+
+            self.assertEqual(captured.get("labels"), ["Pressure.mean", "Bounds"])
+            self.assertEqual(window._last_plot_def.get("legend_highlight_labels"), ["Pressure.mean", "Bounds"])
+            self.assertIsNone(window._pending_legend_highlight_labels)
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
