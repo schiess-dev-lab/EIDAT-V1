@@ -88,6 +88,64 @@ class TestBackendRuntimeEnv(unittest.TestCase):
             self.assertNotIn("EIDAT_VENDORED_SITE_PACKAGES_WARNING", env)
             warn_mock.assert_not_called()
 
+    def test_run_scanner_excludes_edin_generated_program_folders(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            normal_pdf = root / "source" / "keep.pdf"
+            generated_pdf = root / "EDIN Program Folders" / "Program A" / "EDAT reports" / "skip.pdf"
+            generated_alias_pdf = root / "EDEN Program Files" / "skip2.pdf"
+            for path in (normal_pdf, generated_pdf, generated_alias_pdf):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"%PDF-1.4\n")
+
+            with patch.object(backend, "resolve_terms_path", return_value=Path("terms.xlsx")), patch.object(
+                backend, "resolve_pdf_root", return_value=root
+            ), patch.object(
+                backend, "run_simple_extraction", return_value="started"
+            ) as run_mock:
+                result = backend.run_scanner(Path("terms.xlsx"), root)
+
+            self.assertEqual(result, "started")
+            run_mock.assert_called_once()
+            pdfs = run_mock.call_args.args[0]
+            self.assertEqual([Path(p) for p in pdfs], [normal_pdf])
+
+    def test_run_excel_scanner_excludes_edin_generated_program_folders(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            config = root / "excel_trend_config.json"
+            config.write_text("{}", encoding="utf-8")
+            normal_xlsx = root / "source" / "keep.xlsx"
+            generated_xlsx = root / "EDIN Program Folders" / "Program A" / "skip.xlsx"
+            for path in (normal_xlsx, generated_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("", encoding="utf-8")
+
+            with patch.object(backend, "resolve_pdf_root", return_value=root), patch.object(
+                backend, "run_excel_extraction", return_value="started"
+            ) as run_mock:
+                result = backend.run_excel_scanner(root, config)
+
+            self.assertEqual(result, "started")
+            run_mock.assert_called_once()
+            excels = run_mock.call_args.args[0]
+            self.assertEqual([Path(p) for p in excels], [normal_xlsx])
+
+    def test_run_simple_extraction_rejects_only_generated_program_pdfs(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            generated_pdf = root / "EDIN Program Folders" / "Program A" / "EDAT reports" / "skip.pdf"
+            generated_pdf.parent.mkdir(parents=True, exist_ok=True)
+            generated_pdf.write_bytes(b"%PDF-1.4\n")
+
+            with patch.object(backend, "resolve_terms_path", return_value=Path("terms.xlsx")), patch.object(
+                backend, "resolve_pdf_paths", return_value=[generated_pdf]
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    backend.run_simple_extraction([generated_pdf], Path("terms.xlsx"))
+
+            self.assertIn("excluded from scanning", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

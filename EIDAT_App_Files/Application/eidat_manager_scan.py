@@ -39,6 +39,12 @@ except Exception:  # pragma: no cover
 SUPPORTED_EXTENSIONS = {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}
 EXCEL_ARTIFACT_SUFFIX = "__excel"
 TD_FILE_EXTRACTIONS_DIRNAME = "Test Data File Extractions"
+_EDIN_GENERATED_DIR_ALIASES_CASEFOLD = {
+    "edin program folders",
+    "eden program folders",
+    "edin program files",
+    "eden program files",
+}
 
 
 def _node_root_from_support_dir(support_dir: Path) -> Path:
@@ -75,6 +81,7 @@ _IGNORED_REPO_DIRNAMES_CASEFOLD = {
     ".venv",
     "venv",
 }
+_IGNORED_REPO_DIRNAMES_CASEFOLD.update(_EDIN_GENERATED_DIR_ALIASES_CASEFOLD)
 
 def _parse_ignore_dirs_env() -> set[str]:
     raw = str(os.environ.get("EIDAT_SCAN_IGNORE_DIRS") or "").strip()

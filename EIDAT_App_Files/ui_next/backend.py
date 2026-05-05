@@ -85,6 +85,12 @@ DEFAULT_REPO_ROOT = ROOT / "Data Packages"
 DEFAULT_PDF_DIR = DEFAULT_REPO_ROOT
 EDIN_PROGRAM_FOLDERS_DIRNAME = "EDIN Program Folders"
 EDIN_PROGRAM_REPORTS_DIRNAME = "EDAT reports"
+EDIN_GENERATED_DIR_ALIASES = {
+    EDIN_PROGRAM_FOLDERS_DIRNAME.casefold(),
+    "eden program folders",
+    "edin program files",
+    "eden program files",
+}
 SCANNER_ENV = DATA_ROOT / "user_inputs" / "scanner.env"
 SCANNER_ENV_LOCAL = DATA_ROOT / "user_inputs" / "scanner.local.env"
 OCR_FORCE_ENV = DATA_ROOT / "user_inputs" / "ocr_force.env"
@@ -268,6 +274,21 @@ def resolve_pdf_paths(paths: Iterable[Path]) -> list[Path]:
     for p in paths:
         resolved.append(resolve_pdf_path(Path(p), "PDF"))
     return resolved
+
+
+def _path_casefold_parts(path: Path) -> tuple[str, ...]:
+    try:
+        candidate = Path(path).expanduser().resolve()
+    except Exception:
+        try:
+            candidate = Path(path).expanduser().absolute()
+        except Exception:
+            candidate = Path(path)
+    return tuple(str(part or "").strip().casefold() for part in candidate.parts if str(part or "").strip())
+
+
+def _is_edin_generated_program_path(path: Path) -> bool:
+    return any(part in EDIN_GENERATED_DIR_ALIASES for part in _path_casefold_parts(path))
 
 
 def parse_scanner_env(path: Path = SCANNER_ENV) -> Dict[str, str]:
@@ -1800,9 +1821,9 @@ def run_scanner(terms: Path, pdf_dir: Path) -> subprocess.Popen:
     """Run simple extraction on all PDFs under the provided directory."""
     terms_path = resolve_terms_path(terms)
     pdf_root = resolve_pdf_root(pdf_dir)
-    pdfs = [p for p in pdf_root.rglob("*.pdf") if p.is_file()]
+    pdfs = [p for p in pdf_root.rglob("*.pdf") if p.is_file() and not _is_edin_generated_program_path(p)]
     if not pdfs:
-        raise RuntimeError(f"No PDFs found under: {pdf_root}")
+        raise RuntimeError(f"No PDFs found under: {pdf_root} after excluding EDIN/EDEN generated program folders")
     return run_simple_extraction(pdfs, terms_path)
 
 
@@ -1906,7 +1927,9 @@ def pre_ocr_merge_pdfs(paths: list[Path], out_root: Optional[Path] = None, dpi: 
 def run_simple_extraction(paths: list[Path], terms: Optional[Path] = None) -> subprocess.Popen:
     """Run the simple merged-text extraction pipeline on selected PDFs."""
     terms_path = resolve_terms_path(terms)
-    pdfs = resolve_pdf_paths(paths)
+    pdfs = [p for p in resolve_pdf_paths(paths) if not _is_edin_generated_program_path(p)]
+    if not pdfs:
+        raise RuntimeError("Selected PDFs are inside EDIN/EDEN generated program folders and are excluded from scanning.")
     args: list[str] = []
     for p in pdfs:
         args += ["--pdf", str(Path(p))]
@@ -1920,8 +1943,13 @@ def run_excel_extraction(excel_paths: list[Path], config: Optional[Path] = None,
     if not cfg.exists():
         raise FileNotFoundError(f"Excel trend config not found: {cfg}")
     repo = global_repo or DEFAULT_REPO_ROOT
+    filtered_paths = [Path(p) for p in excel_paths if not _is_edin_generated_program_path(Path(p))]
+    if not filtered_paths:
+        raise RuntimeError(
+            "Selected Excel/MAT files are inside EDIN/EDEN generated program folders and are excluded from scanning."
+        )
     args: list[str] = ["--global-repo", str(repo)]
-    for p in excel_paths:
+    for p in filtered_paths:
         args += ["--excel", str(Path(p))]
     args += ["--config", str(cfg)]
     return run_script("scripts/excel_extraction.py", *args)
@@ -1934,10 +1962,17 @@ def run_excel_scanner(data_dir: Path, config: Optional[Path] = None) -> subproce
     excels = [
         p
         for p in data_root.rglob("*")
-        if p.is_file() and p.suffix.lower() in EXCEL_EXTENSIONS and not p.name.startswith("~$")
+        if (
+            p.is_file()
+            and p.suffix.lower() in EXCEL_EXTENSIONS
+            and not p.name.startswith("~$")
+            and not _is_edin_generated_program_path(p)
+        )
     ]
     if not excels:
-        raise RuntimeError(f"No Excel data files found under: {data_root}")
+        raise RuntimeError(
+            f"No Excel data files found under: {data_root} after excluding EDIN/EDEN generated program folders"
+        )
     return run_excel_extraction(excels, cfg, data_root)
 
 

@@ -95,6 +95,30 @@ class TestScanIgnoresHeavyDirs(unittest.TestCase):
             self.assertEqual(len(summary.candidates), 1)
             self.assertEqual(summary.candidates[0].rel_path.replace("\\", "/"), "normal/a.pdf")
 
+    def test_scan_prunes_edin_and_eden_generated_program_folders(self) -> None:
+        import tempfile
+
+        root = _repo_root()
+        sys.path.insert(0, str(root / "EIDAT_App_Files" / "Application"))
+        from eidat_manager_db import support_paths  # type: ignore
+        from eidat_manager_scan import scan_global_repo  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            repo = Path(td)
+            (repo / "normal").mkdir(parents=True, exist_ok=True)
+            (repo / "EDIN Program Folders" / "Program A" / "EDAT reports").mkdir(parents=True, exist_ok=True)
+            (repo / "EDEN Program Files").mkdir(parents=True, exist_ok=True)
+            (repo / "normal" / "a.pdf").write_text("x", encoding="utf-8")
+            (repo / "EDIN Program Folders" / "Program A" / "EDAT reports" / "b.pdf").write_text("x", encoding="utf-8")
+            (repo / "EDEN Program Files" / "c.pdf").write_text("x", encoding="utf-8")
+
+            paths = support_paths(repo)
+            summary = scan_global_repo(paths)
+
+            self.assertEqual(int(summary.pdf_count or 0), 1)
+            self.assertEqual(len(summary.candidates), 1)
+            self.assertEqual(summary.candidates[0].rel_path.replace("\\", "/"), "normal/a.pdf")
+
 
 class TestSingleFileForceUpdate(unittest.TestCase):
     def test_backend_process_passes_file_filters_to_manager(self) -> None:
