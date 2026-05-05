@@ -1032,6 +1032,14 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "run_title": "Run A",
                     "base_condition_label": "Condition A",
                     "selection_fields": {"sequence_text": "Run A", "condition_text": "Condition A"},
+                    "condition_context_rows": [
+                        {
+                            "run_type": "steady state",
+                            "feed_pressure": 275.0,
+                            "feed_pressure_units": "psia",
+                            "suppression_voltage": 5.0,
+                        }
+                    ],
                 },
                 "pair-2": {
                     "pair_id": "pair-2",
@@ -1039,6 +1047,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "run_title": "Run B",
                     "base_condition_label": "Condition A",
                     "selection_fields": {"sequence_text": "Run B", "condition_text": "Condition A"},
+                    "condition_context_rows": [
+                        {
+                            "run_type": "pulsed mode",
+                            "feed_pressure": 320.0,
+                            "feed_pressure_units": "psia",
+                            "pulse_width_on": 0.02,
+                            "pulse_width_units": "s",
+                            "off_time": 0.08,
+                            "off_time_units": "s",
+                            "suppression_voltage": 5.0,
+                        }
+                    ],
                 },
             },
         }
@@ -1084,9 +1104,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(run_condition_spec["page_number"], 4)
         self.assertEqual(create_page_mock.call_args.kwargs["section_title"], "")
         self.assertEqual(create_page_mock.call_args.kwargs["section_subtitle"], "")
+        self.assertEqual(
+            create_page_mock.call_args.kwargs["plot_context_lines"],
+            [
+                "Steady State Condition | Feed Pressure: 275 psia",
+                "Pulse Mode Condition | Feed Pressure: 320 psia | On Time: 0.02 s | Off Time: 0.08 s",
+            ],
+        )
         self.assertFalse(create_page_mock.call_args.kwargs["show_plot_toc_backlink"])
         self.assertEqual(len(axes.plot_calls), 0)
         self.assertEqual(len(axes.scatter_calls), 4)
+        self.assertEqual(axes.title[0][0], "Pressure (mean)")
+        self.assertIn("bbox", axes.title[1])
         series_scatter_labels = [str(call[2].get("label") or "") for call in axes.scatter_calls if call[2].get("label")]
         highlight_calls = [call for call in axes.scatter_calls if not call[2].get("label")]
         highlight_colors = [call[2]["color"] for call in highlight_calls]
@@ -1141,7 +1170,11 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(regrade_spec["section"], "regrade_pass_plot_metrics")
         self.assertEqual(regrade_spec["page_number"], 7)
-        self.assertEqual(create_regrade_page_mock.call_args.kwargs["section_title"], "Regrade Pass Metrics | Condition A")
+        self.assertEqual(create_regrade_page_mock.call_args.kwargs["section_title"], "Regrade Pass Metrics")
+        self.assertEqual(
+            create_regrade_page_mock.call_args.kwargs["plot_context_lines"],
+            ["Steady State Condition | Feed Pressure: 275 psia"],
+        )
         self.assertEqual(axes_regrade.xticklabels, ["SN-001", "SN-002", "SN-003"])
         self.assertEqual(len(axes_regrade.scatter_calls), 2)
         self.assertEqual(len(axes_regrade.axhline_calls), 1)
@@ -1187,6 +1220,32 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             ),
             "hi": ["SN-001"],
             "colors": ["#ef4444", "#2563eb"],
+            "pair_by_id": {
+                "pair-1": {
+                    "pair_id": "pair-1",
+                    "condition_context_rows": [
+                        {
+                            "run_type": "steady state",
+                            "feed_pressure": 275.0,
+                            "feed_pressure_units": "psia",
+                        }
+                    ],
+                },
+                "pair-2": {
+                    "pair_id": "pair-2",
+                    "condition_context_rows": [
+                        {
+                            "run_type": "pulsed mode",
+                            "feed_pressure": 320.0,
+                            "feed_pressure_units": "psia",
+                            "pulse_width_on": 0.02,
+                            "pulse_width_units": "s",
+                            "off_time": 0.08,
+                            "off_time_units": "s",
+                        }
+                    ],
+                },
+            },
             "finding_by_pair_serial": {
                 ("pair-1", "SN-001"): {
                     "initial_max_pct": 2.0,
@@ -1224,8 +1283,17 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(plot_spec["page_number"], 9)
         self.assertEqual(create_page_mock.call_args.kwargs["section_title"], "")
         self.assertEqual(create_page_mock.call_args.kwargs["section_subtitle"], "")
+        self.assertEqual(
+            create_page_mock.call_args.kwargs["plot_context_lines"],
+            [
+                "Steady State Condition | Feed Pressure: 275 psia",
+                "Pulse Mode Condition | Feed Pressure: 320 psia | On Time: 0.02 s | Off Time: 0.08 s",
+            ],
+        )
         self.assertFalse(create_page_mock.call_args.kwargs["show_plot_toc_backlink"])
         self.assertIsNone(axes.position)
+        self.assertEqual(axes.title[0][0], "Pressure")
+        self.assertIn("bbox", axes.title[1])
         self.assertEqual(len(pdf.saved_figures), 1)
         self.assertEqual(fake_plt.closed, [fig])
         self.assertGreaterEqual(len(axes.plot_calls), 2)
@@ -1705,10 +1773,38 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 page_number=7,
                 section_title="Run Condition Metrics | Condition A",
                 section_subtitle="Pressure | Time | mean",
+                plot_context_lines=["Steady State Condition | Feed Pressure: 275 psia"],
             )
 
         rendered_text = [str(args[2]) for args, _kwargs in fig.text_calls if len(args) >= 3]
         self.assertIn(tar._TAR_PLOT_TOC_BACKLINK_TEXT, rendered_text)
+        self.assertIn("Steady State Condition | Feed Pressure: 275 psia", rendered_text)
+
+    def test_plot_condition_header_line_formats_pulse_and_steady_state_metadata(self) -> None:
+        steady = tar._tar_plot_condition_header_line(
+            {
+                "run_type": "steady state",
+                "feed_pressure": 275.0,
+                "feed_pressure_units": "psia",
+            }
+        )
+        pulse = tar._tar_plot_condition_header_line(
+            {
+                "run_type": "pulsed mode",
+                "feed_pressure": 320.0,
+                "feed_pressure_units": "psia",
+                "pulse_width_on": 0.02,
+                "pulse_width_units": "s",
+                "off_time": 0.08,
+                "off_time_units": "s",
+            }
+        )
+
+        self.assertEqual(steady, "Steady State Condition | Feed Pressure: 275 psia")
+        self.assertEqual(
+            pulse,
+            "Pulse Mode Condition | Feed Pressure: 320 psia | On Time: 0.02 s | Off Time: 0.08 s",
+        )
 
     def test_build_intro_story_places_quick_summary_before_counts_and_groups_run_tables(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(

@@ -251,6 +251,20 @@ def _td_valve_voltage_filter_value(row: Mapping[str, object] | None) -> str:
     return _td_compact_filter_value(row.get("valve_voltage"))
 
 
+def _td_feed_pressure_filter_value(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return _td_compact_filter_value(row.get("feed_pressure"))
+
+
+def _td_value_with_units(value: object, units: object) -> str:
+    number = _td_compact_filter_value(value)
+    if not number:
+        return ""
+    unit_text = str(units or "").strip()
+    return " ".join(part for part in (number, unit_text) if part).strip()
+
+
 def _filter_state_values(filter_state: Mapping[str, object] | None, key: str) -> list[str]:
     if not isinstance(filter_state, Mapping):
         return []
@@ -536,16 +550,70 @@ def _td_list_serials(conn: sqlite3.Connection) -> list[str]:
 
 def _td_list_runs(conn: sqlite3.Connection) -> list[dict]:
     try:
-        rows = conn.execute("SELECT run_name, default_x, display_name FROM td_runs ORDER BY run_name").fetchall()
+        rows = conn.execute(
+            """
+            SELECT
+                run_name,
+                default_x,
+                display_name,
+                run_type,
+                control_period,
+                pulse_width,
+                COALESCE(pulse_width_units, ''),
+                off_time,
+                COALESCE(off_time_units, ''),
+                feed_pressure,
+                COALESCE(feed_pressure_units, ''),
+                suppression_voltage,
+                valve_voltage,
+                COALESCE(condition_display, '')
+            FROM td_runs
+            ORDER BY run_name
+            """
+        ).fetchall()
     except Exception:
-        return []
+        try:
+            legacy_rows = conn.execute("SELECT run_name, default_x, display_name FROM td_runs ORDER BY run_name").fetchall()
+        except Exception:
+            return []
+        rows = [
+            (
+                rn,
+                dx,
+                dn,
+                "",
+                None,
+                None,
+                "",
+                None,
+                "",
+                None,
+                "",
+                None,
+                None,
+                "",
+            )
+            for rn, dx, dn in legacy_rows
+        ]
     out: list[dict] = []
-    for rn, dx, dn in rows:
+    for rn, dx, dn, run_type, control_period, pulse_width, pulse_width_units, off_time, off_time_units, feed_pressure, feed_pressure_units, suppression_voltage, valve_voltage, condition_display in rows:
         out.append(
             {
                 "run_name": str(rn or "").strip(),
                 "default_x": str(dx or "").strip(),
                 "display_name": str(dn or "").strip(),
+                "run_type": str(run_type or "").strip(),
+                "control_period": control_period,
+                "pulse_width": pulse_width,
+                "pulse_width_on": pulse_width,
+                "pulse_width_units": str(pulse_width_units or "").strip(),
+                "off_time": off_time,
+                "off_time_units": str(off_time_units or "").strip(),
+                "feed_pressure": feed_pressure,
+                "feed_pressure_units": str(feed_pressure_units or "").strip(),
+                "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
+                "condition_display": str(condition_display or "").strip(),
             }
         )
     return out
@@ -3981,6 +4049,7 @@ def _apply_plot_page_header(
     page_number: int,
     section_title: str,
     section_subtitle: str = "",
+    plot_context_lines: Sequence[str] | None = None,
     show_plot_toc_backlink: bool = True,
 ) -> None:
     from matplotlib.patches import Rectangle  # type: ignore
@@ -4007,6 +4076,25 @@ def _apply_plot_page_header(
         fig.text(0.04, title_y, str(section_title), color="#0f172a", fontsize=14, fontweight="bold", va="top")
     if section_subtitle:
         fig.text(0.04, subtitle_y, str(section_subtitle), color="#334155", fontsize=9.5, va="top")
+    context_lines = [str(line or "").strip() for line in (plot_context_lines or []) if str(line or "").strip()]
+    if context_lines:
+        fig.text(
+            0.50,
+            0.853,
+            "\n".join(context_lines),
+            color="#0f172a",
+            fontsize=9.5,
+            fontweight="bold",
+            va="center",
+            ha="center",
+            multialignment="center",
+            bbox={
+                "boxstyle": "round,pad=0.36",
+                "facecolor": "#f8fafc",
+                "edgecolor": "#cbd5e1",
+                "linewidth": 1.0,
+            },
+        )
     if show_plot_toc_backlink:
         fig.text(
             0.96,
@@ -4028,6 +4116,7 @@ def _create_landscape_plot_page(
     page_number: int,
     section_title: str,
     section_subtitle: str = "",
+    plot_context_lines: Sequence[str] | None = None,
     show_plot_toc_backlink: bool = True,
 ) -> tuple[Any, Any]:
     import matplotlib.pyplot as plt  # type: ignore
@@ -4039,6 +4128,7 @@ def _create_landscape_plot_page(
         page_number=page_number,
         section_title=section_title,
         section_subtitle=section_subtitle,
+        plot_context_lines=plot_context_lines,
         show_plot_toc_backlink=show_plot_toc_backlink,
     )
     ax = fig.add_axes([0.06, 0.09, 0.90, 0.73])
@@ -5518,6 +5608,183 @@ def _tar_subtitle_text(text: object) -> str:
     return textwrap.shorten(raw, width=180, placeholder="...")
 
 
+def _tar_plot_condition_mode_label(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    raw = _norm_key(str(row.get("run_type") or ""))
+    on_time = _safe_float(row.get("pulse_width_on", row.get("pulse_width")))
+    off_time = _safe_float(row.get("off_time"))
+    control_period = _safe_float(row.get("control_period"))
+    pulse_like = (
+        raw in {"pm", "pulsemode", "pulsedmode", "pulsed", "pulse"}
+        or on_time is not None
+        or off_time is not None
+        or (on_time is not None and control_period is not None and control_period >= on_time)
+    )
+    if pulse_like:
+        return "Pulse Mode Condition"
+    if raw in {"ss", "steadystate", "steady"}:
+        return "Steady State Condition"
+    if raw:
+        return str(row.get("run_type") or "").strip()
+    return ""
+
+
+def _tar_plot_condition_on_time_text(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return _td_value_with_units(
+        row.get("pulse_width_on", row.get("pulse_width")),
+        row.get("pulse_width_units"),
+    )
+
+
+def _tar_plot_condition_off_time_text(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    off_text = _td_value_with_units(row.get("off_time"), row.get("off_time_units") or row.get("pulse_width_units"))
+    if off_text:
+        return off_text
+    on_time = _safe_float(row.get("pulse_width_on", row.get("pulse_width")))
+    control_period = _safe_float(row.get("control_period"))
+    if on_time is None or control_period is None or control_period < on_time:
+        return ""
+    return _td_value_with_units(control_period - on_time, row.get("pulse_width_units"))
+
+
+def _tar_plot_condition_header_line(
+    row: Mapping[str, object] | None,
+    *,
+    fallback_condition_label: str = "",
+) -> str:
+    if not isinstance(row, Mapping):
+        return str(fallback_condition_label or "").strip()
+    mode_label = _tar_plot_condition_mode_label(row)
+    pressure_text = _td_value_with_units(row.get("feed_pressure"), row.get("feed_pressure_units"))
+    on_time_text = _tar_plot_condition_on_time_text(row)
+    off_time_text = _tar_plot_condition_off_time_text(row)
+
+    parts: list[str] = []
+    if mode_label:
+        parts.append(mode_label)
+    if pressure_text:
+        parts.append(f"Feed Pressure: {pressure_text}")
+    if mode_label == "Pulse Mode Condition":
+        if on_time_text:
+            parts.append(f"On Time: {on_time_text}")
+        if off_time_text:
+            parts.append(f"Off Time: {off_time_text}")
+
+    if parts:
+        return " | ".join(parts)
+    fallback = str(row.get("condition_display") or fallback_condition_label or "").strip()
+    return fallback
+
+
+def _tar_spec_condition_context_rows(
+    spec: Mapping[str, object] | None,
+    *,
+    suppression_voltage: str = "",
+    valve_voltage: str = "",
+) -> list[dict[str, object]]:
+    raw_rows = [dict(row) for row in (dict(spec or {}).get("condition_context_rows") or []) if isinstance(row, Mapping)]
+    if not raw_rows:
+        return []
+    suppression_text = str(suppression_voltage or "").strip()
+    valve_text = str(valve_voltage or "").strip()
+    if not suppression_text and not valve_text:
+        return raw_rows
+    filtered: list[dict[str, object]] = []
+    for row in raw_rows:
+        if suppression_text and _td_suppression_voltage_filter_value(row) != suppression_text:
+            continue
+        if valve_text and _td_valve_voltage_filter_value(row) != valve_text:
+            continue
+        filtered.append(row)
+    return filtered or raw_rows
+
+
+def _tar_plot_condition_filter_labels(
+    spec: Mapping[str, object] | None,
+    *,
+    filter_state_override: Mapping[str, object] | None = None,
+) -> tuple[str, str]:
+    if isinstance(filter_state_override, Mapping):
+        suppression_values = _filter_state_values(filter_state_override, "suppression_voltages")
+        valve_values = _filter_state_values(filter_state_override, "valve_voltages")
+        suppression_text = suppression_values[0] if len(suppression_values) == 1 else ""
+        valve_text = valve_values[0] if len(valve_values) == 1 else ""
+        if suppression_text or valve_text:
+            return suppression_text, valve_text
+    raw_spec = dict(spec or {})
+    return (
+        str(raw_spec.get("suppression_voltage_label") or "").strip(),
+        str(raw_spec.get("valve_voltage_label") or "").strip(),
+    )
+
+
+def _tar_plot_condition_header_lines(
+    ctx: Mapping[str, Any],
+    spec: Mapping[str, object] | None,
+    *,
+    filter_state_override: Mapping[str, object] | None = None,
+    max_items: int = 3,
+) -> list[str]:
+    raw_spec = dict(spec or {})
+    pair_ids = _tar_unique_text_values(
+        [raw_spec.get("pair_id")] + list(raw_spec.get("member_pair_ids") or [])
+    )
+    pair_by_id = ctx.get("pair_by_id") or {}
+    suppression_text, valve_text = _tar_plot_condition_filter_labels(raw_spec, filter_state_override=filter_state_override)
+    fallback_label = str(
+        raw_spec.get("base_condition_label")
+        or raw_spec.get("run_condition_label")
+        or _tar_plot_run_condition_label(raw_spec, run_by_name=(ctx.get("run_by_name") or {}))
+        or ""
+    ).strip()
+
+    lines: list[str] = []
+    seen: set[str] = set()
+    for pair_id in pair_ids:
+        pair_spec = dict(pair_by_id.get(pair_id) or {})
+        if not pair_spec and pair_id == str(raw_spec.get("pair_id") or "").strip():
+            pair_spec = raw_spec
+        condition_rows = _tar_spec_condition_context_rows(
+            pair_spec,
+            suppression_voltage=suppression_text,
+            valve_voltage=valve_text,
+        )
+        for row in condition_rows:
+            line = _tar_plot_condition_header_line(row, fallback_condition_label=fallback_label)
+            key = line.casefold()
+            if not line or key in seen:
+                continue
+            seen.add(key)
+            lines.append(line)
+            if len(lines) >= max_items:
+                return lines
+    if lines:
+        return lines
+    fallback = str(fallback_label or "").strip()
+    return [fallback] if fallback else []
+
+
+def _tar_set_plot_parameter_title(ax: Any, text: object) -> None:
+    ax.set_title(
+        str(text or "").strip(),
+        loc="left",
+        fontsize=13,
+        fontweight="bold",
+        pad=12,
+        bbox={
+            "boxstyle": "round,pad=0.28",
+            "facecolor": "#f8fafc",
+            "edgecolor": "#cbd5e1",
+            "linewidth": 1.0,
+        },
+    )
+
+
 def _tar_plot_run_condition_label(
     spec: Mapping[str, object] | None = None,
     *,
@@ -5651,20 +5918,19 @@ def _tar_unique_text_values(values: list[object]) -> list[str]:
 def _tar_default_report_subtitle(*, serials: list[str] | None, meta_by_sn: Mapping[str, Mapping[str, object]] | None) -> str:
     serial_list = _tar_unique_text_values(list(serials or []))
     metadata = meta_by_sn or {}
+    programs = _tar_unique_text_values([dict(metadata.get(serial) or {}).get("program_title") for serial in serial_list])
     asset_types = _tar_unique_text_values([dict(metadata.get(serial) or {}).get("asset_type") for serial in serial_list])
     asset_specific_types = _tar_unique_text_values([dict(metadata.get(serial) or {}).get("asset_specific_type") for serial in serial_list])
-    programs = _tar_unique_text_values([dict(metadata.get(serial) or {}).get("program_title") for serial in serial_list])
 
-    parts = [REPORT_SUBTITLE_DEFAULT]
+    parts: list[str] = []
+    if programs:
+        parts.append(_tar_join_limited(programs, max_items=4, empty=""))
     if asset_types:
         parts.append(_tar_join_limited(asset_types, max_items=4, empty=""))
     if asset_specific_types:
         parts.append(_tar_join_limited(asset_specific_types, max_items=4, empty=""))
-    if programs:
-        parts.append(_tar_join_limited(programs, max_items=4, empty=""))
-    if serial_list:
-        parts.append(_tar_join_limited(serial_list, max_items=8, empty=""))
-    return " | ".join([part for part in parts if str(part or "").strip()])
+    subtitle = " | ".join([part for part in parts if str(part or "").strip()])
+    return subtitle or REPORT_SUBTITLE_DEFAULT
 
 
 def _tar_grade_rank(grade: object) -> int:
@@ -9043,6 +9309,8 @@ def _tar_prepare_row_specs(
             )
             raw_condition_pairs: list[dict[str, str]] = []
             seen_condition_keys: set[str] = set()
+            condition_context_rows: list[dict[str, object]] = []
+            seen_condition_contexts: set[tuple[str, ...]] = set()
             for row in filter_rows or []:
                 if not isinstance(row, dict):
                     continue
@@ -9050,6 +9318,38 @@ def _tar_prepare_row_specs(
                     continue
                 if not _selection_matches_observation_row(selection, row):
                     continue
+                context_row = {
+                    "run_name": str(row.get("run_name") or run_name).strip(),
+                    "source_run_name": str(row.get("source_run_name") or "").strip(),
+                    "condition_display": str(row.get("condition_display") or run_meta.get("condition_display") or base_condition_label).strip(),
+                    "run_type": str(row.get("run_type") or run_meta.get("run_type") or "").strip(),
+                    "feed_pressure": row.get("feed_pressure", run_meta.get("feed_pressure")),
+                    "feed_pressure_units": str(row.get("feed_pressure_units") or run_meta.get("feed_pressure_units") or "").strip(),
+                    "pulse_width": row.get("pulse_width_on", row.get("pulse_width", run_meta.get("pulse_width_on", run_meta.get("pulse_width")))),
+                    "pulse_width_on": row.get("pulse_width_on", row.get("pulse_width", run_meta.get("pulse_width_on", run_meta.get("pulse_width")))),
+                    "pulse_width_units": str(row.get("pulse_width_units") or run_meta.get("pulse_width_units") or "").strip(),
+                    "off_time": row.get("off_time", run_meta.get("off_time")),
+                    "off_time_units": str(row.get("off_time_units") or run_meta.get("off_time_units") or "").strip(),
+                    "control_period": row.get("control_period", run_meta.get("control_period")),
+                    "suppression_voltage": row.get("suppression_voltage"),
+                    "valve_voltage": row.get("valve_voltage"),
+                }
+                context_key = (
+                    _norm_key(context_row.get("run_type") or ""),
+                    _td_feed_pressure_filter_value(context_row),
+                    str(context_row.get("feed_pressure_units") or "").strip().casefold(),
+                    _td_compact_filter_value(context_row.get("pulse_width_on")),
+                    str(context_row.get("pulse_width_units") or "").strip().casefold(),
+                    _td_compact_filter_value(context_row.get("off_time")),
+                    str(context_row.get("off_time_units") or "").strip().casefold(),
+                    _td_control_period_filter_value(context_row),
+                    _td_suppression_voltage_filter_value(context_row),
+                    _td_valve_voltage_filter_value(context_row),
+                    str(context_row.get("condition_display") or "").strip().casefold(),
+                )
+                if any(context_key) and context_key not in seen_condition_contexts:
+                    seen_condition_contexts.add(context_key)
+                    condition_context_rows.append(context_row)
                 suppression_value = _td_suppression_voltage_filter_value(row)
                 valve_value = _td_valve_voltage_filter_value(row)
                 condition_key = _tar_condition_combo_key(suppression_value, valve_value)
@@ -9112,6 +9412,33 @@ def _tar_prepare_row_specs(
                 if filtered_series:
                     condition_pairs.append(dict(condition_pair))
                     series_by_condition_key[str(condition_pair.get("key") or "")] = filtered_series
+            if not condition_context_rows:
+                fallback_context_row = {
+                    "run_name": run_name,
+                    "source_run_name": run_name,
+                    "condition_display": str(run_meta.get("condition_display") or base_condition_label).strip(),
+                    "run_type": str(run_meta.get("run_type") or "").strip(),
+                    "feed_pressure": run_meta.get("feed_pressure"),
+                    "feed_pressure_units": str(run_meta.get("feed_pressure_units") or "").strip(),
+                    "pulse_width": run_meta.get("pulse_width_on", run_meta.get("pulse_width")),
+                    "pulse_width_on": run_meta.get("pulse_width_on", run_meta.get("pulse_width")),
+                    "pulse_width_units": str(run_meta.get("pulse_width_units") or "").strip(),
+                    "off_time": run_meta.get("off_time"),
+                    "off_time_units": str(run_meta.get("off_time_units") or "").strip(),
+                    "control_period": run_meta.get("control_period"),
+                    "suppression_voltage": run_meta.get("suppression_voltage"),
+                    "valve_voltage": run_meta.get("valve_voltage"),
+                }
+                if any(
+                    [
+                        str(fallback_context_row.get("run_type") or "").strip(),
+                        _td_feed_pressure_filter_value(fallback_context_row),
+                        _td_compact_filter_value(fallback_context_row.get("pulse_width_on")),
+                        _td_compact_filter_value(fallback_context_row.get("off_time")),
+                        _td_control_period_filter_value(fallback_context_row),
+                    ]
+                ):
+                    condition_context_rows.append(fallback_context_row)
             row_specs.append(
                 {
                     "pair_id": f"{selection_id}::{run_name}::{param_name}",
@@ -9122,6 +9449,7 @@ def _tar_prepare_row_specs(
                     "selection_fields": dict(selection_fields),
                     "selection_label": selection_label,
                     "base_condition_label": base_condition_label,
+                    "condition_context_rows": list(condition_context_rows),
                     "suppression_values": list(suppression_values),
                     "valve_values": list(valve_values),
                     "condition_pairs": list(condition_pairs),
@@ -11127,16 +11455,19 @@ def _tar_render_metric_cohort_page(
         cohort_spec,
         run_by_name=(ctx.get("run_by_name") or {}),
     )
+    plot_context_lines = _tar_plot_condition_header_lines(
+        ctx,
+        cohort_spec,
+        filter_state_override=filter_state_override,
+    )
     hide_header_details = str(section_key or "").strip() == "run_condition_plot_metrics"
     show_family_overlay = _tar_show_pooled_family_overlay(cohort_spec)
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title="" if hide_header_details else _tar_compose_plot_section_title(section_title, run_condition_label),
-        section_subtitle="" if hide_header_details else _tar_subtitle_text(
-            f"Parameter: {param_name} | Statistic: {metric_stat} | X Axis: {x_name} | "
-            f"Selected: {_tar_join_limited(selection_labels, max_items=5, empty='(none)')}"
-        ),
+        section_title="" if hide_header_details else str(section_title or "").strip(),
+        section_subtitle="",
+        plot_context_lines=plot_context_lines,
         show_plot_toc_backlink=not hide_header_details,
     )
     serials = list(ctx.get("all_serials") or [])
@@ -11174,7 +11505,7 @@ def _tar_render_metric_cohort_page(
         plt.close(fig)
         return None
 
-    ax.set_title(f"{param_name} ({metric_stat})", loc="left", fontsize=13, fontweight="bold", pad=10)
+    _tar_set_plot_parameter_title(ax, f"{param_name} ({metric_stat})")
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
     for pair_spec, yv, color in plotted:
         label = _tar_metric_pair_legend_label(
@@ -11263,13 +11594,15 @@ def _tar_render_curve_cohort_page(
         cohort_spec,
         run_by_name=(ctx.get("run_by_name") or {}),
     )
+    plot_context_lines = _tar_plot_condition_header_lines(ctx, cohort_spec)
     full_width_layout = str(section_key or "").strip() == "run_condition_curve_overlays"
     show_family_overlay = _tar_show_pooled_family_overlay(cohort_spec)
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title="" if full_width_layout else _tar_compose_plot_section_title(section_title, run_condition_label),
-        section_subtitle="" if full_width_layout else _tar_subtitle_text(subtitle),
+        section_title="" if full_width_layout else str(section_title or "").strip(),
+        section_subtitle="",
+        plot_context_lines=plot_context_lines,
         show_plot_toc_backlink=not full_width_layout,
     )
     ax_side = None
@@ -11277,7 +11610,7 @@ def _tar_render_curve_cohort_page(
         ax.set_position([0.06, 0.09, 0.66, 0.70])
         ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
         ax_side.axis("off")
-    ax.set_title(f"{param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
+    _tar_set_plot_parameter_title(ax, param_name)
     ax.set_xlabel(x_name)
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
 
@@ -11396,20 +11729,20 @@ def _tar_render_watch_curve_page(
         selection=(pair_spec.get("selection") if isinstance(pair_spec.get("selection"), Mapping) else None),
         run_by_name=(ctx.get("run_by_name") or {}),
     )
+    plot_context_lines = _tar_plot_condition_header_lines(ctx, pair_spec)
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
-        section_title=_tar_compose_plot_section_title("Watch / Non-PASS Curves", run_condition_label),
-        section_subtitle=_tar_subtitle_text(
-            f"{str(pair_spec.get('selection_label') or run_name).strip() or run_name} | Parameter: {param_name}"
-        ),
+        section_title="Watch / Non-PASS Curves",
+        section_subtitle="",
+        plot_context_lines=plot_context_lines,
     )
     ax.set_position([0.06, 0.09, 0.66, 0.70])
     ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
     ax_side.axis("off")
     units = _tar_pair_units_label(pair_spec)
     run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
-    ax.set_title(f"{run_title} - {param_name}", loc="left", fontsize=13, fontweight="bold", pad=10)
+    _tar_set_plot_parameter_title(ax, param_name)
     ax.set_xlabel(x_name)
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
     for serial, y_curve in y_resampled_by_sn.items():

@@ -375,7 +375,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertTrue(ctx.printed_timezone)
         self.assertRegex(ctx.printed_at, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} .+$")
 
-    def test_default_report_subtitle_uses_asset_program_and_serial_metadata(self):
+    def test_default_report_subtitle_uses_only_program_and_asset_metadata(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         subtitle = tar._tar_default_report_subtitle(
@@ -394,7 +394,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             },
         )
 
-        self.assertEqual(subtitle, "Hot Fire Test Data | Valve | Main Fuel Valve | Program A | SN-001, SN-002")
+        self.assertEqual(subtitle, "Program A | Valve | Main Fuel Valve")
+        self.assertNotIn("SN-001", subtitle)
 
     def test_selection_display_fields_condition_mode_keeps_condition_and_sequences(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
