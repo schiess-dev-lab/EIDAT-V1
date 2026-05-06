@@ -2937,6 +2937,7 @@ def process_candidates(
                                     if want_xlsx:
                                         try:
                                             if is_mat_bundle and bundle_seed is not None:
+                                                export_sqlite_excel_mirror(sqlite_abs)
                                                 export_td_sqlite_workbook(sqlite_abs)
                                             else:
                                                 export_sqlite_excel_mirror(sqlite_abs)
@@ -3312,6 +3313,17 @@ def process_candidates(
                 export_excel_mirror=export_td_sqlite_workbook,
                 mirror_xlsx=mirror_xlsx,
             )
+            if mirror_xlsx:
+                for item in list(aggregate_payload.get("aggregates") or []):
+                    if not isinstance(item, dict):
+                        continue
+                    sqlite_path = Path(str(item.get("sqlite_path") or "")).expanduser()
+                    if not sqlite_path.exists():
+                        continue
+                    try:
+                        export_sqlite_excel_mirror(sqlite_path)
+                    except Exception:
+                        pass
             aggregate_payload["triggered"] = True
             aggregate_payload["source_results_detected"] = int(td_source_results_detected)
         except Exception as exc:

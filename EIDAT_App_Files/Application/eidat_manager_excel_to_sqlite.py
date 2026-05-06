@@ -1537,15 +1537,19 @@ def _mat_extract_run_table(
         _canonicalize_header(header, canonical_defs, min_ratio=float(fuzzy_min_ratio))
         for header in headers_all
     ]
-    keep_pairs: list[tuple[str, str]] = []
+    td_pairs: list[tuple[str, str]] = []
+    other_pairs: list[tuple[str, str]] = []
     allowed_norms = {str(v).strip() for v in (allowed_header_norms or set()) if str(v).strip()}
     for header, mapped in zip(headers_all, mapped_all):
         norm = _normalize_header(mapped or header)
-        if allowed_norms and norm not in allowed_norms:
+        pair = (header, mapped)
+        if allowed_norms and norm in allowed_norms:
+            td_pairs.append(pair)
             continue
-        keep_pairs.append((header, mapped))
+        other_pairs.append(pair)
+    keep_pairs = td_pairs + other_pairs
     if not keep_pairs:
-        raise RuntimeError(f"{mat_path.name} did not contain any TD-relevant aligned series.")
+        raise RuntimeError(f"{mat_path.name} did not contain any aligned numeric series.")
     headers = [header for header, _mapped in keep_pairs]
     mapped_headers = [mapped for _header, mapped in keep_pairs]
     col_idents = _dedupe_idents(headers)

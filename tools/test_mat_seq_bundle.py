@@ -269,20 +269,24 @@ class TestMatSeqBundle(unittest.TestCase):
             official_dir = paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN2755"
             artifacts_dir = self._official_td_source_dir(official_dir, bundle.bundle_stem)
             sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
+            sqlite_mirror_path = sqlite_path.with_suffix(sqlite_path.suffix + ".xlsx")
             metadata_path = artifacts_dir / f"{bundle.bundle_stem}_metadata.json"
             manifest_path = artifacts_dir / "mat_seq_bundle.json"
             source_workbook = artifacts_dir / f"{bundle.bundle_stem}.xlsx"
             official_sqlite = official_dir / "SN2755.sqlite3"
+            official_sqlite_mirror = official_sqlite.with_suffix(official_sqlite.suffix + ".xlsx")
             official_metadata = official_dir / "SN2755_metadata.json"
             official_manifest = official_dir / "td_serial_aggregate.json"
             official_workbook = official_dir / "SN2755.xlsx"
 
             self.assertTrue(artifacts_dir.exists())
             self.assertTrue(sqlite_path.exists())
+            self.assertTrue(sqlite_mirror_path.exists())
             self.assertTrue(metadata_path.exists())
             self.assertTrue(manifest_path.exists())
             self.assertTrue(source_workbook.exists())
             self.assertTrue(official_sqlite.exists())
+            self.assertTrue(official_sqlite_mirror.exists())
             self.assertTrue(official_metadata.exists())
             self.assertTrue(official_workbook.exists())
             self.assertFalse(official_manifest.exists())
@@ -331,7 +335,7 @@ class TestMatSeqBundle(unittest.TestCase):
             self.assertIn("time", seq1_cols_norm)
             self.assertIn("thrust", seq1_cols_norm)
             self.assertIn("pressure", seq1_cols_norm)
-            self.assertNotIn("junktelemetry", seq1_cols_norm)
+            self.assertIn("junktelemetry", seq1_cols_norm)
             seq1_context = self._sequence_context_row(sqlite_path, sheet_name="seq1")
             self.assertEqual(str(seq1_context.get("extraction_status") or "").strip(), "incomplete")
 
@@ -340,6 +344,24 @@ class TestMatSeqBundle(unittest.TestCase):
                 try:
                     self.assertEqual(list(wb.sheetnames), ["seq1", "seq2", "seq3"])
                     self.assertTrue(all(not name.startswith("__") for name in wb.sheetnames))
+                    ws = wb["seq1"]
+                    header_values = {
+                        str(cell.value or "").strip().casefold()
+                        for cell in next(ws.iter_rows(min_row=1, max_row=1))
+                        if str(cell.value or "").strip()
+                    }
+                    self.assertIn("time", header_values)
+                    self.assertIn("thrust", header_values)
+                    self.assertIn("pressure", header_values)
+                    self.assertIn("junktelemetry", header_values)
+                finally:
+                    wb.close()
+
+            for workbook_path in (sqlite_mirror_path, official_sqlite_mirror):
+                wb = load_workbook(str(workbook_path), read_only=True, data_only=True)
+                try:
+                    self.assertIn("sheet__seq1", list(wb.sheetnames))
+                    self.assertIn("__sheet_info", list(wb.sheetnames))
                 finally:
                     wb.close()
 
@@ -439,10 +461,14 @@ class TestMatSeqBundle(unittest.TestCase):
             official_sqlite = official_dir / "SN2755.sqlite3"
             official_metadata = official_dir / "SN2755_metadata.json"
             official_workbook = official_dir / "SN2755.xlsx"
+            sqlite_mirror_path = sqlite_path.with_suffix(sqlite_path.suffix + ".xlsx")
+            official_sqlite_mirror = official_sqlite.with_suffix(official_sqlite.suffix + ".xlsx")
 
             self.assertTrue(sqlite_path.exists())
+            self.assertTrue(sqlite_mirror_path.exists())
             self.assertTrue(source_workbook.exists())
             self.assertTrue(official_sqlite.exists())
+            self.assertTrue(official_sqlite_mirror.exists())
             self.assertTrue(official_metadata.exists())
             self.assertTrue(official_workbook.exists())
 
