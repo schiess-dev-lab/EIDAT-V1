@@ -753,6 +753,7 @@ class _RunSelectionHarness:
         self.btn_save_selected_auto = QtWidgets.QPushButton()
         self.btn_save_all_auto = QtWidgets.QPushButton()
         self.btn_view_auto_plots = QtWidgets.QPushButton()
+        self.btn_add_auto_plot = QtWidgets.QPushButton()
         self.btn_auto_graphs = QtWidgets.QPushButton()
         self.btn_auto_report = QtWidgets.QPushButton()
         self._plot_ready = True
@@ -764,6 +765,9 @@ class _RunSelectionHarness:
         self._run_selection_views = {"sequence": [], "condition": []}
         self._run_display_by_name = {}
         self._run_name_by_display = {}
+        self._metric_parameter_options = []
+        self._curve_parameter_options = []
+        self._life_parameter_options = []
         self._global_filter_rows = []
         self._available_program_filters = ["Program A", "Program B", "Unknown Program"]
         self._available_serial_filter_rows = [{"serial": "SN1"}, {"serial": "SN2"}]
@@ -782,6 +786,8 @@ class _RunSelectionHarness:
         self._plot_metrics_called = False
         self._opened_auto_plot_entries: list[dict[str, object]] = []
         self._opened_auto_graph_file: dict[str, object] | None = None
+        self._opened_auto_graph_files: list[dict[str, object]] = []
+        self._last_plot_def: dict[str, object] | None = None
 
         for name in (
             "_auto_plot_available_serial_values",
@@ -811,9 +817,17 @@ class _RunSelectionHarness:
             "_auto_graph_file_tile_text",
             "_auto_graph_file_tooltip",
             "_auto_graph_file_plot_entries",
+            "_auto_graph_file_global_selection_filters_only",
+            "_auto_graph_plot_has_selection_spec",
+            "_migrate_auto_graph_plot_selection",
+            "_load_saved_auto_graph_file_entries",
+            "_save_saved_auto_graph_file_entries",
+            "_upsert_auto_graph_file_entry",
+            "_next_auto_graph_snapshot_name",
             "_normalized_auto_plot_entries",
             "_auto_plot_store_payload",
             "_save_auto_plots_store",
+            "_load_auto_plots",
             "_auto_plot_filter_summary_text",
             "_auto_plot_entry_filter_state",
             "_current_run_selector_mode",
@@ -849,6 +863,15 @@ class _RunSelectionHarness:
             "_restrictive_valve_voltage_filter_values",
             "_filter_state_without_valve_voltages",
             "_selection_filter_state",
+            "_selection_filter_state_cache_key",
+            "_global_filter_evaluation",
+            "_row_matches_global_filters_from_eval",
+            "_active_serial_rows",
+            "_active_serials",
+            "_row_program_label",
+            "_row_matches_global_filters",
+            "_filter_rows_for_global_selection",
+            "_selection_matches_observation_row",
             "_selection_member_control_periods",
             "_selection_member_suppression_voltages",
             "_selection_run_type_modes",
@@ -863,6 +886,9 @@ class _RunSelectionHarness:
             "_refresh_run_dropdown",
             "_auto_report_condition_label",
             "_auto_report_selection_display_text",
+            "_current_quickcheck_plot_entry",
+            "_current_auto_graph_snapshot_file",
+            "_add_current_plot_to_autoplots",
             "_refresh_auto_plots_list",
             "_update_auto_actions",
             "_delete_selected_auto_plots",
@@ -876,6 +902,19 @@ class _RunSelectionHarness:
         self._plot_metrics = lambda: setattr(self, "_plot_metrics_called", True)
         self._plot_curves = lambda: None
         self._refresh_performance_ui = lambda: None
+        self._faceted_available_filter_values = lambda key, filter_state=None: self._auto_plot_available_filter_values(key)
+        self._selected_filter_values_from_available = lambda available_values, selected_values, **kwargs: [
+            value for value in (selected_values or []) if value in set(available_values or [])
+        ]
+        self._curve_plot_y_values = lambda plot_definition: [
+            str(value).strip() for value in (plot_definition.get("y") or []) if str(value).strip()
+        ] if isinstance(plot_definition, dict) and isinstance(plot_definition.get("y"), list) else []
+        self._plot_value_summary = lambda values, max_items=2: ", ".join([str(value) for value in (values or [])[:max_items]])
+        self._parameter_display_name = lambda value, options=None, fallback="": str(value or fallback or "").strip()
+        self._perf_display_name = lambda value: str(value or "").strip()
+        self._normalize_legend_highlight_labels = lambda values: [
+            str(value).strip() for value in (values or []) if str(value).strip()
+        ] if isinstance(values, list) else []
         self._set_combo_to_value = lambda *args, **kwargs: None
         self._on_perf_axis_changed = lambda *args, **kwargs: None
         self._open_auto_plot_entries_panel = lambda entries, *, title: setattr(
@@ -887,6 +926,11 @@ class _RunSelectionHarness:
             self,
             "_opened_auto_graph_file",
             dict(graph_file),
+        )
+        self._open_auto_graph_snapshot_viewer = lambda graph_files, *, title="Auto-Graphs": setattr(
+            self,
+            "_opened_auto_graph_files",
+            [dict(entry) for entry in (graph_files or []) if isinstance(entry, dict)],
         )
         self._open_auto_graph_file_editor = lambda graph_file=None, seed_plot=None: None
         self._open_selected_auto_plot = getattr(
@@ -919,6 +963,8 @@ class _GlobalFilterHarness:
         self._highlight_sn = ""
         self._highlight_sns: list[str] = []
         self._perf_results_by_stat = {}
+        self._global_filter_eval_cache = {}
+        self._parameter_normalization_context = {}
         self._serial_source_rows = [
             {"serial": "SN1", "serial_number": "SN1", "program_title": "Program A", "document_type": "TD"},
             {"serial": "SN2", "serial_number": "SN2", "program_title": "Program B", "document_type": "TD"},
@@ -954,7 +1000,10 @@ class _GlobalFilterHarness:
         for name in (
             "_auto_plot_available_serial_values",
             "_auto_plot_selected_filter_values",
+            "_current_auto_plot_filter_state",
+            "_normalize_auto_plot_filter_state",
             "_selection_filter_state",
+            "_selection_filter_state_cache_key",
             "_active_control_period_filter_values",
             "_single_active_control_period_filter_value",
             "_active_program_filter_values",
@@ -965,9 +1014,13 @@ class _GlobalFilterHarness:
             "_restrictive_control_period_filter_values",
             "_restrictive_suppression_voltage_filter_values",
             "_restrictive_valve_voltage_filter_values",
+            "_global_filter_evaluation",
+            "_row_matches_global_filters_from_eval",
             "_row_program_label",
             "_row_matches_global_filters",
             "_filter_rows_for_global_selection",
+            "_parameter_selection_matches_row",
+            "_parameter_selection_raw_names",
             "_load_metric_series_for_selection",
             "_load_curves_for_selection",
             "_selected_perf_serials",
@@ -1354,6 +1407,102 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         self.assertEqual(harness._db_path, fake_db)
         self.assertEqual(harness._refresh_from_cache_calls, 1)
         self.assertEqual(harness._update_plot_zoom_actions_calls, 1)
+
+    def test_refresh_from_cache_uses_summary_and_batch_loaders_and_defers_perf_ui(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._highlight_sns = []
+            dlg._refresh_performance_ui_calls = 0
+            dlg._refresh_performance_ui = lambda: setattr(
+                dlg,
+                "_refresh_performance_ui_calls",
+                int(getattr(dlg, "_refresh_performance_ui_calls", 0)) + 1,
+            )
+            dlg._load_parameter_normalization_context = lambda: None
+            dlg._refresh_global_filter_options = lambda: None
+            dlg._sync_run_mode_availability = lambda: None
+            dlg._refresh_run_dropdown = lambda prev_selection_id=None: setattr(dlg, "_last_prev_selection_id", prev_selection_id)
+            dlg._set_highlight_serials = lambda values: setattr(dlg, "_highlight_sns", list(values))
+            dlg._refresh_columns_for_run = lambda: None
+            dlg._refresh_stats_preview = lambda: None
+            dlg._clear_smart_solver_result = lambda clear_saved=True: None
+            dlg._refresh_smart_solver_ui = lambda: None
+            dlg._update_plot_zoom_actions = lambda: None
+
+            with mock.patch.object(be, "td_list_runs_ex", return_value=[{"run_name": "RunA", "display_name": "Run A"}]) as runs_mock, mock.patch.object(
+                be, "td_list_serials", return_value=["SN1"]
+            ), mock.patch.object(
+                be,
+                "td_list_run_selection_views",
+                return_value={
+                    "sequence": [{"id": "sequence:RunA", "run_name": "RunA", "sequence_name": "RunA", "display_text": "RunA"}],
+                    "condition": [],
+                },
+            ), mock.patch.object(
+                be,
+                "td_read_sources_metadata_from_cache",
+                return_value=[{"serial": "SN1", "source_key": "SN1", "serial_number": "SN1", "program_title": "Program A"}],
+            ), mock.patch.object(
+                be,
+                "td_read_observation_filter_summary_rows_from_cache",
+                return_value=[{"serial": "SN1", "source_key": "SN1", "serial_number": "SN1", "program_title": "Program A", "run_name": "RunA", "source_run_name": "Seq1"}],
+            ) as summary_mock, mock.patch.object(
+                be,
+                "td_list_y_columns_by_runs",
+                return_value={"RunA": [{"name": "thrust", "units": "lbf"}]},
+            ) as y_cols_mock, mock.patch.object(
+                be,
+                "td_read_observation_filter_rows_from_cache",
+                side_effect=AssertionError("legacy observation filter loader should not be used during startup"),
+            ) as legacy_mock:
+                dlg._refresh_from_cache()
+
+            runs_mock.assert_called_once_with(dlg._db_path)
+            summary_mock.assert_called_once_with(dlg._db_path)
+            y_cols_mock.assert_called_once_with(dlg._db_path)
+            legacy_mock.assert_not_called()
+            self.assertEqual(dlg._refresh_performance_ui_calls, 0)
+            self.assertTrue(dlg._perf_ui_dirty)
+            self.assertEqual(dlg._calc_y_columns_by_run, {"RunA": [{"name": "thrust", "units": "lbf"}]})
+            self.assertEqual([row.get("serial") for row in dlg._global_filter_rows], ["SN1"])
+        finally:
+            dlg.close()
+
+    def test_set_mode_refreshes_performance_ui_only_when_needed(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._refresh_run_selection_visibility = lambda: None
+            dlg._refresh_plot_view_band_controls = lambda: None
+            dlg._refresh_stats_preview = lambda: None
+            dlg._refresh_smart_solver_ui = lambda: None
+            dlg._schedule_mode_panel_height_sync = lambda: None
+            calls = {"count": 0}
+
+            def _fake_refresh_perf() -> None:
+                calls["count"] += 1
+                dlg._perf_ui_initialized = True
+                dlg._perf_ui_dirty = False
+
+            dlg._refresh_performance_ui = _fake_refresh_perf
+            dlg._perf_ui_initialized = False
+            dlg._perf_ui_dirty = True
+
+            dlg._set_mode("performance")
+            self.assertEqual(calls["count"], 1)
+
+            dlg._set_mode("curves")
+            dlg._set_mode("performance")
+            self.assertEqual(calls["count"], 1)
+
+            dlg._perf_ui_dirty = True
+            dlg._set_mode("performance")
+            self.assertEqual(calls["count"], 2)
+        finally:
+            dlg.close()
 
     def test_generate_debug_excel_files_uses_manual_export_only(self) -> None:
         _qt_app()
@@ -2056,14 +2205,23 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         finally:
             dlg.close()
 
-    def test_auto_graphs_button_opens_builder_and_footer_buttons_stay_hidden(self) -> None:
+    def test_auto_graphs_button_opens_snapshot_library_and_save_button_is_visible(self) -> None:
         dlg = _build_test_data_dialog()
         try:
             dlg._plot_ready = True
             dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
+            dlg._auto_plots = [
+                {
+                    "name": "Saved Graph",
+                    "global_selection": {"filters": {}},
+                    "track_program_serials": False,
+                    "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}}],
+                }
+            ]
             dlg._sync_main_auto_plot_actions()
             self.assertTrue(dlg.btn_auto_graphs.isEnabled())
-            self.assertTrue(dlg.btn_add_auto_plot.isHidden())
+            self.assertFalse(dlg.btn_add_auto_plot.isHidden())
+            self.assertEqual(dlg.btn_add_auto_plot.text(), "Save Current Graph")
             self.assertTrue(dlg.btn_view_auto_plots.isHidden())
             self.assertIs(dlg.btn_auto_graphs.parentWidget(), dlg.auto_report_frame)
             self.assertIs(dlg.btn_auto_report.parentWidget(), dlg.auto_report_frame)
@@ -2072,6 +2230,21 @@ class TestTDTrendDialogLayout(unittest.TestCase):
                 dlg._open_auto_plots_popup()
 
             exec_mock.assert_called_once()
+        finally:
+            dlg.close()
+
+    def test_save_current_graph_button_enablement_follows_live_plot_presence(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._plot_ready = True
+            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
+            dlg._last_plot_def = None
+            dlg._sync_main_auto_plot_actions()
+            self.assertFalse(dlg.btn_add_auto_plot.isEnabled())
+
+            dlg._last_plot_def = {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}
+            dlg._sync_main_auto_plot_actions()
+            self.assertTrue(dlg.btn_add_auto_plot.isEnabled())
         finally:
             dlg.close()
 
@@ -2144,6 +2317,7 @@ class TestTDTrendDialogLayout(unittest.TestCase):
                 "plots": [{"mode": "curves", "y": ["current"], "x": "Time"}],
             },
         ]
+        harness._save_saved_auto_graph_file_entries(harness._auto_plots)
         popup_list = QtWidgets.QListWidget()
         popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
         harness._refresh_auto_plots_list(popup_list)
@@ -2159,6 +2333,126 @@ class TestTDTrendDialogLayout(unittest.TestCase):
         self.assertEqual([d.get("name") for d in harness._auto_plots], ["File 2"])
         self.assertEqual(popup_list.count(), 1)
         self.assertIn("File 2", popup_list.item(0).text())
+
+    def test_popup_auto_plot_open_selected_multiple_files_uses_snapshot_viewer(self) -> None:
+        _qt_app()
+        from PySide6 import QtWidgets
+
+        harness = _RunSelectionHarness()
+        harness._auto_plot_entry_tooltip = lambda entry: ""
+        harness._auto_plots = [
+            {
+                "name": "File 1",
+                "global_selection": harness._default_auto_plot_global_selection(),
+                "track_program_serials": False,
+                "plots": [{"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}],
+            },
+            {
+                "name": "File 2",
+                "global_selection": harness._default_auto_plot_global_selection(),
+                "track_program_serials": False,
+                "plots": [{"mode": "metrics", "stats": ["mean"], "y": ["current"]}],
+            },
+        ]
+        popup_list = QtWidgets.QListWidget()
+        popup_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        harness._refresh_auto_plots_list(popup_list)
+        popup_list.item(0).setSelected(True)
+        popup_list.item(1).setSelected(True)
+
+        harness._open_selected_auto_plot(list_widget=popup_list)
+
+        self.assertIsNone(harness._opened_auto_graph_file)
+        self.assertEqual(len(harness._opened_auto_graph_files), 2)
+
+    def test_add_current_plot_to_autoplots_creates_graph_snapshot_entry(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._last_plot_def = {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}
+        harness._load_auto_plots = lambda: None
+
+        harness._add_current_plot_to_autoplots()
+
+        payload = json.loads(harness._auto_plot_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("version"), 4)
+        self.assertEqual(len(payload.get("graph_files") or []), 1)
+        saved = payload["graph_files"][0]
+        self.assertEqual(str(((saved.get("plots") or [])[0] or {}).get("plot_definition", {}).get("mode") or ""), "metrics")
+        self.assertFalse(bool(saved.get("track_program_serials")))
+        self.assertIn("filters", saved.get("global_selection") or {})
+
+    def test_add_current_plot_to_autoplots_repeated_saves_create_distinct_entries(self) -> None:
+        harness = _RunSelectionHarness()
+        harness._last_plot_def = {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}
+        harness._load_auto_plots = lambda: None
+
+        harness._add_current_plot_to_autoplots()
+        harness._add_current_plot_to_autoplots()
+
+        payload = json.loads(harness._auto_plot_path.read_text(encoding="utf-8"))
+        graph_files = payload.get("graph_files") or []
+        self.assertEqual(len(graph_files), 2)
+        names = {str(item.get("name") or "") for item in graph_files}
+        self.assertEqual(names, {"Metrics: mean (thrust)", "Metrics: mean (thrust) (2)"})
+
+    @unittest.skipUnless(_have_matplotlib(), "matplotlib not installed")
+    def test_snapshot_viewer_uses_tabs_for_each_plot_and_prefixes_multi_file_titles(self) -> None:
+        _qt_app()
+        from matplotlib.figure import Figure
+        from PySide6 import QtWidgets
+
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._plot_ready = True
+            dlg._db_path = Path(tempfile.mkdtemp()) / "cache.sqlite3"
+            dlg._render_auto_graph_plot_figure = lambda graph_file, plot_entry: (Figure(figsize=(2, 2), dpi=72), "")
+            graph_files = [
+                dlg._normalize_auto_graph_file(
+                    {
+                        "name": "File 1",
+                        "global_selection": {"filters": {}},
+                        "track_program_serials": False,
+                        "plots": [
+                            {"name": "Plot A", "plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["thrust"]}},
+                            {"name": "Plot B", "plot_definition": {"mode": "curves", "x": "Time", "y": ["current"]}},
+                        ],
+                    }
+                ),
+                dlg._normalize_auto_graph_file(
+                    {
+                        "name": "File 2",
+                        "global_selection": {"filters": {}},
+                        "track_program_serials": False,
+                        "plots": [
+                            {"name": "Plot A", "plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["current"]}},
+                        ],
+                    }
+                ),
+            ]
+            graph_files = [item for item in graph_files if item is not None]
+            captured: dict[str, object] = {}
+
+            def _inspect_exec():
+                dialog = next(
+                    widget
+                    for widget in QtWidgets.QApplication.topLevelWidgets()
+                    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Auto-Graphs"
+                )
+                tabs = dialog.findChild(QtWidgets.QTabWidget)
+                assert tabs is not None
+                captured["count"] = tabs.count()
+                captured["titles"] = [tabs.tabText(idx) for idx in range(tabs.count())]
+                return 0
+
+            with mock.patch("PySide6.QtWidgets.QDialog.exec", side_effect=_inspect_exec):
+                dlg._open_auto_graph_snapshot_viewer(graph_files, title="Auto-Graphs")
+
+            self.assertEqual(captured.get("count"), 3)
+            self.assertEqual(
+                captured.get("titles"),
+                ["File 1: Plot A", "File 1: Plot B", "File 2: Plot A"],
+            )
+        finally:
+            dlg.close()
 
     def test_auto_plot_store_loads_legacy_entries_with_live_filter_fallback(self) -> None:
         harness = _RunSelectionHarness()
@@ -7546,6 +7840,64 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(cond.get("member_run_types"), ["PM"])
             self.assertEqual(cond.get("member_run_type_modes"), ["pulsed_mode"])
 
+    def test_run_selection_views_collapse_duplicate_sequence_rows_and_preserve_aggregates(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            db_path = root / "implementation_trending.sqlite3"
+            wb_path = root / "project.xlsx"
+
+            be._write_test_data_trending_workbook(
+                wb_path,
+                global_repo=root,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": ""}],
+                config=self._make_config(),
+            )
+
+            with sqlite3.connect(str(db_path)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name, run_type, control_period, pulse_width)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "Time", "RunA", "pulsed mode", 60.0, None),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations_sequences
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, control_period, suppression_voltage, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("obs_1", "SN1", "RunA", "Program A", "Seq1", "pulsed mode", 60.0, 24.0, 0),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_condition_observations_sequences
+                    (observation_id, serial, run_name, program_title, source_run_name, run_type, control_period, suppression_voltage, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("obs_2", "SN1", "RunA", "Program A", "Seq1", "pulsed mode", 120.0, 28.0, 0),
+                )
+                conn.commit()
+
+            views = be.td_list_run_selection_views(db_path, wb_path, project_dir=root)
+            seq_items = views.get("sequence") or []
+            cond_items = views.get("condition") or []
+
+            self.assertEqual(len(seq_items), 1)
+            self.assertEqual(seq_items[0].get("display_text"), "Program A - Seq1")
+            self.assertEqual(seq_items[0].get("member_control_periods"), ["60", "120"])
+            self.assertEqual(seq_items[0].get("member_suppression_voltages"), ["24", "28"])
+            self.assertEqual(seq_items[0].get("member_run_types"), ["PM"])
+            self.assertEqual(seq_items[0].get("member_run_type_modes"), ["pulsed_mode"])
+            self.assertEqual(len(cond_items), 1)
+            self.assertEqual(cond_items[0].get("member_sequences"), ["Seq1"])
+            self.assertEqual(cond_items[0].get("member_control_periods"), ["60", "120"])
+            self.assertEqual(cond_items[0].get("member_suppression_voltages"), ["24", "28"])
+
     def test_rebuild_prefers_workbook_config_columns_over_runtime_config(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -9533,6 +9885,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual([row.get("control_period") for row in filter_rows], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in filter_rows], [24.0])
 
+            summary_rows = be.td_read_observation_filter_summary_rows_from_cache(impl_db)
+            self.assertEqual([row.get("control_period") for row in summary_rows], [60.0])
+            self.assertEqual([row.get("suppression_voltage") for row in summary_rows], [24.0])
+
             metric_rows = be.td_load_metric_series(impl_db, "RunA", "thrust", "mean")
             self.assertEqual([row.get("control_period") for row in metric_rows], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in metric_rows], [24.0])
@@ -9540,6 +9896,104 @@ class TestTDSupportWorkbook(unittest.TestCase):
             curves = be.td_load_curves(impl_db, "RunA", "thrust", "Time")
             self.assertEqual([row.get("control_period") for row in curves], [60.0])
             self.assertEqual([row.get("suppression_voltage") for row in curves], [24.0])
+
+    def test_observation_filter_summary_rows_collapse_duplicate_observations(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            impl_db = root / "implementation_trending.sqlite3"
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_source_metadata
+                    (serial, source_serial_number, program_title, document_type, metadata_rel, artifacts_rel, excel_sqlite_rel)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("SN1", "SN1-RAW", "Program A", "TD", "meta.json", "artifacts", "source.sqlite3"),
+                )
+                for obs_id in ("obs_1", "obs_2"):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO td_condition_observations_sequences
+                        (observation_id, serial, run_name, program_title, source_run_name, run_type, pulse_width, pulse_width_units,
+                         off_time, off_time_units, control_period, feed_pressure, feed_pressure_units, suppression_voltage,
+                         valve_voltage, condition_display, computed_epoch_ns)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            obs_id,
+                            "SN1",
+                            "RunA",
+                            "Program A",
+                            "Seq1",
+                            "pulsed mode",
+                            60.0,
+                            "sec",
+                            1.0,
+                            "sec",
+                            120.0,
+                            350.0,
+                            "psia",
+                            24.0,
+                            12.0,
+                            "Condition A",
+                            0,
+                        ),
+                    )
+                conn.commit()
+
+            full_rows = be.td_read_observation_filter_rows_from_cache(impl_db)
+            summary_rows = be.td_read_observation_filter_summary_rows_from_cache(impl_db)
+
+            self.assertEqual(len(full_rows), 2)
+            self.assertEqual(len(summary_rows), 1)
+            self.assertEqual(summary_rows[0].get("serial_number"), "SN1-RAW")
+            self.assertEqual(summary_rows[0].get("program_title"), "Program A")
+            self.assertEqual(summary_rows[0].get("run_name"), "RunA")
+            self.assertEqual(summary_rows[0].get("source_run_name"), "Seq1")
+            self.assertEqual(summary_rows[0].get("control_period"), 120.0)
+            self.assertEqual(summary_rows[0].get("suppression_voltage"), 24.0)
+            self.assertEqual(summary_rows[0].get("valve_voltage"), 12.0)
+            self.assertEqual(summary_rows[0].get("metadata_rel"), "meta.json")
+            self.assertEqual(summary_rows[0].get("artifacts_rel"), "artifacts")
+            self.assertEqual(summary_rows[0].get("excel_sqlite_rel"), "source.sqlite3")
+
+    def test_list_y_columns_by_runs_groups_cached_columns(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            impl_db = root / "implementation_trending.sqlite3"
+
+            with sqlite3.connect(str(impl_db)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "isp", "sec", "y"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunB", "voltage", "V", "y"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunB", "time", "sec", "x"),
+                )
+                conn.commit()
+
+            grouped = be.td_list_y_columns_by_runs(impl_db)
+            grouped_a = be.td_list_y_columns_by_runs(impl_db, ["RunA"])
+
+            self.assertEqual([row.get("name") for row in grouped.get("RunA") or []], ["isp", "thrust"])
+            self.assertEqual([row.get("name") for row in grouped.get("RunB") or []], ["voltage"])
+            self.assertEqual(grouped_a, {"RunA": be.td_list_y_columns(impl_db, "RunA")})
 
     def test_cache_state_requests_full_rebuild_when_raw_condition_metadata_drops(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore

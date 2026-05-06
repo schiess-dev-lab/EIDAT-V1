@@ -35,7 +35,7 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
             window = TestDataTrendDialog(project_dir, workbook_path)
         return window
 
-    def test_load_auto_plots_reads_quickcheck_library_not_legacy_store(self) -> None:
+    def test_load_auto_plots_reads_graph_snapshot_store_and_ignores_quickcheck_library(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project_dir = root / "project"
@@ -43,7 +43,20 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
             workbook_path = project_dir / "project.xlsx"
             workbook_path.write_text("", encoding="utf-8")
             (project_dir / "auto_plots_test_data.json").write_text(
-                json.dumps({"version": 3, "graph_files": [{"id": "legacy", "name": "Legacy File", "plots": []}]}),
+                json.dumps(
+                    {
+                        "version": 4,
+                        "graph_files": [
+                            {
+                                "id": "legacy",
+                                "name": "Legacy File",
+                                "global_selection": {"filters": {}},
+                                "track_program_serials": False,
+                                "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["Pressure"]}}],
+                            }
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             saved = be.save_auto_graph_quickcheck_pack(project_dir, {"name": "Quick Pack", "plots": []})
@@ -51,22 +64,38 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
             window = self._make_window(project_dir, workbook_path)
             try:
                 names = [str(item.get("name") or "") for item in (window._auto_plots or []) if isinstance(item, dict)]
-                self.assertIn("Quick Pack", names)
-                self.assertNotIn("Legacy File", names)
+                self.assertIn("Legacy File", names)
+                self.assertNotIn("Quick Pack", names)
             finally:
                 window.close()
                 window.deleteLater()
 
             self.assertEqual(str(saved.get("name") or ""), "Quick Pack")
 
-    def test_open_selected_auto_plot_uses_quickcheck_viewer_for_pack(self) -> None:
+    def test_open_selected_auto_plot_uses_graph_file_viewer_for_saved_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project_dir = root / "project"
             project_dir.mkdir(parents=True, exist_ok=True)
             workbook_path = project_dir / "project.xlsx"
             workbook_path.write_text("", encoding="utf-8")
-            be.save_auto_graph_quickcheck_pack(project_dir, {"name": "Quick Pack", "plots": []})
+            (project_dir / "auto_plots_test_data.json").write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "graph_files": [
+                            {
+                                "id": "graph-1",
+                                "name": "Saved Graph",
+                                "global_selection": {"filters": {}},
+                                "track_program_serials": False,
+                                "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["Pressure"]}}],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             window = self._make_window(project_dir, workbook_path)
             try:
@@ -79,10 +108,10 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
                     "_open_auto_graph_file_viewer",
                 ) as legacy_viewer_mock:
                     window._open_selected_auto_plot(pack)
-                viewer_mock.assert_called_once()
-                legacy_viewer_mock.assert_not_called()
-                payload = viewer_mock.call_args.args[0]
-                self.assertEqual(str(payload.get("name") or ""), "Quick Pack")
+                viewer_mock.assert_not_called()
+                legacy_viewer_mock.assert_called_once()
+                payload = legacy_viewer_mock.call_args.args[0]
+                self.assertEqual(str(payload.get("name") or ""), "Saved Graph")
             finally:
                 window.close()
                 window.deleteLater()
@@ -154,6 +183,51 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
                     str(((payload.get("plots") or [])[0] or {}).get("plot_definition", {}).get("metric_plot_source") or ""),
                     "all_sequences",
                 )
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_open_project_graph_item_ignores_quickcheck_library_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+            (project_dir / "auto_plots_test_data.json").write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "graph_files": [
+                            {
+                                "id": "legacy",
+                                "name": "Legacy File",
+                                "global_selection": {"filters": {}},
+                                "track_program_serials": False,
+                                "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["Pressure"]}}],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            be.save_auto_graph_quickcheck_pack(project_dir, {"name": "Quick Pack", "plots": []})
+
+            graph_item = next(
+                item
+                for item in be.list_project_graph_items(project_dir, be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING)
+                if str(item.get("kind") or "") == "Auto-Graph File"
+            )
+
+            window = self._make_window(project_dir, workbook_path)
+            try:
+                with mock.patch.object(window, "_open_auto_graph_file_viewer") as legacy_viewer_mock, mock.patch.object(
+                    window,
+                    "_open_auto_graph_quickcheck_viewer",
+                ) as quickcheck_viewer_mock:
+                    window._open_project_graph_item(graph_item)
+                legacy_viewer_mock.assert_called_once()
+                quickcheck_viewer_mock.assert_not_called()
             finally:
                 window.close()
                 window.deleteLater()

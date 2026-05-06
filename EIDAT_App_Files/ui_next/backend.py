@@ -14911,7 +14911,8 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
     if not runs_ex:
         return {"sequence": [], "condition": []}
 
-    observations_by_condition: dict[str, list[dict]] = {}
+    sequences_by_condition: dict[str, list[dict]] = {}
+    sequence_lookup_by_condition: dict[str, dict[str, dict]] = {}
     run_type_mode_by_run: dict[str, str] = {}
     run_type_by_run: dict[str, str] = {}
     with closing(sqlite3.connect(str(Path(db_path).expanduser()))) as conn:
@@ -14929,9 +14930,23 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         obs_table = _td_preferred_sequence_observation_table(conn)
         rows = conn.execute(
             f"""
-            SELECT run_name, COALESCE(program_title, ''), COALESCE(source_run_name, ''), control_period, suppression_voltage, valve_voltage, COALESCE(run_type, '')
+            SELECT DISTINCT
+                run_name,
+                COALESCE(program_title, ''),
+                COALESCE(source_run_name, ''),
+                control_period,
+                suppression_voltage,
+                valve_voltage,
+                COALESCE(run_type, '')
             FROM {obs_table}
-            ORDER BY run_name, program_title, source_run_name, observation_id
+            ORDER BY
+                run_name,
+                program_title,
+                source_run_name,
+                control_period,
+                suppression_voltage,
+                valve_voltage,
+                run_type
             """
         ).fetchall()
     for run_name, program_title, source_run_name, control_period, suppression_voltage, valve_voltage, run_type in rows:
@@ -14941,21 +14956,52 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         seq_name = str(source_run_name or "").strip() or run_key
         run_type_label = td_normalize_run_type(run_type)
         run_type_mode = td_perf_normalize_run_type_mode(run_type)
-        observations_by_condition.setdefault(run_key, []).append(
-            {
+        seq_entries = sequences_by_condition.setdefault(run_key, [])
+        seq_lookup = sequence_lookup_by_condition.setdefault(run_key, {})
+        seq_key = "|".join(
+            [
+                run_key.casefold(),
+                str(program_title or "").strip().casefold(),
+                seq_name.casefold(),
+            ]
+        )
+        seq_entry = seq_lookup.get(seq_key)
+        if seq_entry is None:
+            seq_entry = {
+                "_seq_key": seq_key,
                 "program_title": str(program_title or "").strip(),
                 "program_label": _td_display_program_title(program_title),
                 "source_run_name": seq_name,
                 "control_period": control_period,
-                "control_period_label": _td_format_compact_value(control_period),
                 "suppression_voltage": suppression_voltage,
-                "suppression_voltage_label": _td_format_compact_value(suppression_voltage),
                 "valve_voltage": valve_voltage,
-                "valve_voltage_label": _td_format_compact_value(valve_voltage),
                 "run_type": run_type_label if run_type_label in {"SS", "PM"} else "",
                 "run_type_mode": run_type_mode if run_type_mode in {"steady_state", "pulsed_mode"} else "",
+                "member_control_periods": [],
+                "member_suppression_voltages": [],
+                "member_valve_voltages": [],
+                "member_run_types": [],
+                "member_run_type_modes": [],
             }
-        )
+            seq_entries.append(seq_entry)
+            seq_lookup[seq_key] = seq_entry
+
+        control_period_label = _td_format_compact_value(control_period)
+        suppression_voltage_label = _td_format_compact_value(suppression_voltage)
+        valve_voltage_label = _td_format_compact_value(valve_voltage)
+
+        if control_period_label and control_period_label not in set(seq_entry.get("member_control_periods") or []):
+            seq_entry["member_control_periods"] = list(seq_entry.get("member_control_periods") or []) + [control_period_label]
+        if suppression_voltage_label and suppression_voltage_label not in set(seq_entry.get("member_suppression_voltages") or []):
+            seq_entry["member_suppression_voltages"] = list(seq_entry.get("member_suppression_voltages") or []) + [
+                suppression_voltage_label
+            ]
+        if valve_voltage_label and valve_voltage_label not in set(seq_entry.get("member_valve_voltages") or []):
+            seq_entry["member_valve_voltages"] = list(seq_entry.get("member_valve_voltages") or []) + [valve_voltage_label]
+        if run_type_label and run_type_label not in set(seq_entry.get("member_run_types") or []):
+            seq_entry["member_run_types"] = list(seq_entry.get("member_run_types") or []) + [run_type_label]
+        if run_type_mode and run_type_mode not in set(seq_entry.get("member_run_type_modes") or []):
+            seq_entry["member_run_type_modes"] = list(seq_entry.get("member_run_type_modes") or []) + [run_type_mode]
 
     sequence_items: list[dict] = []
     condition_items: list[dict] = []
@@ -14964,7 +15010,7 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
         if not run_name:
             continue
         run_display_name = str(item.get("display_name") or run_name).strip() or run_name
-        source_rows = list(observations_by_condition.get(run_name) or [])
+        source_rows = list(sequences_by_condition.get(run_name) or [])
         member_sequences: list[str] = []
         member_programs: list[str] = []
         member_control_periods: list[str] = []
@@ -14985,36 +15031,69 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             program_label = str(obs.get("program_label") or "").strip() or _td_display_program_title(program_title)
             source_run_name = str(obs.get("source_run_name") or "").strip() or run_name
             control_period = obs.get("control_period")
-            control_period_label = str(obs.get("control_period_label") or "").strip()
+            control_period_values = [
+                str(value).strip()
+                for value in (obs.get("member_control_periods") or [])
+                if str(value).strip()
+            ]
+            control_period_label = control_period_values[0] if len(control_period_values) == 1 else ""
             suppression_voltage = obs.get("suppression_voltage")
-            suppression_voltage_label = str(obs.get("suppression_voltage_label") or "").strip()
+            suppression_voltage_values = [
+                str(value).strip()
+                for value in (obs.get("member_suppression_voltages") or [])
+                if str(value).strip()
+            ]
+            suppression_voltage_label = suppression_voltage_values[0] if len(suppression_voltage_values) == 1 else ""
             valve_voltage = obs.get("valve_voltage")
-            valve_voltage_label = str(obs.get("valve_voltage_label") or "").strip()
-            run_type_label = str(obs.get("run_type") or "").strip()
-            run_type_mode = str(obs.get("run_type_mode") or "").strip()
+            valve_voltage_values = [
+                str(value).strip()
+                for value in (obs.get("member_valve_voltages") or [])
+                if str(value).strip()
+            ]
+            valve_voltage_label = valve_voltage_values[0] if len(valve_voltage_values) == 1 else ""
+            run_type_values = [
+                str(value).strip()
+                for value in (obs.get("member_run_types") or [])
+                if str(value).strip()
+            ]
+            run_type_label = run_type_values[0] if len(run_type_values) == 1 else str(obs.get("run_type") or "").strip()
+            run_type_mode_values = [
+                str(value).strip()
+                for value in (obs.get("member_run_type_modes") or [])
+                if str(value).strip()
+            ]
+            run_type_mode = (
+                run_type_mode_values[0] if len(run_type_mode_values) == 1 else str(obs.get("run_type_mode") or "").strip()
+            )
             detail = source_run_name if not program_title else f"{program_title}: {source_run_name}"
-            detail_rows.append(detail)
+            if detail not in detail_rows:
+                detail_rows.append(detail)
             if source_run_name.lower() not in seen_sequence_labels:
                 seen_sequence_labels.add(source_run_name.lower())
                 member_sequences.append(source_run_name)
             if program_label.casefold() not in seen_program_labels:
                 seen_program_labels.add(program_label.casefold())
                 member_programs.append(program_label)
-            if control_period_label and control_period_label.casefold() not in seen_control_period_labels:
-                seen_control_period_labels.add(control_period_label.casefold())
-                member_control_periods.append(control_period_label)
-            if suppression_voltage_label and suppression_voltage_label.casefold() not in seen_suppression_labels:
-                seen_suppression_labels.add(suppression_voltage_label.casefold())
-                member_suppression_voltages.append(suppression_voltage_label)
-            if valve_voltage_label and valve_voltage_label.casefold() not in seen_valve_labels:
-                seen_valve_labels.add(valve_voltage_label.casefold())
-                member_valve_voltages.append(valve_voltage_label)
-            if run_type_label and run_type_label not in seen_run_type_labels:
-                seen_run_type_labels.add(run_type_label)
-                member_run_types.append(run_type_label)
-            if run_type_mode and run_type_mode not in seen_run_type_modes:
-                seen_run_type_modes.add(run_type_mode)
-                member_run_type_modes.append(run_type_mode)
+            for value in control_period_values:
+                if value and value.casefold() not in seen_control_period_labels:
+                    seen_control_period_labels.add(value.casefold())
+                    member_control_periods.append(value)
+            for value in suppression_voltage_values:
+                if value and value.casefold() not in seen_suppression_labels:
+                    seen_suppression_labels.add(value.casefold())
+                    member_suppression_voltages.append(value)
+            for value in valve_voltage_values:
+                if value and value.casefold() not in seen_valve_labels:
+                    seen_valve_labels.add(value.casefold())
+                    member_valve_voltages.append(value)
+            for value in run_type_values:
+                if value and value not in seen_run_type_labels:
+                    seen_run_type_labels.add(value)
+                    member_run_types.append(value)
+            for value in run_type_mode_values:
+                if value and value not in seen_run_type_modes:
+                    seen_run_type_modes.add(value)
+                    member_run_type_modes.append(value)
             sequence_items.append(
                 {
                     "mode": "sequence",
@@ -15028,16 +15107,16 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
                     "member_runs": [run_name],
                     "member_programs": [program_label],
                     "member_sequences": [source_run_name],
-                    "control_period": control_period,
-                    "member_control_periods": ([control_period_label] if control_period_label else []),
-                    "suppression_voltage": suppression_voltage,
-                    "member_suppression_voltages": ([suppression_voltage_label] if suppression_voltage_label else []),
-                    "valve_voltage": valve_voltage,
-                    "member_valve_voltages": ([valve_voltage_label] if valve_voltage_label else []),
+                    "control_period": (control_period if len(control_period_values) == 1 else None),
+                    "member_control_periods": list(control_period_values),
+                    "suppression_voltage": (suppression_voltage if len(suppression_voltage_values) == 1 else None),
+                    "member_suppression_voltages": list(suppression_voltage_values),
+                    "valve_voltage": (valve_voltage if len(valve_voltage_values) == 1 else None),
+                    "member_valve_voltages": list(valve_voltage_values),
                     "run_type": run_type_label,
                     "run_type_mode": run_type_mode,
-                    "member_run_types": ([run_type_label] if run_type_label else []),
-                    "member_run_type_modes": ([run_type_mode] if run_type_mode else []),
+                    "member_run_types": list(run_type_values),
+                    "member_run_type_modes": list(run_type_mode_values),
                     "details_text": (
                         f"Program: {program_title or TD_SUPPORT_DEFAULT_PROGRAM_TITLE} | "
                         f"Source Sequence: {source_run_name} | Run Condition: {run_display_name}"
@@ -15112,21 +15191,6 @@ def td_list_run_selection_views(db_path: Path, workbook_path: Path, *, project_d
             str(d.get("sequence_name") or "").lower(),
         )
     )
-    deduped_sequence_items: list[dict] = []
-    seen_sequence_ids: set[str] = set()
-    for item in sequence_items:
-        key = "|".join(
-            [
-                str(item.get("run_name") or "").strip().lower(),
-                str(item.get("program_title") or "").strip().lower(),
-                str(item.get("sequence_name") or "").strip().lower(),
-            ]
-        )
-        if key in seen_sequence_ids:
-            continue
-        seen_sequence_ids.add(key)
-        deduped_sequence_items.append(item)
-    sequence_items = deduped_sequence_items
     condition_items.sort(key=lambda d: str(d.get("display_text") or "").lower())
     return {"sequence": sequence_items, "condition": condition_items}
 
@@ -23768,6 +23832,39 @@ def td_list_y_columns(db_path: Path, run_name: str) -> list[dict]:
     ]
 
 
+def td_list_y_columns_by_runs(
+    db_path: Path,
+    run_names: Sequence[object] | None = None,
+) -> dict[str, list[dict]]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return {}
+    requested_runs = [str(value).strip() for value in (run_names or []) if str(value).strip()]
+    sql = "SELECT run_name, name, units FROM td_columns_calc WHERE kind='y'"
+    params: list[object] = []
+    if requested_runs:
+        placeholders = ",".join("?" for _ in requested_runs)
+        sql += f" AND run_name IN ({placeholders})"
+        params.extend(requested_runs)
+    sql += " ORDER BY run_name, name"
+    with closing(sqlite3.connect(str(path))) as conn:
+        _ensure_test_data_impl_tables(conn)
+        rows = conn.execute(sql, tuple(params)).fetchall()
+    out: dict[str, list[dict]] = {}
+    for run_name, name, units in rows:
+        run = str(run_name or "").strip()
+        col_name = str(name or "").strip()
+        if not run or not col_name:
+            continue
+        out.setdefault(run, []).append(
+            {
+                "name": col_name,
+                "units": str(units or "").strip(),
+            }
+        )
+    return out
+
+
 def td_list_metric_y_columns(db_path: Path, run_name: str) -> list[dict]:
     path = Path(db_path).expanduser()
     if not path.exists():
@@ -23885,6 +23982,106 @@ def td_read_sources_metadata_from_cache(db_path: Path) -> list[dict]:
                 "source_key": sn,
                 "serial_number": str(source_serial_number or sn).strip(),
                 "program_title": str(program_title or "").strip(),
+                "document_type": str(document_type or "").strip(),
+                "metadata_rel": str(metadata_rel or "").strip(),
+                "artifacts_rel": str(artifacts_rel or "").strip(),
+                "excel_sqlite_rel": str(excel_sqlite_rel or "").strip(),
+            }
+        )
+    return out
+
+
+def td_read_observation_filter_summary_rows_from_cache(db_path: Path) -> list[dict]:
+    path = Path(db_path).expanduser()
+    if not path.exists():
+        return []
+    with sqlite3.connect(str(path)) as conn:
+        _ensure_test_data_impl_tables(conn)
+        obs_table = _td_preferred_sequence_observation_table(conn)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT
+                o.serial,
+                COALESCE(m.source_serial_number, o.serial),
+                COALESCE(o.program_title, ''),
+                COALESCE(o.run_name, ''),
+                COALESCE(o.source_run_name, ''),
+                COALESCE(o.run_type, ''),
+                o.pulse_width,
+                COALESCE(o.pulse_width_units, ''),
+                o.off_time,
+                COALESCE(o.off_time_units, ''),
+                o.control_period,
+                o.feed_pressure,
+                COALESCE(o.feed_pressure_units, ''),
+                o.suppression_voltage,
+                o.valve_voltage,
+                COALESCE(o.condition_display, ''),
+                COALESCE(m.document_type, ''),
+                COALESCE(m.metadata_rel, ''),
+                COALESCE(m.artifacts_rel, ''),
+                COALESCE(m.excel_sqlite_rel, '')
+            FROM {obs_table} o
+            LEFT JOIN td_source_metadata m
+              ON m.serial = o.serial
+            ORDER BY
+                o.serial,
+                o.run_name,
+                o.source_run_name,
+                o.program_title,
+                o.control_period,
+                o.suppression_voltage,
+                o.valve_voltage,
+                o.pulse_width,
+                o.off_time
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for (
+        serial,
+        source_serial_number,
+        program_title,
+        run_name,
+        source_run_name,
+        run_type,
+        pulse_width,
+        pulse_width_units,
+        off_time,
+        off_time_units,
+        control_period,
+        feed_pressure,
+        feed_pressure_units,
+        suppression_voltage,
+        valve_voltage,
+        condition_display,
+        document_type,
+        metadata_rel,
+        artifacts_rel,
+        excel_sqlite_rel,
+    ) in rows:
+        sn = str(serial or "").strip()
+        if not sn:
+            continue
+        out.append(
+            {
+                "serial": sn,
+                "source_key": sn,
+                "serial_number": str(source_serial_number or sn).strip(),
+                "program_title": str(program_title or "").strip(),
+                "run_name": str(run_name or "").strip(),
+                "source_run_name": str(source_run_name or "").strip(),
+                "run_type": str(run_type or "").strip(),
+                "pulse_width": pulse_width,
+                "pulse_width_on": pulse_width,
+                "pulse_width_units": str(pulse_width_units or "").strip(),
+                "off_time": off_time,
+                "off_time_units": str(off_time_units or "").strip(),
+                "control_period": control_period,
+                "feed_pressure": feed_pressure,
+                "feed_pressure_units": str(feed_pressure_units or "").strip(),
+                "suppression_voltage": suppression_voltage,
+                "valve_voltage": valve_voltage,
+                "condition_display": str(condition_display or "").strip(),
                 "document_type": str(document_type or "").strip(),
                 "metadata_rel": str(metadata_rel or "").strip(),
                 "artifacts_rel": str(artifacts_rel or "").strip(),
@@ -44510,49 +44707,7 @@ def _project_graph_pdf_items(project_dir: Path) -> list[dict[str, object]]:
 
 def list_project_graph_items(project_dir: Path, project_type: str) -> list[dict[str, object]]:
     if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
-        from . import auto_graph_quickcheck as agq  # local import
-
-        library = agq.load_auto_graph_quickcheck_library(project_dir)
-        store_path = Path(str(library.get("path") or agq.quickcheck_library_path(project_dir))).expanduser()
-        out: list[dict[str, object]] = []
-        for pack in [dict(item) for item in (library.get("packs") or []) if isinstance(item, Mapping)]:
-            plot_count = len([item for item in (pack.get("plots") or []) if isinstance(item, Mapping)])
-            snapshot = dict(pack.get("baseline_snapshot") or {})
-            baseline_ready = bool(str(snapshot.get("db_path") or "").strip() and Path(str(snapshot.get("db_path") or "")).expanduser().exists())
-            updated_at = str(pack.get("updated_at") or pack.get("created_at") or "").strip()
-            modified_epoch = 0.0
-            if updated_at:
-                for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
-                    try:
-                        modified_epoch = datetime.strptime(updated_at, fmt).timestamp()
-                        break
-                    except Exception:
-                        continue
-            if not modified_epoch:
-                try:
-                    modified_epoch = float(store_path.stat().st_mtime)
-                except Exception:
-                    modified_epoch = 0.0
-            out.append(
-                {
-                    "id": f"graph_definition:{str(pack.get('id') or '').strip()}",
-                    "type": "graph_definition",
-                    "kind": "Quick-Check Pack",
-                    "name": str(pack.get("name") or "").strip() or "Quick-Check Pack",
-                    "scope": (
-                        f"{plot_count} plot{'s' if plot_count != 1 else ''} | "
-                        + ("Baseline ready" if baseline_ready else "No baseline")
-                    ),
-                    "location": str(store_path),
-                    "path": str(store_path),
-                    "allowed_dir": str(store_path.parent),
-                    "graph_key": str(pack.get("id") or "").strip(),
-                    "store_path": str(store_path),
-                    "modified_epoch": modified_epoch,
-                    "size_bytes": 0,
-                }
-            )
-        out.extend(_test_data_legacy_graph_definition_items(project_dir))
+        out = _test_data_legacy_graph_definition_items(project_dir)
         out.extend(_project_graph_pdf_items(project_dir))
         out.sort(
             key=lambda item: (
@@ -44648,31 +44803,27 @@ def delete_project_managed_file(
 
 def rename_project_graph_definition(project_dir: Path, project_type: str, graph_key: str, new_name: str) -> dict[str, object]:
     if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
-        from . import auto_graph_quickcheck as agq  # local import
-
         legacy_prefix = "legacy_graph_file:"
         raw_graph_key = str(graph_key or "").strip()
-        if raw_graph_key.startswith(legacy_prefix):
-            legacy_key = raw_graph_key[len(legacy_prefix):]
-            store = _load_graph_store_from_path(_test_data_legacy_graph_store_path(project_dir))
-            entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
-            target_idx = -1
-            for idx, entry in enumerate(entries):
-                if _project_graph_entry_matches(entry, idx, legacy_key):
-                    target_idx = idx
-                    break
-            if target_idx < 0:
-                raise RuntimeError("Selected graph definition was not found.")
-            cleaned_name = _safe_windows_path_name(new_name, fallback="Auto-Graph File")
-            entries[target_idx]["name"] = cleaned_name
-            entries[target_idx]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _write_project_graph_store(store, entries)
-            return {
-                "graph_key": f"{legacy_prefix}{_project_graph_entry_key(entries[target_idx], target_idx)}",
-                "name": cleaned_name,
-                "store_path": str(store.get("path") or ""),
-            }
-        return agq.rename_auto_graph_quickcheck_pack(project_dir, graph_key, _safe_windows_path_name(new_name, fallback="Quick-Check Pack"))
+        legacy_key = raw_graph_key[len(legacy_prefix):] if raw_graph_key.startswith(legacy_prefix) else raw_graph_key
+        store = _load_graph_store_from_path(_test_data_legacy_graph_store_path(project_dir))
+        entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
+        target_idx = -1
+        for idx, entry in enumerate(entries):
+            if _project_graph_entry_matches(entry, idx, legacy_key):
+                target_idx = idx
+                break
+        if target_idx < 0:
+            raise RuntimeError("Selected graph definition was not found.")
+        cleaned_name = _safe_windows_path_name(new_name, fallback="Auto-Graph File")
+        entries[target_idx]["name"] = cleaned_name
+        entries[target_idx]["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _write_project_graph_store(store, entries)
+        return {
+            "graph_key": f"{legacy_prefix}{_project_graph_entry_key(entries[target_idx], target_idx)}",
+            "name": cleaned_name,
+            "store_path": str(store.get("path") or ""),
+        }
     store = _load_project_graph_store(project_dir, project_type)
     entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
     target_idx = -1
@@ -44695,30 +44846,26 @@ def rename_project_graph_definition(project_dir: Path, project_type: str, graph_
 
 def delete_project_graph_definition(project_dir: Path, project_type: str, graph_key: str) -> dict[str, object]:
     if str(project_type or "").strip() == EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
-        from . import auto_graph_quickcheck as agq  # local import
-
         legacy_prefix = "legacy_graph_file:"
         raw_graph_key = str(graph_key or "").strip()
-        if raw_graph_key.startswith(legacy_prefix):
-            legacy_key = raw_graph_key[len(legacy_prefix):]
-            store = _load_graph_store_from_path(_test_data_legacy_graph_store_path(project_dir))
-            entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
-            kept: list[dict[str, object]] = []
-            deleted = False
-            for idx, entry in enumerate(entries):
-                if _project_graph_entry_matches(entry, idx, legacy_key):
-                    deleted = True
-                    continue
-                kept.append(entry)
-            if not deleted:
-                raise RuntimeError("Selected graph definition was not found.")
-            _write_project_graph_store(store, kept)
-            return {
-                "deleted": True,
-                "graph_key": raw_graph_key,
-                "store_path": str(store.get("path") or ""),
-            }
-        return agq.delete_auto_graph_quickcheck_pack(project_dir, graph_key)
+        legacy_key = raw_graph_key[len(legacy_prefix):] if raw_graph_key.startswith(legacy_prefix) else raw_graph_key
+        store = _load_graph_store_from_path(_test_data_legacy_graph_store_path(project_dir))
+        entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
+        kept: list[dict[str, object]] = []
+        deleted = False
+        for idx, entry in enumerate(entries):
+            if _project_graph_entry_matches(entry, idx, legacy_key):
+                deleted = True
+                continue
+            kept.append(entry)
+        if not deleted:
+            raise RuntimeError("Selected graph definition was not found.")
+        _write_project_graph_store(store, kept)
+        return {
+            "deleted": True,
+            "graph_key": raw_graph_key,
+            "store_path": str(store.get("path") or ""),
+        }
     store = _load_project_graph_store(project_dir, project_type)
     entries = [dict(entry) for entry in (store.get("entries") or []) if isinstance(entry, Mapping)]
     kept: list[dict[str, object]] = []

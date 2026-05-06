@@ -175,42 +175,52 @@ class TestProjectDocumentsBackend(unittest.TestCase):
             self.assertFalse(new_pdf.exists())
             self.assertFalse(new_sidecar.exists())
 
-    def test_td_graph_definition_mutations_use_quickcheck_library_and_ignore_legacy_store(self) -> None:
+    def test_td_graph_definition_items_ignore_quickcheck_library_and_mutations_leave_it_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp)
             legacy_store = project_dir / "auto_plots_test_data.json"
             legacy_store.write_text(
-                json.dumps({"version": 3, "graph_files": [{"id": "legacy", "name": "Old Legacy", "plots": []}]}),
+                json.dumps(
+                    {
+                        "version": 4,
+                        "graph_files": [
+                            {
+                                "id": "legacy",
+                                "name": "Old Legacy",
+                                "global_selection": {"filters": {}},
+                                "track_program_serials": False,
+                                "plots": [{"plot_definition": {"mode": "metrics", "stats": ["mean"], "y": ["Pressure"]}}],
+                            }
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             saved = be.save_auto_graph_quickcheck_pack(project_dir, {"name": "Quick Pack", "plots": []})
 
             items = be.list_project_graph_items(project_dir, be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING)
-            quick_item = next(item for item in items if str(item.get("kind") or "") == "Quick-Check Pack")
             legacy_item = next(item for item in items if str(item.get("kind") or "") == "Auto-Graph File")
-            self.assertEqual(quick_item.get("graph_key"), str(saved.get("id") or "").strip())
-            self.assertEqual(quick_item.get("name"), "Quick Pack")
+            self.assertEqual(len([item for item in items if str(item.get("type") or "") == "graph_definition"]), 1)
             self.assertEqual(legacy_item.get("name"), "Old Legacy")
             be.rename_project_graph_definition(
                 project_dir,
                 be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
-                str(quick_item.get("graph_key") or "").strip(),
+                str(legacy_item.get("graph_key") or "").strip(),
                 "New",
             )
-            payload = be.load_auto_graph_quickcheck_library(project_dir)
-            self.assertEqual(payload.get("version"), 1)
-            self.assertEqual(payload.get("packs")[0].get("name"), "New")
-            self.assertTrue(payload.get("packs")[0].get("updated_at"))
+            payload = json.loads(legacy_store.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("graph_files")[0].get("name"), "New")
 
             be.delete_project_graph_definition(
                 project_dir,
                 be.EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING,
-                str(quick_item.get("graph_key") or "").strip(),
+                str(legacy_item.get("graph_key") or "").strip(),
             )
-            payload = be.load_auto_graph_quickcheck_library(project_dir)
-            self.assertEqual(payload.get("packs"), [])
-            legacy_payload = json.loads(legacy_store.read_text(encoding="utf-8"))
-            self.assertEqual(legacy_payload.get("graph_files")[0].get("name"), "Old Legacy")
+            payload = json.loads(legacy_store.read_text(encoding="utf-8"))
+            self.assertEqual(payload.get("graph_files"), [])
+            quickcheck_payload = be.load_auto_graph_quickcheck_library(project_dir)
+            self.assertEqual(str(saved.get("id") or ""), str((quickcheck_payload.get("packs") or [])[0].get("id") or ""))
+            self.assertEqual((quickcheck_payload.get("packs") or [])[0].get("name"), "Quick Pack")
 
     def test_td_graph_definition_mutations_support_legacy_graph_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
