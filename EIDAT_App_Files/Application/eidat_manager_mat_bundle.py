@@ -144,13 +144,13 @@ def _parse_sequence_word_tokens(tokens: list[str]) -> int | None:
     return None
 
 
-def _parse_terminal_sequence(tokens: list[str]) -> tuple[str, int] | None:
-    if not tokens:
+def _parse_sequence_candidate(tokens: list[str], *, token_idx: int) -> tuple[str, int] | None:
+    if token_idx < 0 or token_idx >= len(tokens):
         return None
-    last = str(tokens[-1] or "").strip().casefold()
-    if not last:
+    token = str(tokens[token_idx] or "").strip().casefold()
+    if not token:
         return None
-    inline_digits = _SEQ_INLINE_DIGITS_RE.match(last)
+    inline_digits = _SEQ_INLINE_DIGITS_RE.match(token)
     if inline_digits:
         try:
             number = int(inline_digits.group(2))
@@ -158,20 +158,28 @@ def _parse_terminal_sequence(tokens: list[str]) -> tuple[str, int] | None:
             number = -1
         if number >= 0:
             return (f"seq{number}", int(number))
-    inline_word = _SEQ_INLINE_WORD_RE.match(last)
+    inline_word = _SEQ_INLINE_WORD_RE.match(token)
     if inline_word:
         number = _parse_sequence_word_tokens([str(inline_word.group(2) or "")])
         if number is not None and number >= 0:
             return (f"seq{number}", int(number))
-
-    start = max(0, len(tokens) - 3)
-    for marker_idx in range(start, len(tokens) - 1):
-        marker = str(tokens[marker_idx] or "").strip().casefold()
-        if marker not in _SEQ_MARKERS:
-            continue
-        number = _parse_sequence_word_tokens(tokens[marker_idx + 1 :])
+    if token not in _SEQ_MARKERS:
+        return None
+    max_end = min(len(tokens), token_idx + 3)
+    for end_idx in range(max_end, token_idx + 1, -1):
+        number = _parse_sequence_word_tokens(tokens[token_idx + 1 : end_idx])
         if number is not None and number >= 0:
             return (f"seq{number}", int(number))
+    return None
+
+
+def _parse_sequence_after_serial(tokens: list[str], *, serial_idx: int) -> tuple[str, int] | None:
+    if not tokens or serial_idx < 0:
+        return None
+    for token_idx in range(int(serial_idx) + 1, len(tokens)):
+        sequence = _parse_sequence_candidate(tokens, token_idx=token_idx)
+        if sequence is not None:
+            return sequence
     return None
 
 
@@ -187,10 +195,12 @@ def detect_mat_bundle_member(file_path: Path, *, repo_root: Path | None = None) 
         return None
 
     serial = ""
-    for token in tokens:
+    serial_idx = -1
+    for idx, token in enumerate(tokens):
         if not serial and _SERIAL_TOKEN_RE.match(token):
             serial = token.upper()
-    sequence = _parse_terminal_sequence(tokens)
+            serial_idx = idx
+    sequence = _parse_sequence_after_serial(tokens, serial_idx=serial_idx)
     seq_name = str(sequence[0] or "") if sequence is not None else ""
     seq_number = int(sequence[1]) if sequence is not None else -1
     if not serial or not seq_name or seq_number < 0:

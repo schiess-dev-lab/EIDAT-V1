@@ -10218,7 +10218,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
             root = Path(td)
             src_dir = root / "Valve" / "ModelX"
             src_dir.mkdir(parents=True, exist_ok=True)
-            mat_path = src_dir / "SN123_seq1.mat"
+            mat_path = src_dir / "MR-106L_SN2755_Seq3_zeroed_MATLAB.mat"
             savemat(
                 str(mat_path),
                 {
@@ -10238,14 +10238,20 @@ class TestTDSupportWorkbook(unittest.TestCase):
             td_doc = next(
                 doc
                 for doc in docs
-                if str(doc.get("serial_number") or "").strip() == "SN123"
+                if str(doc.get("serial_number") or "").strip() == "SN2755"
                 and str(doc.get("document_type_source") or "").strip() == "td_serial_official_source"
             )
-            self.assertIn("Valve/ModelX/SN123_seq1.mat", [str(value or "").replace("\\", "/") for value in (td_doc.get("source_rel_paths") or [])])
-            official_dir = (
-                paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN123"
+            self.assertIn(
+                "Valve/ModelX/MR-106L_SN2755_Seq3_zeroed_MATLAB.mat",
+                [str(value or "").replace("\\", "/") for value in (td_doc.get("source_rel_paths") or [])],
             )
-            self.assertEqual(get_file_artifacts_path(root, "Valve/ModelX/SN123_seq1.mat"), official_dir)
+            official_dir = (
+                paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN2755"
+            )
+            self.assertEqual(
+                get_file_artifacts_path(root, "Valve/ModelX/MR-106L_SN2755_Seq3_zeroed_MATLAB.mat"),
+                official_dir,
+            )
             (root / be.EIDAT_PROJECT_META).write_text(
                 json.dumps(
                     {
@@ -10275,8 +10281,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
             try:
                 ws_prog = wb[be._td_support_program_sheet_name("Unknown", 0)]
                 headers = self._sheet_header_map(ws_prog)
-                self.assertEqual(str(ws_prog.cell(2, headers["source_run_name"]).value or "").strip(), "seq1")
-                self.assertEqual(str(ws_prog.cell(2, headers["source_sheet_name"]).value or "").strip(), "SN123_seq1")
+                self.assertEqual(str(ws_prog.cell(2, headers["source_run_name"]).value or "").strip(), "seq3")
+                self.assertEqual(
+                    str(ws_prog.cell(2, headers["source_sheet_name"]).value or "").strip(),
+                    "MR-106L_SN2755_Seq3_zeroed_MATLAB",
+                )
                 self.assertEqual(str(ws_prog.cell(2, headers["condition_key"]).value or "").strip(), "")
                 self.assertEqual(str(ws_prog.cell(2, headers["display_name"]).value or "").strip(), "")
                 self.assertEqual(str(ws_prog.cell(2, headers["run_type"]).value or "").strip(), "")
