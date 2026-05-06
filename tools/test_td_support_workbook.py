@@ -9259,6 +9259,81 @@ class TestTDSupportWorkbook(unittest.TestCase):
             self.assertEqual(float(curves[0].get("control_period") or 0.0), 60.0)
             self.assertEqual(float(curves[0].get("suppression_voltage") or 0.0), 24.0)
 
+    def test_td_load_curves_run_type_filter_separates_steady_state_and_pm(self) -> None:
+        from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            impl_db = root / "implementation_trending.sqlite3"
+            with sqlite3.connect(str(impl_db)) as conn:
+                be._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_SEQUENCES_TABLE}
+                    (run_name, display_name, x_axis_kind, source_run_name, pulse_width, run_type, control_period, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "Run A", "Time", "RunA", None, "steady state", None, 1),
+                )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_CURVE_CATALOG_TABLE}
+                    (run_name, parameter_name, units, x_axis_kind, display_name, source_kind, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "lbf", "Time", "Thrust", "source_sqlite", 1),
+                )
+                conn.executemany(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_OBSERVATIONS_TABLE}
+                    (observation_id, run_name, serial, program_title, source_run_name, run_type, pulse_width, control_period, suppression_voltage, source_mtime_ns, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("obs_ss", "RunA", "SN_SS", "Program A", "RunA", "steady state", None, None, 24.0, 1, 1),
+                        ("obs_pm", "RunA", "SN_PM", "Program A", "RunA", "pulsed mode", 5.0, 60.0, 24.0, 1, 1),
+                    ],
+                )
+                conn.executemany(
+                    f"""
+                    INSERT OR REPLACE INTO {be.TD_PLOTTER_CURVES_TABLE}
+                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        ("RunA", "thrust", "Time", "obs_ss", "SN_SS", "[0,1,2]", "[10,11,12]", 3, 1, 1, "Program A", "RunA"),
+                        ("RunA", "thrust", "Time", "obs_pm", "SN_PM", "[0,1,2]", "[20,21,22]", 3, 1, 1, "Program A", "RunA"),
+                    ],
+                )
+                conn.commit()
+
+            ss_curves = be.td_load_curves(
+                impl_db,
+                "RunA",
+                "thrust",
+                "Time",
+                program_title="Program A",
+                source_run_name="RunA",
+                control_period_filter=60,
+                run_type_filter="steady_state",
+            )
+            pm_curves = be.td_load_curves(
+                impl_db,
+                "RunA",
+                "thrust",
+                "Time",
+                program_title="Program A",
+                source_run_name="RunA",
+                control_period_filter=60,
+                run_type_filter="pulsed_mode",
+            )
+
+            self.assertEqual([row.get("serial") for row in ss_curves], ["SN_SS"])
+            self.assertEqual([str(row.get("run_type") or "") for row in ss_curves], ["steady state"])
+            self.assertEqual([row.get("serial") for row in pm_curves], ["SN_PM"])
+            self.assertEqual([str(row.get("run_type") or "") for row in pm_curves], ["pulsed mode"])
+            self.assertEqual(float(pm_curves[0].get("control_period") or 0.0), 60.0)
+
     def test_td_curve_selectors_fall_back_to_legacy_impl_curves_when_raw_cache_missing(self) -> None:
         from EIDAT_App_Files.ui_next import backend as be  # type: ignore
 
@@ -10131,7 +10206,7 @@ class TestTDSupportWorkbook(unittest.TestCase):
         from eidat_manager_index import build_index  # type: ignore
         from eidat_manager_process import process_candidates  # type: ignore
         from eidat_manager_scan import scan_global_repo  # type: ignore
-        from EIDAT_App_Files.ui_next.backend import read_eidat_index_documents  # type: ignore
+        from EIDAT_App_Files.ui_next.backend import get_file_artifacts_path, read_eidat_index_documents  # type: ignore
 
         if not _have_scipy():
             self.skipTest("scipy not installed")
@@ -10166,6 +10241,11 @@ class TestTDSupportWorkbook(unittest.TestCase):
                 if str(doc.get("serial_number") or "").strip() == "SN123"
                 and str(doc.get("document_type_source") or "").strip() == "td_serial_official_source"
             )
+            self.assertIn("Valve/ModelX/SN123_seq1.mat", [str(value or "").replace("\\", "/") for value in (td_doc.get("source_rel_paths") or [])])
+            official_dir = (
+                paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN123"
+            )
+            self.assertEqual(get_file_artifacts_path(root, "Valve/ModelX/SN123_seq1.mat"), official_dir)
             (root / be.EIDAT_PROJECT_META).write_text(
                 json.dumps(
                     {

@@ -7,7 +7,75 @@ from pathlib import Path
 
 
 _SERIAL_TOKEN_RE = re.compile(r"^sn[0-9a-z]+$", re.IGNORECASE)
-_SEQ_TOKEN_RE = re.compile(r"^seq(\d+)$", re.IGNORECASE)
+_SEQ_INLINE_DIGITS_RE = re.compile(r"^(seq|sequence)(\d+)$", re.IGNORECASE)
+_SEQ_INLINE_WORD_RE = re.compile(r"^(seq|sequence)([a-z]+)$", re.IGNORECASE)
+_SEQ_ORDINAL_DIGITS_RE = re.compile(r"^(\d+)(?:st|nd|rd|th)$", re.IGNORECASE)
+
+_SEQ_MARKERS = {"seq", "sequence"}
+_SEQ_CARDINAL_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+}
+_SEQ_ORDINAL_WORDS = {
+    "zeroth": 0,
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+    "eleventh": 11,
+    "twelfth": 12,
+    "thirteenth": 13,
+    "fourteenth": 14,
+    "fifteenth": 15,
+    "sixteenth": 16,
+    "seventeenth": 17,
+    "eighteenth": 18,
+    "nineteenth": 19,
+}
+_SEQ_TENS_WORDS = {
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+_SEQ_TENS_ORDINAL_WORDS = {
+    "twentieth": 20,
+    "thirtieth": 30,
+    "fortieth": 40,
+    "fiftieth": 50,
+    "sixtieth": 60,
+    "seventieth": 70,
+    "eightieth": 80,
+    "ninetieth": 90,
+}
 
 
 @dataclass(frozen=True)
@@ -37,6 +105,76 @@ def _repo_rel_parent_key(repo_root: Path | None, file_path: Path) -> str:
         return str(parent).replace("\\", "/").casefold()
 
 
+def _parse_sequence_word_tokens(tokens: list[str]) -> int | None:
+    parts = [str(token or "").strip().casefold() for token in tokens if str(token or "").strip()]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        token = parts[0]
+        if token.isdigit():
+            try:
+                return int(token)
+            except Exception:
+                return None
+        match = _SEQ_ORDINAL_DIGITS_RE.match(token)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+        if token in _SEQ_CARDINAL_WORDS:
+            return int(_SEQ_CARDINAL_WORDS[token])
+        if token in _SEQ_ORDINAL_WORDS:
+            return int(_SEQ_ORDINAL_WORDS[token])
+        if token in _SEQ_TENS_WORDS:
+            return int(_SEQ_TENS_WORDS[token])
+        if token in _SEQ_TENS_ORDINAL_WORDS:
+            return int(_SEQ_TENS_ORDINAL_WORDS[token])
+        return None
+    if len(parts) == 2:
+        tens = _SEQ_TENS_WORDS.get(parts[0])
+        if tens is None:
+            return None
+        ones = _SEQ_CARDINAL_WORDS.get(parts[1])
+        if ones is not None and 0 < ones < 10:
+            return int(tens + ones)
+        ordinal_ones = _SEQ_ORDINAL_WORDS.get(parts[1])
+        if ordinal_ones is not None and 0 < ordinal_ones < 10:
+            return int(tens + ordinal_ones)
+    return None
+
+
+def _parse_terminal_sequence(tokens: list[str]) -> tuple[str, int] | None:
+    if not tokens:
+        return None
+    last = str(tokens[-1] or "").strip().casefold()
+    if not last:
+        return None
+    inline_digits = _SEQ_INLINE_DIGITS_RE.match(last)
+    if inline_digits:
+        try:
+            number = int(inline_digits.group(2))
+        except Exception:
+            number = -1
+        if number >= 0:
+            return (f"seq{number}", int(number))
+    inline_word = _SEQ_INLINE_WORD_RE.match(last)
+    if inline_word:
+        number = _parse_sequence_word_tokens([str(inline_word.group(2) or "")])
+        if number is not None and number >= 0:
+            return (f"seq{number}", int(number))
+
+    start = max(0, len(tokens) - 3)
+    for marker_idx in range(start, len(tokens) - 1):
+        marker = str(tokens[marker_idx] or "").strip().casefold()
+        if marker not in _SEQ_MARKERS:
+            continue
+        number = _parse_sequence_word_tokens(tokens[marker_idx + 1 :])
+        if number is not None and number >= 0:
+            return (f"seq{number}", int(number))
+    return None
+
+
 def detect_mat_bundle_member(file_path: Path, *, repo_root: Path | None = None) -> MatBundleMember | None:
     path = Path(file_path).expanduser()
     if path.suffix.lower() != ".mat":
@@ -49,19 +187,12 @@ def detect_mat_bundle_member(file_path: Path, *, repo_root: Path | None = None) 
         return None
 
     serial = ""
-    seq_name = ""
-    seq_number = -1
     for token in tokens:
         if not serial and _SERIAL_TOKEN_RE.match(token):
             serial = token.upper()
-    last = tokens[-1]
-    m_seq = _SEQ_TOKEN_RE.match(last)
-    if m_seq:
-        seq_name = last.lower()
-        try:
-            seq_number = int(m_seq.group(1))
-        except Exception:
-            seq_number = -1
+    sequence = _parse_terminal_sequence(tokens)
+    seq_name = str(sequence[0] or "") if sequence is not None else ""
+    seq_number = int(sequence[1]) if sequence is not None else -1
     if not serial or not seq_name or seq_number < 0:
         return None
 
@@ -107,4 +238,3 @@ def mat_bundle_artifacts_dir(support_dir: Path, member: MatBundleMember) -> Path
 
 def mat_bundle_sqlite_path(support_dir: Path, member: MatBundleMember) -> Path:
     return mat_bundle_artifacts_dir(support_dir, member) / f"{member.bundle_stem}.sqlite3"
-

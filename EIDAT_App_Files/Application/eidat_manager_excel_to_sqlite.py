@@ -375,6 +375,249 @@ def export_sqlite_excel_mirror(
     return out
 
 
+def export_td_sqlite_workbook(
+    sqlite_path: Path,
+    *,
+    out_xlsx: Path | None = None,
+    max_cell_chars: int = 32_000,
+) -> Path:
+    """Export a TD sqlite database as a normal workbook with logical sequence tabs only."""
+    try:
+        import openpyxl  # type: ignore
+        from openpyxl.styles import Font  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("openpyxl is required to export TD workbooks to .xlsx") from exc
+
+    db = Path(sqlite_path).expanduser()
+    if not db.exists() or not db.is_file():
+        raise FileNotFoundError(str(db))
+
+    if out_xlsx is None:
+        if db.suffix.lower() == ".sqlite3":
+            out = db.with_suffix(".xlsx")
+        else:
+            out = db.with_suffix(db.suffix + ".xlsx")
+    else:
+        out = Path(out_xlsx).expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    header_font = Font(bold=True)
+
+    def _safe_sheet_name(name: str, used: set[str]) -> str:
+        base = (name or "sheet").strip() or "sheet"
+        base = re.sub(r"[:\\\\/\\?\\*\\[\\]]+", "_", base)
+        base = base[:31].rstrip() or "sheet"
+        cand = base
+        i = 2
+        while cand.lower() in {u.lower() for u in used}:
+            suffix = f"_{i}"
+            cand = (base[: max(0, 31 - len(suffix))] + suffix).rstrip() or f"sheet{i}"
+            i += 1
+        used.add(cand)
+        return cand
+
+    def _safe_cell(v: object) -> object:
+        if v is None:
+            return None
+        if isinstance(v, (int, float, bool)):
+            return v
+        s = str(v).replace("\r\n", "\n").replace("\r", "\n")
+        if len(s) > int(max_cell_chars):
+            s = s[: int(max_cell_chars) - 3] + "..."
+        return s
+
+    def _quote_ident(name: object) -> str:
+        return '"' + str(name or "").replace('"', '""') + '"'
+
+    def _parse_json_list(value: object) -> list[object]:
+        raw = str(value or "").strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return []
+        return list(parsed) if isinstance(parsed, list) else []
+
+    def _parse_json_dict(value: object) -> dict[str, object]:
+        raw = str(value or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        out_dict: dict[str, object] = {}
+        for key, item in parsed.items():
+            out_dict[str(key or "")] = item
+        return out_dict
+
+    with sqlite3.connect(str(db)) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            sheet_info_cols = {str(row[1] or "") for row in conn.execute("PRAGMA table_info(__sheet_info)").fetchall()}
+        except Exception:
+            sheet_info_cols = set()
+        if not sheet_info_cols:
+            raise RuntimeError(f"TD sqlite workbook metadata is missing from {db.name}")
+        order_sql = "ORDER BY COALESCE(import_order, rowid), rowid" if "import_order" in sheet_info_cols else "ORDER BY rowid"
+        sheet_rows = list(conn.execute(f"SELECT * FROM __sheet_info {order_sql}").fetchall())
+        if not sheet_rows:
+            raise RuntimeError(f"TD sqlite workbook metadata is empty for {db.name}")
+
+        wb = openpyxl.Workbook()
+        try:
+            wb.remove(wb.active)
+        except Exception:
+            pass
+        used_names: set[str] = set()
+
+        for sheet_row in sheet_rows:
+            logical_name = str(sheet_row["sheet_name"] if "sheet_name" in sheet_row.keys() else "").strip() or "sheet"
+            table_name = str(sheet_row["table_name"] if "table_name" in sheet_row.keys() else "").strip()
+            if not table_name:
+                continue
+            try:
+                header_row = max(1, int(sheet_row["header_row"] if "header_row" in sheet_row.keys() else 1))
+            except Exception:
+                header_row = 1
+
+            headers = [str(value or "") for value in _parse_json_list(sheet_row["headers_json"] if "headers_json" in sheet_row.keys() else "[]")]
+            excel_col_indices = []
+            for value in _parse_json_list(
+                sheet_row["excel_col_indices_json"] if "excel_col_indices_json" in sheet_row.keys() else "[]"
+            ):
+                try:
+                    idx = int(value)
+                except Exception:
+                    idx = 0
+                if idx > 0:
+                    excel_col_indices.append(idx)
+            columns_json = _parse_json_dict(sheet_row["columns_json"] if "columns_json" in sheet_row.keys() else "{}")
+            try:
+                table_cols = [str(row[1] or "") for row in conn.execute(f"PRAGMA table_info({_quote_ident(table_name)})").fetchall()]
+            except Exception:
+                table_cols = []
+            if not table_cols:
+                continue
+            if not headers:
+                headers = list(table_cols)
+            if len(excel_col_indices) != len(headers):
+                excel_col_indices = list(range(1, len(headers) + 1))
+
+            try:
+                col_map_rows = conn.execute(
+                    "SELECT header, sqlite_column FROM __column_map WHERE sheet_name=? ORDER BY rowid",
+                    (logical_name,),
+                ).fetchall()
+            except Exception:
+                col_map_rows = []
+            mapped_cols_by_header = {
+                str(row[0] or ""): str(row[1] or "")
+                for row in col_map_rows
+                if str(row[0] or "").strip() and str(row[1] or "").strip()
+            }
+
+            sqlite_columns: list[str] = []
+            for idx, header in enumerate(headers):
+                candidate = str(mapped_cols_by_header.get(header) or columns_json.get(header) or "").strip()
+                if candidate and candidate in table_cols:
+                    sqlite_columns.append(candidate)
+                    continue
+                if header in table_cols:
+                    sqlite_columns.append(header)
+                    continue
+                fallback = table_cols[idx] if idx < len(table_cols) else table_cols[-1]
+                sqlite_columns.append(str(fallback or ""))
+
+            ws = wb.create_sheet(title=_safe_sheet_name(logical_name, used_names))
+
+            try:
+                meta_rows = conn.execute(
+                    """
+                    SELECT excel_row, excel_col, value
+                    FROM __meta_cells
+                    WHERE sheet_name=?
+                    ORDER BY excel_row, excel_col
+                    """,
+                    (logical_name,),
+                ).fetchall()
+            except Exception:
+                meta_rows = []
+            for meta_row in meta_rows:
+                try:
+                    row_idx = int(meta_row[0] or 0)
+                    col_idx = int(meta_row[1] or 0)
+                except Exception:
+                    continue
+                if row_idx <= 0 or col_idx <= 0:
+                    continue
+                ws.cell(row=row_idx, column=col_idx, value=_safe_cell(meta_row[2]))
+
+            for col_idx, header in zip(excel_col_indices, headers):
+                if col_idx <= 0:
+                    continue
+                cell = ws.cell(row=header_row, column=col_idx, value=_safe_cell(header))
+                cell.font = header_font
+
+            row_position_column = "excel_row" if "excel_row" in table_cols else ""
+            select_sql = ", ".join([_quote_ident(row_position_column or "rowid")] + [_quote_ident(col) for col in sqlite_columns])
+            order_sql = (
+                f"ORDER BY {_quote_ident(row_position_column)}, rowid"
+                if row_position_column
+                else "ORDER BY rowid"
+            )
+            try:
+                data_rows = conn.execute(
+                    f"SELECT {select_sql} FROM {_quote_ident(table_name)} {order_sql}"
+                ).fetchall()
+            except Exception:
+                data_rows = []
+            next_row = header_row + 1
+            for data_row in data_rows:
+                try:
+                    excel_row = int(data_row[0] or 0)
+                except Exception:
+                    excel_row = 0
+                if excel_row <= 0:
+                    excel_row = next_row
+                next_row = max(next_row, excel_row + 1)
+                for offset, col_idx in enumerate(excel_col_indices, start=1):
+                    if col_idx <= 0:
+                        continue
+                    try:
+                        value = data_row[offset]
+                    except Exception:
+                        value = None
+                    ws.cell(row=excel_row, column=col_idx, value=_safe_cell(value))
+
+            ws.freeze_panes = f"A{header_row + 1}"
+            try:
+                max_cols = max([1, *excel_col_indices])
+                for col_idx in range(1, max_cols + 1):
+                    max_len = 0
+                    for row_idx in range(1, min(int(ws.max_row or 0), 200) + 1):
+                        value = ws.cell(row=row_idx, column=col_idx).value
+                        if value is None:
+                            continue
+                        max_len = max(max_len, min(60, len(str(value))))
+                    if max_len > 0:
+                        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
+            except Exception:
+                pass
+
+        wb.save(str(out))
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    return out
+
+
 def _is_blank(v: Any) -> bool:
     if v is None:
         return True

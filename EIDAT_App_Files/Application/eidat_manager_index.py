@@ -563,6 +563,9 @@ def _td_source_rel_paths(paths: SupportPaths, meta_path: Path, raw: Mapping[str,
     if not isinstance(raw_meta_rels, list):
         raw_meta_rels = []
     rels.extend([str(v or "").strip() for v in raw_meta_rels if str(v or "").strip()])
+    raw_meta_rel = str(raw.get("source_metadata_rel") or "").strip()
+    if raw_meta_rel:
+        rels.append(raw_meta_rel)
     if isinstance(manifest, dict):
         manifest_meta_rels = manifest.get("source_metadata_rels") or []
         if isinstance(manifest_meta_rels, list):
@@ -580,6 +583,12 @@ def _td_source_rel_paths(paths: SupportPaths, meta_path: Path, raw: Mapping[str,
         source_meta = _read_json_file(candidate)
         if not source_meta:
             continue
+        source_meta_paths = source_meta.get("source_rel_paths")
+        if isinstance(source_meta_paths, list):
+            for value in source_meta_paths:
+                rel_path = str(value or "").strip().replace("\\", "/")
+                if rel_path:
+                    found.append(rel_path)
         source_rel = _source_rel_from_value(paths.global_repo, source_meta.get("source_rel_path") or source_meta.get("source_file"))
         if source_rel:
             found.append(source_rel)

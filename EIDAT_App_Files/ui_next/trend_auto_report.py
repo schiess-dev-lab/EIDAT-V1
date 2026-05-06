@@ -278,6 +278,65 @@ def _filter_state_has_key(filter_state: Mapping[str, object] | None, key: str) -
     return isinstance(filter_state, Mapping) and key in filter_state
 
 
+def _td_normalize_run_type_mode(value: object) -> str:
+    raw = _norm_key(str(value or ""))
+    if raw in {"steadystate", "steady", "ss"}:
+        return "steady_state"
+    if raw in {"pulsedmode", "pulsed", "pulse", "pm"}:
+        return "pulsed_mode"
+    return ""
+
+
+def _selection_run_type_modes(selection: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(selection, Mapping):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in ("member_run_type_modes", "member_run_types"):
+        raw_values = selection.get(key) or []
+        if not isinstance(raw_values, list):
+            continue
+        for value in raw_values:
+            normalized = _td_normalize_run_type_mode(value)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(normalized)
+    if out:
+        return out
+    for value in (selection.get("run_type_mode"), selection.get("run_type")):
+        normalized = _td_normalize_run_type_mode(value)
+        if normalized:
+            return [normalized]
+    return []
+
+
+def _selection_single_run_type_mode(selection: Mapping[str, object] | None) -> str:
+    modes = _selection_run_type_modes(selection)
+    return modes[0] if len(modes) == 1 else ""
+
+
+def _row_run_type_mode(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    for value in (row.get("run_type_mode"), row.get("run_type")):
+        normalized = _td_normalize_run_type_mode(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def _row_matches_selection_run_type_mode(
+    selection_run_type_mode: str,
+    row_run_type_mode: str,
+) -> bool:
+    if selection_run_type_mode == "pulsed_mode":
+        return row_run_type_mode == "pulsed_mode"
+    if selection_run_type_mode == "steady_state":
+        return row_run_type_mode != "pulsed_mode"
+    return True
+
+
 def _row_matches_filter_state(row: Mapping[str, object] | None, filter_state: Mapping[str, object] | None) -> bool:
     if not isinstance(row, Mapping):
         return False
@@ -358,6 +417,12 @@ def _selection_matches_observation_row(
     if member_programs:
         if _td_display_program_title(row.get("program_title")) not in set(member_programs):
             return False
+    selection_run_type_mode = _selection_single_run_type_mode(selection)
+    if selection_run_type_mode and not _row_matches_selection_run_type_mode(
+        selection_run_type_mode,
+        _row_run_type_mode(row),
+    ):
+        return False
     member_valves: list[str] = []
     seen_valves: set[str] = set()
     raw_valves = selection.get("member_valve_voltages") or []
@@ -680,6 +745,28 @@ def _selection_observation_filters(selection: dict | None) -> tuple[str, str]:
     program_title = str(selection.get("program_title") or "").strip()
     source_run_name = str(selection.get("source_run_name") or selection.get("sequence_name") or "").strip()
     return program_title, source_run_name
+
+
+def _selection_requires_row_post_filter(selection: Mapping[str, object] | None) -> bool:
+    if not isinstance(selection, Mapping):
+        return False
+    return str(selection.get("mode") or "sequence").strip().lower() != "sequence"
+
+
+def _filter_rows_for_report_selection(
+    rows: list[dict],
+    *,
+    selection: Mapping[str, object] | None = None,
+    filter_state: Mapping[str, object] | None = None,
+) -> list[dict]:
+    filtered_rows = _filter_rows_for_filter_state(rows, filter_state)
+    if not _selection_requires_row_post_filter(selection):
+        return filtered_rows
+    return [
+        dict(row)
+        for row in filtered_rows
+        if isinstance(row, dict) and _selection_matches_observation_row(selection, row)
+    ]
 
 
 def _selection_for_run(run_name: str, options: dict) -> dict:
@@ -1042,6 +1129,7 @@ def _load_metric_series_for_selection(
     filter_state: Mapping[str, object] | None = None,
 ) -> list[dict]:
     program_title, source_run_name = _selection_observation_filters(selection)
+    run_type_filter = _selection_single_run_type_mode(selection)
     try:
         rows = be.td_load_metric_series(
             db_path,
@@ -1051,10 +1139,15 @@ def _load_metric_series_for_selection(
             program_title=(program_title or None),
             source_run_name=(source_run_name or None),
             control_period_filter=control_period_filter,
+            run_type_filter=(run_type_filter or None),
         )
     except Exception:
         rows = []
-    return _filter_rows_for_filter_state(rows, filter_state)
+    return _filter_rows_for_report_selection(
+        rows,
+        selection=selection,
+        filter_state=filter_state,
+    )
 
 
 def _load_metric_map_for_selection(
@@ -1199,6 +1292,7 @@ def _load_curves_for_selection(
     filter_state: Mapping[str, object] | None = None,
 ) -> list[CurveSeries]:
     program_title, source_run_name = _selection_observation_filters(selection)
+    run_type_filter = _selection_single_run_type_mode(selection)
     try:
         rows = be.td_load_curves(
             db_path,
@@ -1208,10 +1302,17 @@ def _load_curves_for_selection(
             serials=serials,
             program_title=(program_title or None),
             source_run_name=(source_run_name or None),
+            run_type_filter=(run_type_filter or None),
         )
     except Exception:
         rows = []
-    return _curve_rows_to_series(_filter_rows_for_filter_state(rows, filter_state))
+    return _curve_rows_to_series(
+        _filter_rows_for_report_selection(
+            rows,
+            selection=selection,
+            filter_state=filter_state,
+        )
+    )
 
 
 def _read_gui_source_metadata(be: Any, workbook_path: Path) -> tuple[dict[str, dict[str, str]], str]:

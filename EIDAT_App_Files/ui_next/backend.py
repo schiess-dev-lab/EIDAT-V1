@@ -23190,6 +23190,7 @@ def _td_try_load_plotter_curves(
     program_title: str | None = None,
     source_run_name: str | None = None,
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> tuple[bool, list[dict]]:
     if not path.exists():
         return False, []
@@ -23228,6 +23229,7 @@ def _td_try_load_plotter_curves(
                 COALESCE(c.source_run_name, ''),
                 COALESCE(sm.asset_type, ''),
                 COALESCE(sm.asset_specific_type, ''),
+                COALESCE(o.run_type, ''),
                 o.control_period,
                 o.suppression_voltage,
                 o.valve_voltage,
@@ -23252,20 +23254,29 @@ def _td_try_load_plotter_curves(
         if src_run:
             curve_sql.append(" AND lower(COALESCE(c.source_run_name, '')) = lower(?)")
             curve_params.append(src_run)
+        run_type_sql, run_type_params = _td_perf_run_type_sql_clause(run_type_filter, "o.run_type")
+        if run_type_sql:
+            curve_sql.append(run_type_sql)
+            curve_params.extend(run_type_params)
         if control_period_filter not in (None, ""):
             cp_filter_num = _to_support_number(control_period_filter)
+            run_type_key = _td_perf_run_type_sql_key("o.run_type")
             if cp_filter_num is not None:
-                curve_sql.append(" AND ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9")
+                curve_sql.append(
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)"
+                )
                 curve_params.append(cp_filter_num)
             else:
                 curve_sql.append(
-                    " AND lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT)))"
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
                 )
                 curve_params.append(str(control_period_filter))
         curve_sql.append(" ORDER BY c.serial, c.observation_id")
         rows = conn.execute("".join(curve_sql), tuple(curve_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, run_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -23282,6 +23293,7 @@ def _td_try_load_plotter_curves(
                 "source_run_name": str(source_run_txt or "").strip(),
                 "asset_type": str(asset_type or "").strip(),
                 "asset_specific_type": str(asset_specific_type or "").strip(),
+                "run_type": str(run_type or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "valve_voltage": valve_voltage,
@@ -23456,6 +23468,7 @@ def _td_load_legacy_curves(
     program_title: str | None = None,
     source_run_name: str | None = None,
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> list[dict]:
     if not path.exists():
         return []
@@ -23486,6 +23499,7 @@ def _td_load_legacy_curves(
             "COALESCE(c.source_run_name, '')" if has_src else "'' AS source_run_name",
             "COALESCE(sm.asset_type, '') AS asset_type",
             "COALESCE(sm.asset_specific_type, '') AS asset_specific_type",
+            "COALESCE(o.run_type, '')" if obs_table and "run_type" in obs_cols else "'' AS run_type",
             "o.control_period" if obs_table else "NULL AS control_period",
             "o.suppression_voltage" if obs_table and "suppression_voltage" in obs_cols else "NULL AS suppression_voltage",
             "o.valve_voltage" if obs_table and "valve_voltage" in obs_cols else "NULL AS valve_voltage",
@@ -23510,18 +23524,37 @@ def _td_load_legacy_curves(
         if src_run and has_src:
             sql.append(" AND lower(COALESCE(c.source_run_name, '')) = lower(?)")
             params.append(src_run)
+        if obs_table and "run_type" in obs_cols:
+            run_type_sql, run_type_params = _td_perf_run_type_sql_clause(run_type_filter, "o.run_type")
+            if run_type_sql:
+                sql.append(run_type_sql)
+                params.extend(run_type_params)
         if control_period_filter not in (None, "") and obs_table:
             cp_filter_num = _to_support_number(control_period_filter)
-            if cp_filter_num is not None:
+            if cp_filter_num is not None and "run_type" in obs_cols:
+                run_type_key = _td_perf_run_type_sql_key("o.run_type")
+                sql.append(
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)"
+                )
+                params.append(cp_filter_num)
+            elif cp_filter_num is not None:
                 sql.append(" AND ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9")
                 params.append(cp_filter_num)
+            elif "run_type" in obs_cols:
+                run_type_key = _td_perf_run_type_sql_key("o.run_type")
+                sql.append(
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
+                )
+                params.append(str(control_period_filter))
             else:
                 sql.append(" AND lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT)))")
                 params.append(str(control_period_filter))
         sql.append(" ORDER BY c.serial")
         rows = conn.execute("".join(sql), tuple(params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, run_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -23537,6 +23570,7 @@ def _td_load_legacy_curves(
                 "source_run_name": str(source_run_txt or "").strip(),
                 "asset_type": str(asset_type or "").strip(),
                 "asset_specific_type": str(asset_specific_type or "").strip(),
+                "run_type": str(run_type or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "valve_voltage": valve_voltage,
@@ -23557,6 +23591,7 @@ def _td_try_load_raw_curves(
     program_title: str | None = None,
     source_run_name: str | None = None,
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> tuple[bool, list[dict]]:
     if not path.exists():
         return False, []
@@ -23589,6 +23624,7 @@ def _td_try_load_raw_curves(
                 COALESCE(c.source_run_name, ''),
                 '' AS asset_type,
                 '' AS asset_specific_type,
+                COALESCE(o.run_type, ''),
                 o.control_period,
                 o.suppression_voltage,
                 o.valve_voltage,
@@ -23611,14 +23647,23 @@ def _td_try_load_raw_curves(
         if src_run:
             curve_sql.append(" AND lower(COALESCE(c.source_run_name, '')) = lower(?)")
             curve_params.append(src_run)
+        run_type_sql, run_type_params = _td_perf_run_type_sql_clause(run_type_filter, "o.run_type")
+        if run_type_sql:
+            curve_sql.append(run_type_sql)
+            curve_params.extend(run_type_params)
         if control_period_filter not in (None, ""):
             cp_filter_num = _to_support_number(control_period_filter)
+            run_type_key = _td_perf_run_type_sql_key("o.run_type")
             if cp_filter_num is not None:
-                curve_sql.append(" AND ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9")
+                curve_sql.append(
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR ABS(COALESCE(o.control_period, 0) - ?) <= 1e-9)"
+                )
                 curve_params.append(cp_filter_num)
             else:
                 curve_sql.append(
-                    " AND lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT)))"
+                    f" AND ({run_type_key} NOT IN ('pm', 'pulsemode', 'pulsedmode', 'pulsed', 'pulse')"
+                    " OR lower(TRIM(CAST(o.control_period AS TEXT))) = lower(TRIM(CAST(? AS TEXT))))"
                 )
                 curve_params.append(str(control_period_filter))
         curve_sql.append(" ORDER BY c.serial, c.observation_id")
@@ -23628,7 +23673,7 @@ def _td_try_load_raw_curves(
             if not _td_curve_schema_fallback_allowed(exc):
                 raise
             legacy_sql = [
-                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, '' AS asset_type, '' AS asset_specific_type, NULL AS control_period, NULL AS suppression_voltage, NULL AS valve_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
+                f"SELECT '' AS observation_id, serial, '' AS program_title, '' AS source_run_name, '' AS asset_type, '' AS asset_specific_type, '' AS run_type, NULL AS control_period, NULL AS suppression_voltage, NULL AS valve_voltage, x_json, y_json FROM {_quote_ident(table_name)} WHERE 1=1"
             ]
             legacy_params: list[object] = []
             if want:
@@ -23638,7 +23683,7 @@ def _td_try_load_raw_curves(
             legacy_sql.append(" ORDER BY serial")
             rows = conn.execute("".join(legacy_sql), tuple(legacy_params)).fetchall()
     out: list[dict] = []
-    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
+    for observation_id, sn, program_txt, source_run_txt, asset_type, asset_specific_type, run_type, control_period, suppression_voltage, valve_voltage, xj, yj in rows:
         try:
             xs = json.loads(xj or "[]")
             ys = json.loads(yj or "[]")
@@ -23655,6 +23700,7 @@ def _td_try_load_raw_curves(
                 "source_run_name": str(source_run_txt or "").strip(),
                 "asset_type": str(asset_type or "").strip(),
                 "asset_specific_type": str(asset_specific_type or "").strip(),
+                "run_type": str(run_type or "").strip(),
                 "control_period": control_period,
                 "suppression_voltage": suppression_voltage,
                 "valve_voltage": valve_voltage,
@@ -37805,6 +37851,7 @@ def td_load_curves(
     program_title: str | None = None,
     source_run_name: str | None = None,
     control_period_filter: object = None,
+    run_type_filter: object = None,
 ) -> list[dict]:
     run = str(run_name or "").strip()
     y = str(y_name or "").strip()
@@ -37822,6 +37869,7 @@ def td_load_curves(
             program_title=program_title,
             source_run_name=source_run_name,
             control_period_filter=control_period_filter,
+            run_type_filter=run_type_filter,
         )
         if found_plotter:
             return out
@@ -37835,6 +37883,7 @@ def td_load_curves(
         program_title=program_title,
         source_run_name=source_run_name,
         control_period_filter=control_period_filter,
+        run_type_filter=run_type_filter,
     )
     if found_raw or original_path == raw_path:
         return out
@@ -37847,6 +37896,7 @@ def td_load_curves(
         program_title=program_title,
         source_run_name=source_run_name,
         control_period_filter=control_period_filter,
+        run_type_filter=run_type_filter,
     )
     if legacy_out:
         return legacy_out
@@ -39504,6 +39554,27 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
                 artifacts_path = support_dir / artifacts_rel
                 if artifacts_path.exists():
                     return artifacts_path
+        for doc in docs:
+            try:
+                source_rel_path = str(doc.get("source_rel_path") or "").strip().replace("\\", "/")
+            except Exception:
+                source_rel_path = ""
+            source_rel_paths = []
+            try:
+                source_rel_paths = [
+                    str(value or "").strip().replace("\\", "/")
+                    for value in (doc.get("source_rel_paths") or [])
+                    if str(value or "").strip()
+                ]
+            except Exception:
+                source_rel_paths = []
+            if rel_norm not in {source_rel_path, *source_rel_paths}:
+                continue
+            artifacts_rel = str(doc.get("artifacts_rel") or "").strip()
+            if artifacts_rel:
+                artifacts_path = support_dir / artifacts_rel
+                if artifacts_path.exists():
+                    return artifacts_path
     path_obj = Path(rel_norm)
     stem = path_obj.stem
     ext = path_obj.suffix.lower()
@@ -39537,7 +39608,7 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
             except Exception:
                 pass
         candidates.append(raw_cand)
-    if ext in EXCEL_EXTENSIONS and td_root.exists():
+    if ext in (set(EXCEL_EXTENSIONS) | {".mat"}) and td_root.exists():
         td_source_stems = [stem]
         if ext == ".mat" and detect_mat_bundle_member is not None:
             try:

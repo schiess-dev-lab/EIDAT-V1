@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "EIDAT_App_Files"))
 
 from eidat_manager_db import support_paths  # type: ignore
 from eidat_manager import _cmd_process  # type: ignore
-from eidat_manager_excel_to_sqlite import excel_to_sqlite  # type: ignore
+from eidat_manager_excel_to_sqlite import excel_to_sqlite, export_td_sqlite_workbook  # type: ignore
 from eidat_manager_index import build_index  # type: ignore
 from eidat_manager_mat_bundle import detect_mat_bundle_member, list_mat_bundle_members  # type: ignore
 from eidat_manager_process import process_candidates, rebuild_td_serial_aggregates  # type: ignore
@@ -198,36 +198,64 @@ class TestMatSeqBundle(unittest.TestCase):
             names = [str(col[0] or "") for col in (cursor.description or [])]
         return {names[idx]: row[idx] for idx in range(min(len(names), len(row or [])))}
 
+    def _official_td_source_dir(self, official_dir: Path, bundle_stem: str) -> Path:
+        matches = sorted((official_dir / "sources").glob(f"{bundle_stem}__*__excel"))
+        self.assertEqual(len(matches), 1, f"expected one official source package for {bundle_stem}, found {matches}")
+        return matches[0]
+
     def test_bundle_detector_matches_seq_files_only(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             repo = Path(td)
             data_dir = repo / "td"
             data_dir.mkdir(parents=True, exist_ok=True)
-            good = data_dir / "SN123_seq01.mat"
+            seq_digit = data_dir / "SN123_seq1.mat"
+            seq_spaced_digit = data_dir / "SN123_seq 2.mat"
+            seq_word = data_dir / "SN123_sequence two.mat"
+            seq_ordinal = data_dir / "SN123_seq first.mat"
             other = data_dir / "capture.mat"
-            self._write_valid_mat(good, 0.0)
+            for idx, path in enumerate((seq_digit, seq_spaced_digit, seq_word, seq_ordinal), start=1):
+                self._write_valid_mat(path, float(idx))
             self._write_valid_mat(other, 1.0)
 
-            info = detect_mat_bundle_member(good, repo_root=repo)
-            self.assertIsNotNone(info)
-            assert info is not None
-            self.assertEqual(info.serial_number, "SN123")
-            self.assertEqual(info.sequence_name, "seq01")
+            expected = {
+                seq_digit: ("SN123", "seq1", 1),
+                seq_spaced_digit: ("SN123", "seq2", 2),
+                seq_word: ("SN123", "seq2", 2),
+                seq_ordinal: ("SN123", "seq1", 1),
+            }
+            for path, (serial, seq_name, seq_number) in expected.items():
+                info = detect_mat_bundle_member(path, repo_root=repo)
+                self.assertIsNotNone(info, str(path))
+                assert info is not None
+                self.assertEqual(info.serial_number, serial)
+                self.assertEqual(info.sequence_name, seq_name)
+                self.assertEqual(info.sequence_number, seq_number)
             self.assertIsNone(detect_mat_bundle_member(other, repo_root=repo))
 
     def test_processes_bundle_into_single_indexed_td_source(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             repo = Path(td)
             src_dir = repo / "Valve" / "ModelX"
             src_dir.mkdir(parents=True, exist_ok=True)
-            seq1 = src_dir / "SN123_seq1.mat"
-            seq2 = src_dir / "SN123_seq2.mat"
+            seq1 = src_dir / "SN123_seq first.mat"
+            seq2 = src_dir / "SN123_sequence two.mat"
             seq3 = src_dir / "SN123_seq3.mat"
             self._write_valid_mat(seq1, 0.0)
             self._write_valid_mat(seq2, 10.0)
             self._write_valid_mat(seq3, 20.0)
 
             paths = support_paths(repo)
+            bundle = detect_mat_bundle_member(seq1, repo_root=repo)
+            assert bundle is not None
+            legacy_bundle_dir = paths.support_dir / "debug" / "ocr" / f"{bundle.bundle_stem}__excel"
+            legacy_bundle_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_bundle_dir / "stale.txt").write_text("stale", encoding="utf-8")
+            for stale_name in ("SN123_seq first__excel", "SN123_sequence two__excel", "SN123_seq3__excel"):
+                stale_dir = paths.support_dir / "debug" / "ocr" / stale_name
+                stale_dir.mkdir(parents=True, exist_ok=True)
+                (stale_dir / "stale.txt").write_text("stale", encoding="utf-8")
             scan_summary = scan_global_repo(paths)
             self.assertEqual(len(scan_summary.candidates), 3)
 
@@ -236,25 +264,30 @@ class TestMatSeqBundle(unittest.TestCase):
 
             members = list_mat_bundle_members(seq1, repo_root=repo)
             self.assertEqual([m.sequence_name for m in members], ["seq1", "seq2", "seq3"])
-            bundle = detect_mat_bundle_member(seq1, repo_root=repo)
-            assert bundle is not None
-            artifacts_dir = paths.support_dir / "debug" / "ocr" / f"{bundle.bundle_stem}__excel"
+            official_dir = paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN123"
+            artifacts_dir = self._official_td_source_dir(official_dir, bundle.bundle_stem)
             sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
             metadata_path = artifacts_dir / f"{bundle.bundle_stem}_metadata.json"
             manifest_path = artifacts_dir / "mat_seq_bundle.json"
-            official_dir = paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN123"
+            source_workbook = artifacts_dir / f"{bundle.bundle_stem}.xlsx"
             official_sqlite = official_dir / "SN123.sqlite3"
             official_metadata = official_dir / "SN123_metadata.json"
             official_manifest = official_dir / "td_serial_aggregate.json"
+            official_workbook = official_dir / "SN123.xlsx"
 
             self.assertTrue(artifacts_dir.exists())
             self.assertTrue(sqlite_path.exists())
             self.assertTrue(metadata_path.exists())
             self.assertTrue(manifest_path.exists())
+            self.assertTrue(source_workbook.exists())
             self.assertTrue(official_sqlite.exists())
             self.assertTrue(official_metadata.exists())
+            self.assertTrue(official_workbook.exists())
             self.assertFalse(official_manifest.exists())
-            self.assertFalse((paths.support_dir / "debug" / "ocr" / "SN123_seq1__excel").exists())
+            self.assertFalse(legacy_bundle_dir.exists())
+            self.assertFalse((paths.support_dir / "debug" / "ocr" / "SN123_seq first__excel").exists())
+            self.assertFalse((paths.support_dir / "debug" / "ocr" / "SN123_sequence two__excel").exists())
+            self.assertFalse((paths.support_dir / "debug" / "ocr" / "SN123_seq3__excel").exists())
             meta = __import__("json").loads(metadata_path.read_text(encoding="utf-8"))
             manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(str(meta.get("asset_type") or "").strip(), "Valve")
@@ -264,7 +297,11 @@ class TestMatSeqBundle(unittest.TestCase):
             official_meta = __import__("json").loads(official_metadata.read_text(encoding="utf-8"))
             self.assertEqual(str(official_meta.get("metadata_source") or "").strip(), "td_serial_official_source")
             self.assertEqual(str(official_meta.get("source_artifacts_rel") or "").replace("\\", "/"), str(artifacts_dir.relative_to(paths.support_dir)).replace("\\", "/"))
-            self.assertEqual(str(official_meta.get("source_sheet_name") or "").strip(), "SN123_seq3")
+            self.assertEqual(str(official_meta.get("source_sqlite_rel") or "").replace("\\", "/"), str(sqlite_path.relative_to(repo)).replace("\\", "/"))
+            self.assertIn(
+                str(official_meta.get("source_sheet_name") or "").strip(),
+                {"SN123_seq first", "SN123_sequence two", "SN123_seq3"},
+            )
 
             with sqlite3.connect(str(sqlite_path)) as conn:
                 runs = [str(row[0] or "") for row in conn.execute("SELECT sheet_name FROM __sheet_info ORDER BY sheet_name").fetchall()]
@@ -275,7 +312,7 @@ class TestMatSeqBundle(unittest.TestCase):
                 member_count = int(conn.execute("SELECT COUNT(*) FROM __mat_bundle_members").fetchone()[0] or 0)
                 seq1_cols = [str(row[1] or "") for row in conn.execute('PRAGMA table_info("sheet__seq1")').fetchall()]
             self.assertEqual(runs, ["seq1", "seq2", "seq3"])
-            self.assertEqual(source_runs, {"seq1": "SN123_seq1", "seq2": "SN123_seq2", "seq3": "SN123_seq3"})
+            self.assertEqual(source_runs, {"seq1": "SN123_seq first", "seq2": "SN123_sequence two", "seq3": "SN123_seq3"})
             self.assertEqual(member_count, 3)
             seq1_cols_norm = {str(value or "").strip().casefold() for value in seq1_cols}
             self.assertIn("time", seq1_cols_norm)
@@ -285,16 +322,46 @@ class TestMatSeqBundle(unittest.TestCase):
             seq1_context = self._sequence_context_row(sqlite_path, sheet_name="seq1")
             self.assertEqual(str(seq1_context.get("extraction_status") or "").strip(), "incomplete")
 
+            for workbook_path in (source_workbook, official_workbook):
+                wb = load_workbook(str(workbook_path), read_only=True, data_only=True)
+                try:
+                    self.assertEqual(list(wb.sheetnames), ["seq1", "seq2", "seq3"])
+                    self.assertTrue(all(not name.startswith("__") for name in wb.sheetnames))
+                finally:
+                    wb.close()
+
             build_index(paths)
             docs = read_eidat_index_documents(repo)
             td_docs = [doc for doc in docs if str(doc.get("serial_number") or "").strip() == "SN123"]
             self.assertEqual(len(td_docs), 1)
             self.assertEqual(str(td_docs[0].get("document_type_source") or "").strip(), "td_serial_official_source")
             self.assertTrue(str(td_docs[0].get("excel_sqlite_rel") or "").replace("\\", "/").endswith("/SN123/SN123.sqlite3"))
+            self.assertEqual(
+                sorted(str(value or "").replace("\\", "/") for value in (td_docs[0].get("source_rel_paths") or [])),
+                sorted(
+                    [
+                        "Valve/ModelX/SN123_seq first.mat",
+                        "Valve/ModelX/SN123_sequence two.mat",
+                        "Valve/ModelX/SN123_seq3.mat",
+                    ]
+                ),
+            )
 
-            resolved_artifacts = get_file_artifacts_path(repo, "Valve/ModelX/SN123_seq2.mat")
+            resolved_artifacts = get_file_artifacts_path(repo, "Valve/ModelX/SN123_sequence two.mat")
             self.assertIsNotNone(resolved_artifacts)
             self.assertEqual(resolved_artifacts, official_dir)
+
+            sentinel = artifacts_dir / "keep.txt"
+            sentinel.write_text("keep", encoding="utf-8")
+            rebuild_payload = rebuild_td_serial_aggregates(
+                paths,
+                export_excel_mirror=export_td_sqlite_workbook,
+                mirror_xlsx=True,
+            )
+            self.assertEqual(int(rebuild_payload.get("official_source_count") or 0), 1)
+            self.assertTrue(artifacts_dir.exists())
+            self.assertTrue(sentinel.exists())
+            self.assertTrue(official_workbook.exists())
 
             scan_after = scan_global_repo(paths)
             self.assertEqual(len(scan_after.candidates), 0)
@@ -304,7 +371,7 @@ class TestMatSeqBundle(unittest.TestCase):
             repo = Path(td)
             src_dir = repo / "Valve" / "ModelX"
             src_dir.mkdir(parents=True, exist_ok=True)
-            mat_path = src_dir / "SN123_seq1.mat"
+            mat_path = src_dir / "SN123_sequence two.mat"
             self._write_valid_mat(mat_path, 0.0)
 
             out_dir = repo / "sqlite_out"
@@ -329,54 +396,69 @@ class TestMatSeqBundle(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name"
                     ).fetchall()
                 ]
-            self.assertEqual(sheet_rows, [("seq1", "SN123_seq1")])
-            self.assertEqual(table_names, ["sheet__seq1"])
-            seq1_context = self._sequence_context_row(sqlite_path, sheet_name="seq1")
-            self.assertEqual(str(seq1_context.get("source_sheet_name") or "").strip(), "SN123_seq1")
-            self.assertEqual(str(seq1_context.get("extraction_status") or "").strip(), "incomplete")
+            self.assertEqual(sheet_rows, [("seq2", "SN123_sequence two")])
+            self.assertEqual(table_names, ["sheet__seq2"])
+            seq2_context = self._sequence_context_row(sqlite_path, sheet_name="seq2")
+            self.assertEqual(str(seq2_context.get("source_sheet_name") or "").strip(), "SN123_sequence two")
+            self.assertEqual(str(seq2_context.get("extraction_status") or "").strip(), "incomplete")
 
     def test_single_sequence_mat_process_materializes_official_source_with_seq_run_name(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             repo = Path(td)
             src_dir = repo / "Valve" / "ModelX"
             src_dir.mkdir(parents=True, exist_ok=True)
-            seq1 = src_dir / "SN123_seq1.mat"
-            self._write_valid_mat(seq1, 0.0)
+            seq2 = src_dir / "SN123_sequence two.mat"
+            self._write_valid_mat(seq2, 0.0)
 
             paths = support_paths(repo)
             scan_global_repo(paths)
             results = process_candidates(paths)
             self.assertEqual(sum(1 for item in results if item.ok), 1)
 
-            bundle = detect_mat_bundle_member(seq1, repo_root=repo)
+            bundle = detect_mat_bundle_member(seq2, repo_root=repo)
             assert bundle is not None
-            artifacts_dir = paths.support_dir / "debug" / "ocr" / f"{bundle.bundle_stem}__excel"
-            sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
             official_dir = paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN123"
+            artifacts_dir = self._official_td_source_dir(official_dir, bundle.bundle_stem)
+            sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
+            source_workbook = artifacts_dir / f"{bundle.bundle_stem}.xlsx"
             official_sqlite = official_dir / "SN123.sqlite3"
             official_metadata = official_dir / "SN123_metadata.json"
+            official_workbook = official_dir / "SN123.xlsx"
 
             self.assertTrue(sqlite_path.exists())
+            self.assertTrue(source_workbook.exists())
             self.assertTrue(official_sqlite.exists())
             self.assertTrue(official_metadata.exists())
+            self.assertTrue(official_workbook.exists())
 
             with sqlite3.connect(str(sqlite_path)) as conn:
                 source_rows = conn.execute(
                     "SELECT sheet_name, source_sheet_name FROM __sheet_info ORDER BY sheet_name"
                 ).fetchall()
-            self.assertEqual(source_rows, [("seq1", "SN123_seq1")])
+            self.assertEqual(source_rows, [("seq2", "SN123_sequence two")])
 
             with sqlite3.connect(str(official_sqlite)) as conn:
                 official_rows = conn.execute(
                     "SELECT sheet_name, source_sheet_name FROM __sheet_info ORDER BY sheet_name"
                 ).fetchall()
-            self.assertEqual(official_rows, [("seq1", "SN123_seq1")])
+            self.assertEqual(official_rows, [("seq2", "SN123_sequence two")])
+
+            for workbook_path in (source_workbook, official_workbook):
+                wb = load_workbook(str(workbook_path), read_only=True, data_only=True)
+                try:
+                    self.assertEqual(list(wb.sheetnames), ["seq2"])
+                finally:
+                    wb.close()
 
             official_meta = json.loads(official_metadata.read_text(encoding="utf-8"))
             self.assertEqual(str(official_meta.get("metadata_source") or "").strip(), "td_serial_official_source")
             self.assertEqual(str(official_meta.get("asset_type") or "").strip(), "Valve")
             self.assertEqual(str(official_meta.get("asset_specific_type") or "").strip(), "ModelX")
-            self.assertEqual(str(official_meta.get("source_sheet_name") or "").strip(), "SN123_seq1")
+            self.assertEqual(str(official_meta.get("source_sheet_name") or "").strip(), "SN123_sequence two")
+            self.assertEqual(str(official_meta.get("source_artifacts_rel") or "").replace("\\", "/"), str(artifacts_dir.relative_to(paths.support_dir)).replace("\\", "/"))
+            self.assertEqual(str(official_meta.get("source_sqlite_rel") or "").replace("\\", "/"), str(sqlite_path.relative_to(repo)).replace("\\", "/"))
             self.assertFalse((official_dir / "td_serial_aggregate.json").exists())
 
     def test_processes_mat_bundle_populates_sequence_context_and_support_conditions(self) -> None:
@@ -429,7 +511,8 @@ class TestMatSeqBundle(unittest.TestCase):
 
             bundle = detect_mat_bundle_member(seq1, repo_root=repo)
             assert bundle is not None
-            artifacts_dir = paths.support_dir / "debug" / "ocr" / f"{bundle.bundle_stem}__excel"
+            official_dir = paths.support_dir / "Test Data File Extractions" / "Unknown" / "Valve" / "ModelX" / "SN123"
+            artifacts_dir = self._official_td_source_dir(official_dir, bundle.bundle_stem)
             sqlite_path = artifacts_dir / f"{bundle.bundle_stem}.sqlite3"
             self.assertTrue(sqlite_path.exists())
 

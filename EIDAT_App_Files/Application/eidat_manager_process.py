@@ -1092,6 +1092,59 @@ def _merge_bundle_metadata(items: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
+def _dedupe_source_rel_paths(rel_paths: Sequence[object]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in rel_paths:
+        rel = str(value or "").strip().replace("\\", "/")
+        if not rel:
+            continue
+        key = rel.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rel)
+    return out
+
+
+def _augment_td_source_metadata(
+    *,
+    global_repo: Path,
+    metadata: Mapping[str, Any] | None,
+    source_paths: Sequence[Path],
+) -> dict[str, Any]:
+    out = dict(metadata or {})
+    rel_paths = _dedupe_source_rel_paths([_safe_repo_rel(global_repo, Path(path).expanduser()) for path in source_paths])
+    if rel_paths:
+        out["source_rel_paths"] = list(rel_paths)
+        if len(rel_paths) == 1:
+            out["source_rel_path"] = rel_paths[0]
+            try:
+                out["source_file"] = str((Path(global_repo).expanduser() / Path(rel_paths[0])).expanduser())
+            except Exception:
+                out["source_file"] = rel_paths[0]
+    return out
+
+
+def _apply_mat_metadata_hints(
+    *,
+    metadata: Mapping[str, Any] | None,
+    mat_path: Path,
+    bundle_seed: MatBundleMember | None,
+) -> dict[str, Any]:
+    out = dict(metadata or {})
+    folder_hints = _mat_folder_asset_hints(mat_path)
+    if bundle_seed is not None:
+        out["serial_number"] = bundle_seed.serial_number
+        out["document_type"] = "TD"
+        out["document_type_acronym"] = "TD"
+    if str(out.get("asset_type") or "").strip() in {"", "Unknown", "unknown"}:
+        out["asset_type"] = folder_hints.get("asset_type") or "Unknown"
+    if str(out.get("asset_specific_type") or "").strip() in {"", "Unknown", "unknown"}:
+        out["asset_specific_type"] = folder_hints.get("asset_specific_type") or "Unknown"
+    return out
+
+
 def _cleanup_stale_mat_member_artifacts(paths: SupportPaths, members: list[MatBundleMember], keep_dir: Path) -> None:
     for member in members:
         old_dir = paths.support_dir / "debug" / "ocr" / f"{member.file_path.stem}{EXCEL_ARTIFACT_SUFFIX}"
@@ -1537,6 +1590,20 @@ def _td_agg_dedupe_sequence_members(
     return deduped, dropped
 
 
+def _td_agg_group_source_rel_paths(group_members: Sequence[Mapping[str, Any]]) -> list[str]:
+    found: list[str] = []
+    for raw_member in group_members:
+        member = dict(raw_member)
+        meta = dict(member.get("metadata") or {})
+        direct_list = meta.get("source_rel_paths")
+        if isinstance(direct_list, list):
+            found.extend(direct_list)
+        direct_single = str(meta.get("source_rel_path") or "").strip()
+        if direct_single:
+            found.append(direct_single)
+    return _dedupe_source_rel_paths(found)
+
+
 def _td_agg_collect_members(paths: SupportPaths) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     support_dir = Path(paths.support_dir)
     members: list[dict[str, Any]] = []
@@ -1763,6 +1830,36 @@ def _td_agg_create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _td_agg_reset_output_sqlite(conn: sqlite3.Connection) -> None:
+    try:
+        sheet_tables = [
+            str(row[0] or "")
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'sheet__%' ORDER BY name"
+            ).fetchall()
+            if str(row[0] or "").strip()
+        ]
+    except Exception:
+        sheet_tables = []
+    for table_name in sheet_tables:
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS {_td_agg_quote_ident(table_name)}")
+        except Exception:
+            pass
+    for table_name in (
+        "__workbook",
+        "__sheet_info",
+        "__column_map",
+        "__meta_cells",
+        "__sequence_context",
+        "__td_serial_aggregate_members",
+    ):
+        try:
+            conn.execute(f"DELETE FROM {_td_agg_quote_ident(table_name)}")
+        except Exception:
+            pass
+
+
 def _td_agg_copy_data_table(
     src: sqlite3.Connection,
     dest: sqlite3.Connection,
@@ -1923,6 +2020,7 @@ def _td_agg_write_group(
     now_ns = time.time_ns()
     with sqlite3.connect(str(sqlite_path)) as dest:
         _td_agg_create_schema(dest)
+        _td_agg_reset_output_sqlite(dest)
         for idx, raw_member in enumerate(selected_members, start=1):
             member = dict(raw_member)
             source_sqlite = Path(member.get("sqlite_path") or "")
@@ -2058,6 +2156,7 @@ def _td_agg_write_group(
         for item in manifest_members
         if str(item.get("source_metadata_rel") or "").strip()
     ]
+    source_rel_paths = _td_agg_group_source_rel_paths(group_members)
     header_metadata_rel = str(header_member.get("metadata_rel") or "").strip()
     header_sqlite_rel = str(header_member.get("sqlite_rel") or "").strip()
     header_sheet_name = str(header_member.get("source_sheet_name") or header_member.get("sheet_name") or "").strip()
@@ -2101,12 +2200,16 @@ def _td_agg_write_group(
             "file_extension": ".sqlite3",
             "metadata_source": TD_SERIAL_OFFICIAL_SOURCE_METADATA_SOURCE,
             "source_metadata_rel": header_metadata_rel,
+            "source_metadata_rels": [header_metadata_rel] if header_metadata_rel else [],
             "source_sqlite_rel": header_sqlite_rel,
             "source_artifacts_rel": str(header_member.get("artifacts_rel") or "").strip(),
             "source_file": str(header_member.get("source_file") or "").strip(),
             "source_sheet_name": header_sheet_name,
+            "source_rel_paths": list(source_rel_paths),
             "sequence_count": len(manifest_members),
         }
+        if len(source_rel_paths) == 1:
+            official_meta["source_rel_path"] = source_rel_paths[0]
         metadata_path.write_text(json.dumps(official_meta, indent=2, ensure_ascii=True), encoding="utf-8")
     else:
         aggregate_meta = {
@@ -2139,7 +2242,11 @@ def _td_agg_write_group(
             "aggregate_header_source_metadata_rel": header_metadata_rel,
             "aggregate_header_source_sqlite_rel": header_sqlite_rel,
             "aggregate_header_source_sheet_name": header_sheet_name,
+            "source_metadata_rels": list(source_metadata_rels),
+            "source_rel_paths": list(source_rel_paths),
         }
+        if len(source_rel_paths) == 1:
+            aggregate_meta["source_rel_path"] = source_rel_paths[0]
         metadata_path.write_text(json.dumps(aggregate_meta, indent=2, ensure_ascii=True), encoding="utf-8")
         manifest = {
             "kind": TD_SERIAL_AGGREGATE_METADATA_SOURCE,
@@ -2191,8 +2298,7 @@ def _td_agg_clear_previous_outputs(aggregate_root: Path) -> None:
         except Exception:
             rel_parts = [part.casefold() for part in path.parts]
         try:
-            if path.is_dir() and path.name.casefold() == TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME.casefold():
-                shutil.rmtree(path, ignore_errors=True)
+            if TD_SERIAL_SOURCE_ARTIFACTS_DIRNAME.casefold() in rel_parts:
                 continue
             if path.is_file():
                 low = path.name.lower()
@@ -2201,6 +2307,7 @@ def _td_agg_clear_previous_outputs(aggregate_root: Path) -> None:
                     or low.endswith(".sqlite3")
                     or low.endswith(".sqlite3.txt")
                     or low.endswith(".sqlite3.xlsx")
+                    or low.endswith(".xlsx")
                     or low.endswith("_metadata.json")
                     or low.endswith(".metadata.json")
                 ):
@@ -2499,7 +2606,7 @@ def process_candidates(
             excel_mod = _load_excel_extractor()
         return excel_mod
 
-    def _get_excel_sqlite_helpers() -> tuple[Any, Any, Any, Any, Any, Any]:
+    def _get_excel_sqlite_helpers() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
         nonlocal excel_sqlite_helpers
         if excel_sqlite_helpers is None:
             try:
@@ -2507,6 +2614,7 @@ def process_candidates(
                     _load_test_data_env,
                     _truthy,
                     excel_to_sqlite,
+                    export_td_sqlite_workbook,
                     export_sqlite_excel_mirror,
                     export_sqlite_text_mirror,
                     write_mat_bundle_sqlite,
@@ -2516,6 +2624,7 @@ def process_candidates(
                     _load_test_data_env,
                     _truthy,
                     excel_to_sqlite,
+                    export_td_sqlite_workbook,
                     export_sqlite_excel_mirror,
                     export_sqlite_text_mirror,
                     write_mat_bundle_sqlite,
@@ -2524,6 +2633,7 @@ def process_candidates(
                 excel_to_sqlite,
                 export_sqlite_text_mirror,
                 export_sqlite_excel_mirror,
+                export_td_sqlite_workbook,
                 _load_test_data_env,
                 _truthy,
                 write_mat_bundle_sqlite,
@@ -2617,14 +2727,16 @@ def process_candidates(
                         bundle_seed = detect_mat_bundle_member(abs_path, repo_root=paths.global_repo) if is_mat else None
                         bundle_members = list_mat_bundle_members(abs_path, repo_root=paths.global_repo) if bundle_seed is not None else []
                         is_mat_bundle = bool(bundle_seed is not None and bundle_members)
-                        artifacts_root = (
+                        initial_artifacts_root = (
                             mat_bundle_artifacts_dir(paths.support_dir, bundle_seed)
                             if is_mat_bundle and bundle_seed is not None
                             else _excel_artifacts_dir(paths, abs_path)
                         )
-                        legacy_artifacts_root = artifacts_root
+                        artifacts_root = initial_artifacts_root
+                        legacy_artifacts_root = initial_artifacts_root
                         artifacts_dir = str(artifacts_root)
                         metadata_identity_path = _bundle_identity_path(bundle_seed) if is_mat_bundle and bundle_seed is not None else abs_path
+                        source_paths = [member.file_path for member in bundle_members] if is_mat_bundle else [abs_path]
                         data_matrix_sqlite_abs: Path | None = None
 
                         # Load any existing artifacts metadata first (treated as curated when present).
@@ -2668,17 +2780,57 @@ def process_candidates(
                             )
                         except Exception:
                             raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
-                        if is_mat and isinstance(raw_meta, dict):
+                        if is_mat:
                             mat_hint_path = bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path
-                            folder_hints = _mat_folder_asset_hints(mat_hint_path)
-                            if is_mat_bundle and bundle_seed is not None:
-                                raw_meta["serial_number"] = bundle_seed.serial_number
-                                raw_meta["document_type"] = "TD"
-                                raw_meta["document_type_acronym"] = "TD"
-                            if str(raw_meta.get("asset_type") or "").strip() in {"", "Unknown", "unknown"}:
-                                raw_meta["asset_type"] = folder_hints.get("asset_type") or "Unknown"
-                            if str(raw_meta.get("asset_specific_type") or "").strip() in {"", "Unknown", "unknown"}:
-                                raw_meta["asset_specific_type"] = folder_hints.get("asset_specific_type") or "Unknown"
+                            raw_meta = _apply_mat_metadata_hints(
+                                metadata=raw_meta,
+                                mat_path=mat_hint_path,
+                                bundle_seed=bundle_seed if is_mat_bundle else None,
+                            )
+                        raw_meta = _augment_td_source_metadata(
+                            global_repo=paths.global_repo,
+                            metadata=raw_meta,
+                            source_paths=source_paths,
+                        )
+                        if is_mat_bundle and bundle_seed is not None:
+                            artifacts_root = _td_source_scoped_artifacts_dir(
+                                paths.support_dir,
+                                raw_meta,
+                                metadata_identity_path,
+                                bundle_stem=bundle_seed.bundle_stem,
+                            )
+                            try:
+                                official_existing_meta = load_metadata_from_artifacts(artifacts_root, metadata_identity_path)
+                            except Exception:
+                                official_existing_meta = None
+                            if official_existing_meta is not None:
+                                existing_meta = official_existing_meta
+                                try:
+                                    raw_meta = canonicalize_metadata_for_file(
+                                        bundle_seed.file_path,
+                                        existing_meta=existing_meta,
+                                        extracted_meta=extracted_meta,
+                                        default_document_type="TD",
+                                    )
+                                except Exception:
+                                    raw_meta = extracted_meta if isinstance(extracted_meta, dict) else {}
+                                raw_meta = _apply_mat_metadata_hints(
+                                    metadata=raw_meta,
+                                    mat_path=bundle_seed.file_path,
+                                    bundle_seed=bundle_seed,
+                                )
+                                raw_meta = _augment_td_source_metadata(
+                                    global_repo=paths.global_repo,
+                                    metadata=raw_meta,
+                                    source_paths=source_paths,
+                                )
+                            artifacts_root = _td_source_scoped_artifacts_dir(
+                                paths.support_dir,
+                                raw_meta,
+                                metadata_identity_path,
+                                bundle_stem=bundle_seed.bundle_stem,
+                            )
+                            artifacts_dir = str(artifacts_root)
 
                         is_test_data = bool(is_mat) or _is_test_data_meta(raw_meta if isinstance(raw_meta, dict) else {})
                         is_confirmed_test_data = bool(is_mat) or _is_confirmed_test_data_meta(
@@ -2709,12 +2861,14 @@ def process_candidates(
                                     excel_to_sqlite,
                                     export_sqlite_text_mirror,
                                     export_sqlite_excel_mirror,
+                                    export_td_sqlite_workbook,
                                     _load_test_data_env,
                                     _truthy,
                                     write_mat_bundle_sqlite,
                                 ) = _get_excel_sqlite_helpers()
                                 sqlite_rel = ""
                                 sqlite_abs: Path | None = None
+                                sqlite_errors: list[str] = []
                                 if is_mat_bundle and bundle_seed is not None:
                                     artifacts_root.mkdir(parents=True, exist_ok=True)
                                     _cleanup_stale_mat_member_artifacts(paths, bundle_members, artifacts_root)
@@ -2738,7 +2892,6 @@ def process_candidates(
                                         results_list = list((payload or {}).get("results") or [])
                                     except Exception:
                                         results_list = []
-                                    sqlite_errors: list[str] = []
                                     for r0 in results_list:
                                         try:
                                             sp = str((r0 or {}).get("sqlite_path") or "").strip()
@@ -2783,7 +2936,10 @@ def process_candidates(
                                         want_xlsx = False
                                     if want_xlsx:
                                         try:
-                                            export_sqlite_excel_mirror(sqlite_abs)
+                                            if is_mat_bundle and bundle_seed is not None:
+                                                export_td_sqlite_workbook(sqlite_abs)
+                                            else:
+                                                export_sqlite_excel_mirror(sqlite_abs)
                                         except Exception:
                                             pass
                                 if is_mat_bundle and bundle_seed is not None:
@@ -2828,15 +2984,16 @@ def process_candidates(
                         )
                         if is_mat:
                             mat_hint_path = bundle_seed.file_path if is_mat_bundle and bundle_seed is not None else abs_path
-                            folder_hints = _mat_folder_asset_hints(mat_hint_path)
-                            if is_mat_bundle and bundle_seed is not None:
-                                clean_meta["serial_number"] = bundle_seed.serial_number
-                                clean_meta["document_type"] = "TD"
-                                clean_meta["document_type_acronym"] = "TD"
-                            if str(clean_meta.get("asset_type") or "").strip() in {"", "Unknown", "unknown"}:
-                                clean_meta["asset_type"] = folder_hints.get("asset_type") or "Unknown"
-                            if str(clean_meta.get("asset_specific_type") or "").strip() in {"", "Unknown", "unknown"}:
-                                clean_meta["asset_specific_type"] = folder_hints.get("asset_specific_type") or "Unknown"
+                            clean_meta = _apply_mat_metadata_hints(
+                                metadata=clean_meta,
+                                mat_path=mat_hint_path,
+                                bundle_seed=bundle_seed if is_mat_bundle else None,
+                            )
+                        clean_meta = _augment_td_source_metadata(
+                            global_repo=paths.global_repo,
+                            metadata=clean_meta,
+                            source_paths=source_paths,
+                        )
                         metadata_path = write_metadata(Path(artifacts_dir), metadata_identity_path, clean_meta)
                         if is_mat_bundle and bundle_seed is not None:
                             _write_mat_bundle_manifest(
@@ -3139,6 +3296,7 @@ def process_candidates(
                 _excel_to_sqlite,
                 export_sqlite_text_mirror,
                 export_sqlite_excel_mirror,
+                export_td_sqlite_workbook,
                 _load_test_data_env,
                 _truthy,
                 _write_mat_bundle_sqlite,
@@ -3151,7 +3309,7 @@ def process_candidates(
             aggregate_payload = rebuild_td_serial_aggregates(
                 paths,
                 export_text_mirror=export_sqlite_text_mirror,
-                export_excel_mirror=export_sqlite_excel_mirror,
+                export_excel_mirror=export_td_sqlite_workbook,
                 mirror_xlsx=mirror_xlsx,
             )
             aggregate_payload["triggered"] = True
