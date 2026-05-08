@@ -1111,7 +1111,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "Pulse Mode Condition | Feed Pressure: 320 psia | On Time: 0.02 s | Off Time: 0.08 s",
             ],
         )
-        self.assertFalse(create_page_mock.call_args.kwargs["show_plot_toc_backlink"])
+        self.assertFalse(create_page_mock.call_args.kwargs["show_plot_backlink"])
         self.assertEqual(len(axes.plot_calls), 0)
         self.assertEqual(len(axes.scatter_calls), 4)
         self.assertEqual(axes.title[0][0], "Pressure (mean)")
@@ -1290,7 +1290,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "Pulse Mode Condition | Feed Pressure: 320 psia | On Time: 0.02 s | Off Time: 0.08 s",
             ],
         )
-        self.assertFalse(create_page_mock.call_args.kwargs["show_plot_toc_backlink"])
+        self.assertFalse(create_page_mock.call_args.kwargs["show_plot_backlink"])
         self.assertIsNone(axes.position)
         self.assertEqual(axes.title[0][0], "Pressure")
         self.assertIn("bbox", axes.title[1])
@@ -1481,15 +1481,16 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(ctx["plot_navigation"][0]["page_text"], "7")
         self.assertEqual(ctx["plot_navigation"][0]["plot_label"], "Actual Fit | Flow vs Bus Voltage | Stat: mean")
 
-    def test_apply_pdf_navigation_adds_links_and_bookmarks(self) -> None:
+    def test_apply_pdf_navigation_adds_bookmarks_and_comparison_links(self) -> None:
         fitz = __import__("fitz")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            pdf_path = Path(tmp_dir) / "toc_navigation.pdf"
+            pdf_path = Path(tmp_dir) / "comparison_navigation_links.pdf"
             doc = fitz.open()
-            toc_page = doc.new_page()
-            toc_page.insert_text((72, 72), "Run Condition Metrics")
-            toc_page.insert_text((72, 104), "Pressure | Time | mean")
-            toc_page.insert_text((220, 104), "2")
+            comparison_page = doc.new_page()
+            comparison_page.insert_text((72, 72), "Metric Chart")
+            comparison_page.insert_text((220, 72), "Metric Chart")
+            comparison_page.insert_text((72, 104), "Plot Curves")
+            comparison_page.insert_text((220, 104), "Plot Curves")
             doc.new_page()
             doc.new_page()
             doc.save(str(pdf_path))
@@ -1507,15 +1508,11 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                         "destination_page_index": 1,
                     }
                 ],
-                plot_toc_layout=[
-                    {
-                        "toc_page_number": 1,
-                        "navigator_sections": [],
-                        "rows": [
-                            {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
-                            {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 1, "page_text": "2"},
-                        ],
-                    }
+                comparison_chart_links=[
+                    {"source_page_index": 0, "link_label": "Metric Chart", "occurrence_index": 0, "destination_page_index": 1},
+                    {"source_page_index": 0, "link_label": "Metric Chart", "occurrence_index": 1, "destination_page_index": 2},
+                    {"source_page_index": 0, "link_label": "Plot Curves", "occurrence_index": 0, "destination_page_index": 1},
+                    {"source_page_index": 0, "link_label": "Plot Curves", "occurrence_index": 1, "destination_page_index": 2},
                 ],
             )
 
@@ -1526,27 +1523,19 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 self.assertEqual(toc_rows[0][2], 2)
                 self.assertEqual(toc_rows[1][1], "Pressure | Time | mean")
                 links = result.load_page(0).get_links()
-                self.assertGreaterEqual(len(links), 2)
-                self.assertTrue(all(link.get("page") == 1 for link in links))
+                self.assertEqual(sorted(link.get("page") for link in links), [1, 1, 2, 2])
             finally:
                 result.close()
 
-    def test_apply_pdf_navigation_links_rows_in_multiple_toc_columns(self) -> None:
+    def test_apply_pdf_navigation_uses_occurrence_order_for_repeated_comparison_labels(self) -> None:
         fitz = __import__("fitz")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            pdf_path = Path(tmp_dir) / "toc_navigation_multicolumn.pdf"
+            pdf_path = Path(tmp_dir) / "comparison_navigation_occurrence.pdf"
             doc = fitz.open()
-            toc_page = doc.new_page()
-            toc_page.insert_text((72, 72), "Plot Table of Contents")
-            toc_page.insert_text((72, 104), "Run Condition Metrics")
-            toc_page.insert_text((72, 136), "Pressure | Time | mean")
-            toc_page.insert_text((220, 136), "2")
-            toc_page.insert_text((250, 104), "Performance Plots")
-            toc_page.insert_text((250, 136), "ATP Fit | Flow vs Bus Voltage | mean")
-            toc_page.insert_text((398, 136), "3")
-            toc_page.insert_text((428, 104), "Watch / Non-PASS Curves")
-            toc_page.insert_text((428, 136), "Run A | Pressure | 2 Serials")
-            toc_page.insert_text((576, 136), "4")
+            comparison_page = doc.new_page()
+            comparison_page.insert_text((72, 72), "Metric Chart")
+            comparison_page.insert_text((180, 72), "Metric Chart")
+            comparison_page.insert_text((288, 72), "Metric Chart")
             doc.new_page()
             doc.new_page()
             doc.new_page()
@@ -1555,174 +1544,30 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
             tar._tar_apply_pdf_navigation(
                 pdf_path,
-                plot_navigation=[
-                    {
-                        "section_key": "run_condition_plot_metrics",
-                        "section_label": "Run Condition Metrics",
-                        "navigator_label": "Run Metrics",
-                        "plot_label": "Pressure | Time | mean",
-                        "page_number": 2,
-                        "destination_page_index": 1,
-                    },
-                    {
-                        "section_key": "performance_plots",
-                        "section_label": "Performance Plots",
-                        "navigator_label": "Performance",
-                        "plot_label": "ATP Fit | Flow vs Bus Voltage | mean",
-                        "page_number": 3,
-                        "destination_page_index": 2,
-                    },
-                    {
-                        "section_key": "watch_nonpass_curves",
-                        "section_label": "Watch / Non-PASS Curves",
-                        "navigator_label": "Watch / Fail",
-                        "plot_label": "Run A | Pressure | 2 Serials",
-                        "page_number": 4,
-                        "destination_page_index": 3,
-                    },
-                ],
-                plot_toc_layout=[
-                    {
-                        "toc_page_number": 1,
-                        "navigator_sections": [],
-                        "column_count": 3,
-                        "columns": [
-                            {
-                                "column_index": 1,
-                                "rows": [
-                                    {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
-                                    {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 1, "page_text": "2"},
-                                ],
-                            },
-                            {
-                                "column_index": 2,
-                                "rows": [
-                                    {"kind": "section", "text": "Performance Plots", "target_page_index": 2},
-                                    {
-                                        "kind": "plot",
-                                        "text": "ATP Fit | Flow vs Bus Voltage | mean",
-                                        "target_page_index": 2,
-                                        "page_text": "3",
-                                    },
-                                ],
-                            },
-                            {
-                                "column_index": 3,
-                                "rows": [
-                                    {"kind": "section", "text": "Watch / Non-PASS Curves", "target_page_index": 3},
-                                    {"kind": "plot", "text": "Run A | Pressure | 2 Serials", "target_page_index": 3, "page_text": "4"},
-                                ],
-                            },
-                        ],
-                        "rows": [
-                            {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
-                            {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 1, "page_text": "2"},
-                            {"kind": "section", "text": "Performance Plots", "target_page_index": 2},
-                            {"kind": "plot", "text": "ATP Fit | Flow vs Bus Voltage | mean", "target_page_index": 2, "page_text": "3"},
-                            {"kind": "section", "text": "Watch / Non-PASS Curves", "target_page_index": 3},
-                            {"kind": "plot", "text": "Run A | Pressure | 2 Serials", "target_page_index": 3, "page_text": "4"},
-                        ],
-                    }
+                plot_navigation=[],
+                comparison_chart_links=[
+                    {"source_page_index": 0, "link_label": "Metric Chart", "occurrence_index": 0, "destination_page_index": 1},
+                    {"source_page_index": 0, "link_label": "Metric Chart", "occurrence_index": 1, "destination_page_index": 2},
+                    {"source_page_index": 0, "link_label": "Metric Chart", "occurrence_index": 2, "destination_page_index": 3},
                 ],
             )
 
             result = fitz.open(str(pdf_path))
             try:
                 links = result.load_page(0).get_links()
-                self.assertEqual(sorted(link.get("page") for link in links), [1, 1, 2, 2, 3, 3])
-                page_2_links = [link for link in links if link.get("page") == 1]
-                page_3_links = [link for link in links if link.get("page") == 2]
-                page_4_links = [link for link in links if link.get("page") == 3]
-                self.assertTrue(all(link["from"].x1 < 240 for link in page_2_links))
-                self.assertTrue(all(link["from"].x0 > 200 for link in page_3_links))
-                self.assertTrue(all(link["from"].x0 > 380 for link in page_4_links))
+                self.assertEqual([link.get("page") for link in links], [1, 2, 3])
+                self.assertTrue(links[0]["from"].x0 < links[1]["from"].x0 < links[2]["from"].x0)
             finally:
                 result.close()
 
-    def test_apply_pdf_navigation_resolves_shifted_toc_pages_from_headings(self) -> None:
+    def test_apply_pdf_navigation_adds_backlink_to_first_comparison_page(self) -> None:
         fitz = __import__("fitz")
         with tempfile.TemporaryDirectory() as tmp_dir:
-            pdf_path = Path(tmp_dir) / "toc_navigation_shifted.pdf"
+            pdf_path = Path(tmp_dir) / "comparison_navigation_backlink.pdf"
             doc = fitz.open()
-            cover_page = doc.new_page()
-            cover_page.insert_text((72, 72), "Cover Page")
-            toc_page_1 = doc.new_page()
-            toc_page_1.insert_text((72, 72), "Plot Table of Contents")
-            toc_page_1.insert_text((72, 104), "Run Condition Metrics")
-            toc_page_1.insert_text((72, 136), "Pressure | Time | mean")
-            toc_page_1.insert_text((220, 136), "4")
-            toc_page_2 = doc.new_page()
-            toc_page_2.insert_text((72, 72), "Plot Table of Contents (Continued)")
-            toc_page_2.insert_text((72, 104), "Regrade Pass Metrics")
-            toc_page_2.insert_text((72, 136), "Flow | Time | mean")
-            toc_page_2.insert_text((220, 136), "5")
             doc.new_page()
-            doc.new_page()
-            doc.save(str(pdf_path))
-            doc.close()
-
-            tar._tar_apply_pdf_navigation(
-                pdf_path,
-                plot_navigation=[
-                    {
-                        "section_key": "run_condition_plot_metrics",
-                        "section_label": "Run Condition Metrics",
-                        "navigator_label": "Run Metrics",
-                        "plot_label": "Pressure | Time | mean",
-                        "page_number": 4,
-                        "destination_page_index": 3,
-                    },
-                    {
-                        "section_key": "regrade_pass_plot_metrics",
-                        "section_label": "Regrade Pass Metrics",
-                        "navigator_label": "Regrade Metrics",
-                        "plot_label": "Flow | Time | mean",
-                        "page_number": 5,
-                        "destination_page_index": 4,
-                    },
-                ],
-                plot_toc_layout=[
-                    {
-                        "toc_page_number": 1,
-                        "navigator_sections": [],
-                        "rows": [
-                            {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 3},
-                            {"kind": "plot", "text": "Pressure | Time | mean", "target_page_index": 3, "page_text": "4"},
-                        ],
-                    },
-                    {
-                        "toc_page_number": 2,
-                        "navigator_sections": [],
-                        "rows": [
-                            {"kind": "section", "text": "Regrade Pass Metrics", "target_page_index": 4},
-                            {"kind": "plot", "text": "Flow | Time | mean", "target_page_index": 4, "page_text": "5"},
-                        ],
-                    },
-                ],
-            )
-
-            result = fitz.open(str(pdf_path))
-            try:
-                self.assertEqual(result.load_page(0).get_links(), [])
-                page_2_links = result.load_page(1).get_links()
-                page_3_links = result.load_page(2).get_links()
-                self.assertGreaterEqual(len(page_2_links), 2)
-                self.assertGreaterEqual(len(page_3_links), 2)
-                self.assertTrue(all(link.get("page") == 3 for link in page_2_links))
-                self.assertTrue(all(link.get("page") == 4 for link in page_3_links))
-            finally:
-                result.close()
-
-    def test_apply_pdf_navigation_adds_backlink_to_first_plot_toc_page(self) -> None:
-        fitz = __import__("fitz")
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            pdf_path = Path(tmp_dir) / "toc_navigation_backlink.pdf"
-            doc = fitz.open()
-            toc_page = doc.new_page()
-            toc_page.insert_text((72, 72), "Plot Table of Contents")
-            toc_page.insert_text((72, 104), "Run Condition Metrics")
             plot_page = doc.new_page()
-            plot_page.insert_text((430, 82), tar._TAR_PLOT_TOC_BACKLINK_TEXT)
+            plot_page.insert_text((430, 82), tar._TAR_PLOT_BACKLINK_TEXT)
             doc.save(str(pdf_path))
             doc.close()
 
@@ -1738,15 +1583,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                         "destination_page_index": 1,
                     }
                 ],
-                plot_toc_layout=[
-                    {
-                        "toc_page_number": 1,
-                        "navigator_sections": [],
-                        "rows": [
-                            {"kind": "section", "text": "Run Condition Metrics", "target_page_index": 1},
-                        ],
-                    }
-                ],
+                comparison_section_start_page_index=0,
             )
 
             result = fitz.open(str(pdf_path))
@@ -1756,7 +1593,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             finally:
                 result.close()
 
-    def test_apply_plot_page_header_renders_plot_toc_backlink_text(self) -> None:
+    def test_apply_plot_page_header_renders_plot_backlink_text(self) -> None:
         fig = _FakeHeaderFigure()
         print_ctx = tar.PrintContext(
             printed_at="2026-04-14 09:00 MDT",
@@ -1777,7 +1614,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
 
         rendered_text = [str(args[2]) for args, _kwargs in fig.text_calls if len(args) >= 3]
-        self.assertIn(tar._TAR_PLOT_TOC_BACKLINK_TEXT, rendered_text)
+        self.assertIn(tar._TAR_PLOT_BACKLINK_TEXT, rendered_text)
         self.assertIn("Steady State Condition | Feed Pressure: 275 psia", rendered_text)
 
     def test_plot_condition_header_line_formats_pulse_and_steady_state_metadata(self) -> None:
@@ -1831,7 +1668,6 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             "_build_portrait_styles",
             return_value=_fake_styles(),
         ):
-            plot_toc_layout = tar._tar_paginate_plot_navigation(plot_navigation)
             ctx = {
                 "print_ctx": tar.PrintContext(
                     printed_at="2026-04-12 09:00 MDT",
@@ -1902,7 +1738,6 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 "runs": ["Run A"],
                 "all_serials": ["SN-001", "SN-010"],
                 "plot_navigation": plot_navigation,
-                "plot_toc_layout": plot_toc_layout,
                 "quick_summary": {
                     "lines": [
                         "Certifying Program(s): Program A",
@@ -1939,16 +1774,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
         )
 
-        page_break_idx = next(idx for idx, item in enumerate(story) if isinstance(item, _FakePageBreak))
         exec_idx = next(
             idx
             for idx, item in enumerate(story)
             if isinstance(item, _FakeParagraph) and item.text == "Executive Summary"
-        )
-        toc_idx = next(
-            idx
-            for idx, item in enumerate(story)
-            if isinstance(item, _FakeParagraph) and item.text == "Plot Table of Contents"
         )
         scope_idx = next(
             idx
@@ -1970,13 +1799,17 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for idx, item in enumerate(story)
             if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Run Condition"
         )
-        self.assertLess(exec_idx, page_break_idx)
-        self.assertGreater(toc_idx, page_break_idx)
+        self.assertFalse(any(isinstance(item, _FakePageBreak) for item in story))
+        self.assertFalse(
+            any(
+                isinstance(item, _FakeParagraph) and "Plot Table of Contents" in item.text
+                for item in story
+            )
+        )
         self.assertLess(scope_idx, grading_idx)
         self.assertLess(grading_idx, serial_table_idx)
         self.assertLess(serial_table_idx, exception_table_idx)
-        self.assertLess(exception_table_idx, page_break_idx)
-        self.assertLess(page_break_idx, toc_idx)
+        self.assertLess(exec_idx, scope_idx)
 
         self.assertFalse(
             any(
@@ -1994,11 +1827,12 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 for cell in row
             )
         )
-        toc_tables = [table for table in all_tables if _table_text(table) and _table_text(table)[0][0] == "Plot / Section"]
-        toc_rows = [row for table in toc_tables for row in _table_text(table)[1:]]
-        self.assertEqual(toc_rows[0][0], "Run Condition Metrics")
-        self.assertEqual(toc_rows[1][0], "Parameter: Pressure | X: Time | Stat: mean")
-        self.assertEqual(toc_rows[2][0], "Performance Plots")
+        self.assertFalse(
+            any(
+                _table_text(table) and _table_text(table)[0][0] == "Plot / Section"
+                for table in all_tables
+            )
+        )
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(

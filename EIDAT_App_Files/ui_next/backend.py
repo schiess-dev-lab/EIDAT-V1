@@ -34079,6 +34079,284 @@ def td_perf_export_equation_workbook(
     return path
 
 
+def td_export_life_metrics_snapshot_workbook(
+    output_path: Path,
+    *,
+    snapshot: Mapping[str, object],
+    progress_cb: Callable[[str], None] | None = None,
+) -> Path:
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.chart import Reference, ScatterChart, Series  # type: ignore
+        from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export Life Metrics snapshots to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    if not isinstance(snapshot, Mapping):
+        raise RuntimeError("Life Metrics plot snapshot is unavailable.")
+
+    def _text(value: object) -> object:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "Yes" if value else "No"
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            return numeric if math.isfinite(numeric) else ""
+        if isinstance(value, Mapping):
+            try:
+                return json.dumps(dict(value), ensure_ascii=False, sort_keys=True, default=str)
+            except Exception:
+                return str(dict(value))
+        if isinstance(value, (list, tuple, set)):
+            items = [str(item).strip() for item in value if str(item).strip()]
+            if not items:
+                return ""
+            return ", ".join(items)
+        return str(value).strip()
+
+    def _finite_pair(raw: object) -> tuple[float, float] | None:
+        if isinstance(raw, (str, bytes)):
+            return None
+        if not isinstance(raw, Sequence):
+            return None
+        values = [float(value) for value in raw[:2]] if len(raw) >= 2 else []
+        if len(values) != 2 or not all(math.isfinite(value) for value in values):
+            return None
+        return (values[0], values[1])
+
+    def _flatten_trace_rows(trace_rows: Sequence[Mapping[str, object]], trace: Mapping[str, object]) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        for index, point_row in enumerate(trace_rows, start=1):
+            row = dict(point_row)
+            row.setdefault("trace_id", str(trace.get("trace_id") or "").strip())
+            row.setdefault("trace_label", str(trace.get("label") or "").strip())
+            row.setdefault("point_index", index)
+            row.setdefault("plot_type", str(trace.get("plot_type") or "").strip())
+            row.setdefault("life_axis", str(trace.get("life_axis") or "").strip())
+            row.setdefault("life_axis_label", str(trace.get("life_axis_label") or "").strip())
+            row.setdefault("x_parameter", str(trace.get("x_parameter") or "").strip())
+            row.setdefault("x_parameter_label", str(trace.get("x_parameter_label") or "").strip())
+            row.setdefault("x_units", str(trace.get("x_units") or "").strip())
+            row.setdefault("y_parameter", str(trace.get("y_parameter") or row.get("parameter_name") or "").strip())
+            row.setdefault("y_parameter_label", str(trace.get("y_parameter_label") or "").strip())
+            row.setdefault("y_units", str(trace.get("y_units") or row.get("units") or "").strip())
+            out.append(row)
+        return out
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    plot_metadata = dict(snapshot.get("plot_metadata") or {}) if isinstance(snapshot.get("plot_metadata"), Mapping) else {}
+    axis_view = dict(snapshot.get("axis_view") or {}) if isinstance(snapshot.get("axis_view"), Mapping) else {}
+    traces_raw = [dict(trace) for trace in (snapshot.get("traces") or []) if isinstance(trace, Mapping)]
+    if not traces_raw:
+        raise RuntimeError("Life Metrics plot snapshot has no trace data to export.")
+
+    visible_ids = [str(value).strip() for value in (snapshot.get("visible_trace_ids") or []) if str(value).strip()]
+    visible_set = set(visible_ids)
+    traces = [trace for trace in traces_raw if not visible_set or str(trace.get("trace_id") or "").strip() in visible_set]
+    if not traces:
+        traces = list(traces_raw)
+    exported_trace_ids = {str(trace.get("trace_id") or "").strip() for trace in traces if str(trace.get("trace_id") or "").strip()}
+
+    snapshot_rows_raw = [dict(row) for row in (snapshot.get("rows") or []) if isinstance(row, Mapping)]
+    snapshot_rows = [
+        row
+        for row in snapshot_rows_raw
+        if str(row.get("trace_id") or "").strip() in exported_trace_ids
+    ]
+    if not snapshot_rows:
+        for trace in traces:
+            trace_rows = [dict(row) for row in (trace.get("rows") or []) if isinstance(row, Mapping)]
+            snapshot_rows.extend(_flatten_trace_rows(trace_rows, trace))
+
+    plot_title = str(plot_metadata.get("plot_title") or "").strip() or "Life Metrics Plot Snapshot"
+    x_label = str(plot_metadata.get("x_label") or "").strip()
+    y_label = str(plot_metadata.get("y_label") or "").strip()
+    x_limits = _finite_pair(axis_view.get("x_limits"))
+    y_limits = _finite_pair(axis_view.get("y_limits"))
+
+    _td_emit_progress(progress_cb, "Building Life Metrics Excel workbook")
+    wb = Workbook()
+    ws_plot = wb.active
+    if ws_plot is None:
+        ws_plot = wb.create_sheet("Plot")
+    ws_plot.title = "Plot"
+    ws_data = wb.create_sheet("Plot_Data")
+    ws_rows = wb.create_sheet("Plot_Rows")
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    metadata_rows: list[tuple[str, object]] = [
+        ("Export Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("Plot Title", plot_title),
+        ("Plot Type", _text(plot_metadata.get("plot_type"))),
+        ("X Axis Label", x_label),
+        ("Y Axis Label", y_label),
+        ("Selected Stats", _text(plot_metadata.get("stats") or [])),
+        ("Selected Condition IDs", _text(plot_metadata.get("selection_ids") or [])),
+        ("Selected Condition Labels", _text(plot_metadata.get("selection_labels") or [])),
+        ("Selected Run Conditions", _text(plot_metadata.get("run_conditions") or [])),
+        ("Member Runs", _text(plot_metadata.get("member_runs") or [])),
+        ("Member Sequences", _text(plot_metadata.get("member_sequences") or [])),
+        ("Active Serials", _text(plot_metadata.get("active_serials") or [])),
+        ("Active Global Filters", _text(plot_metadata.get("global_filters") or {})),
+        ("Visible Trace Count", len(traces)),
+        ("Snapshot Trace Count", len(traces_raw)),
+        ("X Limits", _text(list(x_limits) if x_limits is not None else "")),
+        ("Y Limits", _text(list(y_limits) if y_limits is not None else "")),
+    ]
+    for row_idx, (label, value) in enumerate(metadata_rows, start=1):
+        ws_plot.cell(row_idx, 1).value = label
+        ws_plot.cell(row_idx, 2).value = value
+        ws_plot.cell(row_idx, 1).font = header_font
+        ws_plot.cell(row_idx, 1).fill = header_fill
+        ws_plot.cell(row_idx, 1).alignment = Alignment(horizontal="left")
+    ws_plot.column_dimensions["A"].width = 28
+    ws_plot.column_dimensions["B"].width = 42
+
+    _td_emit_progress(progress_cb, "Writing chart-oriented plot data")
+    chart = ScatterChart()
+    chart.scatterStyle = "lineMarker"
+    chart.title = plot_title
+    chart.x_axis.title = x_label
+    chart.y_axis.title = y_label
+    chart.height = 10
+    chart.width = 20
+    if x_limits is not None and x_limits[0] != x_limits[1]:
+        chart.x_axis.scaling.min = x_limits[0]
+        chart.x_axis.scaling.max = x_limits[1]
+    if y_limits is not None and y_limits[0] != y_limits[1]:
+        chart.y_axis.scaling.min = y_limits[0]
+        chart.y_axis.scaling.max = y_limits[1]
+
+    for trace_index, trace in enumerate(traces, start=1):
+        x_col = (trace_index - 1) * 2 + 1
+        y_col = x_col + 1
+        label = str(trace.get("label") or trace.get("trace_id") or f"Trace {trace_index}").strip()
+        x_values = [float(value) for value in (trace.get("x_values") or []) if isinstance(value, (int, float)) and math.isfinite(float(value))]
+        y_values = [float(value) for value in (trace.get("y_values") or []) if isinstance(value, (int, float)) and math.isfinite(float(value))]
+        point_count = min(len(x_values), len(y_values))
+        ws_data.cell(1, x_col).value = f"{label} X"
+        ws_data.cell(1, y_col).value = label
+        ws_data.cell(1, x_col).font = header_font
+        ws_data.cell(1, y_col).font = header_font
+        ws_data.cell(1, x_col).fill = header_fill
+        ws_data.cell(1, y_col).fill = header_fill
+        for point_idx in range(point_count):
+            ws_data.cell(point_idx + 2, x_col).value = x_values[point_idx]
+            ws_data.cell(point_idx + 2, y_col).value = y_values[point_idx]
+        ws_data.column_dimensions[get_column_letter(x_col)].width = max(14, min(36, len(label) + 6))
+        ws_data.column_dimensions[get_column_letter(y_col)].width = max(18, min(40, len(label) + 2))
+        if point_count > 0:
+            x_ref = Reference(ws_data, min_col=x_col, min_row=2, max_row=point_count + 1)
+            y_ref = Reference(ws_data, min_col=y_col, min_row=1, max_row=point_count + 1)
+            chart.series.append(Series(y_ref, x_ref, title_from_data=True))
+    ws_data.freeze_panes = "A2"
+    ws_plot.add_chart(chart, "D2")
+
+    _td_emit_progress(progress_cb, "Writing exact plotted point rows")
+    fixed_headers = [
+        "trace_id",
+        "trace_label",
+        "point_index",
+        "plot_type",
+        "stat",
+        "life_axis",
+        "life_axis_label",
+        "x_parameter",
+        "x_parameter_label",
+        "x_units",
+        "x_value",
+        "y_parameter",
+        "y_parameter_label",
+        "y_units",
+        "y_value",
+        "parameter_name",
+        "units",
+        "value_num",
+        "observation_id",
+        "serial",
+        "sequence_index",
+        "sequence_label",
+        "condition_key",
+        "condition_display",
+        "program_title",
+        "source_run_name",
+        "asset_type",
+        "asset_specific_type",
+        "run_type",
+        "control_period",
+        "suppression_voltage",
+        "valve_voltage",
+        "diagnostics",
+        "sequence_pulses",
+        "cumulative_pulses",
+        "sequence_on_time",
+        "cumulative_on_time",
+        "sequence_elapsed_time",
+        "cumulative_elapsed_time",
+        "sequence_throughput",
+        "cumulative_throughput",
+        "sequence_impulse",
+        "cumulative_impulse",
+    ]
+    extra_headers = sorted(
+        {
+            str(key).strip()
+            for row in snapshot_rows
+            for key in row.keys()
+            if str(key).strip() and str(key).strip() not in set(fixed_headers)
+        },
+        key=str.casefold,
+    )
+    row_headers = fixed_headers + extra_headers
+    for col_idx, header in enumerate(row_headers, start=1):
+        ws_rows.cell(1, col_idx).value = header
+        ws_rows.cell(1, col_idx).font = header_font
+        ws_rows.cell(1, col_idx).fill = header_fill
+        ws_rows.cell(1, col_idx).alignment = Alignment(horizontal="center")
+        ws_rows.column_dimensions[get_column_letter(col_idx)].width = 18 if len(header) < 18 else min(36, len(header) + 2)
+    ws_rows.freeze_panes = "A2"
+
+    for row_idx, row in enumerate(snapshot_rows, start=2):
+        for col_idx, header in enumerate(row_headers, start=1):
+            value = row.get(header)
+            if isinstance(value, Mapping):
+                try:
+                    value = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, default=str)
+                except Exception:
+                    value = str(dict(value))
+            elif isinstance(value, (list, tuple, set)):
+                try:
+                    value = json.dumps(list(value), ensure_ascii=False, default=str)
+                except Exception:
+                    value = ", ".join(str(item) for item in value)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                numeric = float(value)
+                value = numeric if math.isfinite(numeric) else ""
+            ws_rows.cell(row_idx, col_idx).value = value
+
+    try:
+        _td_emit_progress(progress_cb, "Saving Excel workbook")
+        wb.save(str(path))
+    except PermissionError as exc:
+        raise RuntimeError(f"Workbook is not writable (close it in Excel first): {path}") from exc
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    _td_emit_progress(progress_cb, f"Excel export ready: {path.name}")
+    return path
+
+
 def _td_smart_solver_export_variables_from_result(result: Mapping[str, object]) -> list[dict[str, object]]:
     raw_variables = result.get("solver_variables") if isinstance(result, Mapping) else None
     variables: list[dict[str, object]] = []

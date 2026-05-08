@@ -737,6 +737,55 @@ class TestProjectTaskWorker(unittest.TestCase):
             self.assertEqual(dummy.opened, [out_path])
             self.assertIn("Export Saved Performance Equations to Excel complete", result)
 
+    def test_start_life_metrics_excel_snapshot_export_uses_project_task(self) -> None:
+        class _DummyExportWindow:
+            def __init__(self) -> None:
+                self._db_path = Path("C:/temp/cache.sqlite3")
+                self._project_dir = Path("C:/temp/project")
+                self.started: dict[str, object] | None = None
+                self.opened: list[Path] = []
+
+            def _start_perf_export_task(self, **kwargs) -> None:
+                self.started = dict(kwargs)
+
+            def _open_spreadsheet_path(self, file_path: Path) -> None:
+                self.opened.append(Path(file_path))
+
+            def _handle_perf_excel_export_success(self, payload: object, *, heading: str) -> str:
+                return TestDataTrendDialog._handle_perf_excel_export_success(self, payload, heading=heading)
+
+        dummy = _DummyExportWindow()
+        out_path = Path("C:/temp/life_metrics_plot_snapshot.xlsx")
+        snapshot = {
+            "plot_metadata": {"plot_title": "Life Plot", "plot_type": "life_axis"},
+            "axis_view": {"x_limits": [0.0, 1.0], "y_limits": [0.0, 2.0]},
+            "visible_trace_ids": ["trace-1"],
+            "traces": [{"trace_id": "trace-1", "label": "Trace 1", "x_values": [1.0], "y_values": [2.0], "rows": []}],
+            "rows": [],
+        }
+
+        with patch("ui_next.qt_main.be.td_export_life_metrics_snapshot_workbook", return_value=out_path) as export_mock:
+            TestDataTrendDialog._start_life_metrics_excel_snapshot_export(dummy, out_path, snapshot=snapshot)
+
+            self.assertIsNotNone(dummy.started)
+            task_factory = dummy.started["task_factory"]
+            on_success = dummy.started["on_success"]
+            self.assertEqual(dummy.started["heading"], "Export Plot to Excel")
+            self.assertEqual(dummy.started["status_text"], "Exporting Life Metrics snapshot to life_metrics_plot_snapshot.xlsx")
+
+            progress_messages: list[str] = []
+            payload = task_factory(progress_messages.append)
+            export_mock.assert_called_once()
+            self.assertEqual(export_mock.call_args.args[0], out_path)
+            self.assertEqual(export_mock.call_args.kwargs["snapshot"]["plot_metadata"]["plot_title"], "Life Plot")
+            export_mock.call_args.kwargs["progress_cb"]("step one")
+            self.assertEqual(progress_messages, ["step one"])
+            self.assertEqual(payload, out_path)
+
+            result = on_success(payload)
+            self.assertEqual(dummy.opened, [out_path])
+            self.assertIn("Export Plot to Excel complete", result)
+
     def test_start_smart_solver_equation_matlab_export_uses_project_task(self) -> None:
         class _DummyExportWindow:
             def __init__(self) -> None:

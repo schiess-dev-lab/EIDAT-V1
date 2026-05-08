@@ -3514,7 +3514,10 @@ _TAR_COMPARISON_METRIC_ROWS = (
     "Deviation Score",
     "Official Grade",
     "Grade Basis",
+    "Metric Chart",
+    "Plot Curves",
 )
+_TAR_COMPARISON_CHART_ROW_LABELS = ("Metric Chart", "Plot Curves")
 _TAR_COMPARISON_PAGE_WIDTH = 17.0 * 72.0
 _TAR_COMPARISON_PAGE_HEIGHT = 11.0 * 72.0
 _TAR_COMPARISON_LEFT_MARGIN = 24.0
@@ -3746,7 +3749,98 @@ def _tar_prepass_cohort_note(row: Mapping[str, object] | None) -> str:
     return "\n".join(parts)
 
 
-def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_label: str) -> str:
+def _tar_plot_spec_pair_ids(plot_spec: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(plot_spec, Mapping):
+        return []
+    return _tar_unique_text_values(
+        [plot_spec.get("pair_id")] + list(plot_spec.get("member_pair_ids") or [])
+    )
+
+
+def _tar_run_condition_metric_destinations(
+    plot_navigation: list[Mapping[str, Any]] | None,
+) -> dict[str, int]:
+    fallback: dict[str, int] = {}
+    preferred: dict[str, int] = {}
+    for entry in plot_navigation or []:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("section_key") or entry.get("section") or "").strip() != "run_condition_plot_metrics":
+            continue
+        try:
+            destination_page_index = int(entry.get("destination_page_index"))
+        except Exception:
+            continue
+        pair_ids = _tar_plot_spec_pair_ids(entry)
+        if not pair_ids:
+            continue
+        is_mean = str(entry.get("stat") or "").strip().lower() == "mean"
+        for pair_id in pair_ids:
+            if pair_id not in fallback:
+                fallback[pair_id] = destination_page_index
+            if is_mean and pair_id not in preferred:
+                preferred[pair_id] = destination_page_index
+    return {**fallback, **preferred}
+
+
+def _tar_run_condition_curve_destinations(
+    plot_navigation: list[Mapping[str, Any]] | None,
+) -> dict[str, int]:
+    destinations: dict[str, int] = {}
+    for entry in plot_navigation or []:
+        if not isinstance(entry, Mapping):
+            continue
+        if str(entry.get("section_key") or entry.get("section") or "").strip() != "run_condition_curve_overlays":
+            continue
+        try:
+            destination_page_index = int(entry.get("destination_page_index"))
+        except Exception:
+            continue
+        for pair_id in _tar_plot_spec_pair_ids(entry):
+            if pair_id and pair_id not in destinations:
+                destinations[pair_id] = destination_page_index
+    return destinations
+
+
+def _tar_comparison_chart_destinations(
+    plot_navigation: list[Mapping[str, Any]] | None,
+) -> dict[str, dict[str, int]]:
+    return {
+        "metric_by_pair_id": _tar_run_condition_metric_destinations(plot_navigation),
+        "curve_by_pair_id": _tar_run_condition_curve_destinations(plot_navigation),
+    }
+
+
+def _tar_comparison_chart_destination(
+    row: Mapping[str, object] | None,
+    metric_label: str,
+    *,
+    chart_destinations: Mapping[str, Mapping[str, int]] | None = None,
+) -> int | None:
+    if not isinstance(row, Mapping):
+        return None
+    pair_id = str(row.get("pair_id") or "").strip()
+    if not pair_id:
+        return None
+    destinations = dict(chart_destinations or {})
+    if metric_label == "Metric Chart":
+        dest_map = destinations.get("metric_by_pair_id") or {}
+    elif metric_label == "Plot Curves":
+        dest_map = destinations.get("curve_by_pair_id") or {}
+    else:
+        return None
+    try:
+        return int(dest_map.get(pair_id)) if pair_id in dest_map else None
+    except Exception:
+        return None
+
+
+def _tar_comparison_page_metric_value(
+    row: Mapping[str, object] | None,
+    metric_label: str,
+    *,
+    chart_destinations: Mapping[str, Mapping[str, int]] | None = None,
+) -> str:
     if not isinstance(row, Mapping):
         return ""
 
@@ -3757,6 +3851,17 @@ def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_l
                 return value
         return None
 
+    if metric_label in _TAR_COMPARISON_CHART_ROW_LABELS:
+        return (
+            str(metric_label)
+            if _tar_comparison_chart_destination(
+                row,
+                metric_label,
+                chart_destinations=chart_destinations,
+            )
+            is not None
+            else ""
+        )
     if metric_label == "Initial Status":
         return _tar_initial_status_display(row)
     if metric_label == "Graded Mean":
@@ -3782,9 +3887,12 @@ def _tar_comparison_page_metric_value(row: Mapping[str, object] | None, metric_l
     return ""
 
 
-def _tar_build_comparison_page_matrix(page_spec: Mapping[str, object]) -> tuple[list[list[str]], list[tuple]]:
+def _tar_build_comparison_page_matrix_details(
+    page_spec: Mapping[str, object],
+) -> tuple[list[list[str]], list[tuple], dict[tuple[int, int], dict[str, Any]]]:
     param_names = [str(name or "").strip() for name in (page_spec.get("param_names") or []) if str(name or "").strip()]
     param_units = dict(page_spec.get("param_units") or {})
+    chart_destinations = dict(page_spec.get("comparison_chart_destinations") or {})
     rows: list[list[str]] = [
         ["Run Condition", "Sequence(s)", "Metric", *param_names],
         ["", "", "", *[str(param_units.get(name) or "") for name in param_names]],
@@ -3794,6 +3902,7 @@ def _tar_build_comparison_page_matrix(page_spec: Mapping[str, object]) -> tuple[
         ("SPAN", (1, 0), (1, 1)),
         ("SPAN", (2, 0), (2, 1)),
     ]
+    link_cells: dict[tuple[int, int], dict[str, Any]] = {}
     blocks = list(page_spec.get("blocks") or [])
     for block_index, raw_block in enumerate(blocks):
         block = dict(raw_block or {})
@@ -3801,13 +3910,38 @@ def _tar_build_comparison_page_matrix(page_spec: Mapping[str, object]) -> tuple[
         by_parameter = dict(block.get("rows_by_parameter") or {})
         sample_row = next((dict(value) for value in by_parameter.values() if isinstance(value, Mapping)), {})
         for metric_index, metric_label in enumerate(_TAR_COMPARISON_METRIC_ROWS):
+            matrix_row_index = len(rows)
             row_values = [
                 _tar_run_condition_bullet_text(sample_row or block) if metric_index == 0 else "",
                 _tar_sequence_bullet_text(sample_row or block) if metric_index == 0 else "",
                 metric_label,
             ]
-            for param_name in param_names:
-                row_values.append(_tar_comparison_page_metric_value(by_parameter.get(param_name), metric_label))
+            for param_offset, param_name in enumerate(param_names):
+                data_row = by_parameter.get(param_name)
+                cell_text = _tar_comparison_page_metric_value(
+                    data_row,
+                    metric_label,
+                    chart_destinations=chart_destinations,
+                )
+                row_values.append(cell_text)
+                if (
+                    metric_label in _TAR_COMPARISON_CHART_ROW_LABELS
+                    and cell_text
+                    and isinstance(data_row, Mapping)
+                ):
+                    destination_page_index = _tar_comparison_chart_destination(
+                        data_row,
+                        metric_label,
+                        chart_destinations=chart_destinations,
+                    )
+                    if destination_page_index is not None:
+                        link_cells[(matrix_row_index, 3 + param_offset)] = {
+                            "link_label": cell_text,
+                            "metric_label": metric_label,
+                            "pair_id": str(data_row.get("pair_id") or "").strip(),
+                            "parameter": str(data_row.get("parameter") or param_name).strip(),
+                            "destination_page_index": int(destination_page_index),
+                        }
             rows.append(row_values)
         style_cmds.extend(
             [
@@ -3823,6 +3957,11 @@ def _tar_build_comparison_page_matrix(page_spec: Mapping[str, object]) -> tuple[
             if isinstance(data_row, Mapping) and bool(data_row.get("regrade_applied")):
                 col_index = 3 + param_offset
                 style_cmds.append(("BACKGROUND", (col_index, start_row), (col_index, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), "#fef3c7"))
+    return rows, style_cmds, link_cells
+
+
+def _tar_build_comparison_page_matrix(page_spec: Mapping[str, object]) -> tuple[list[list[str]], list[tuple]]:
+    rows, style_cmds, _ = _tar_build_comparison_page_matrix_details(page_spec)
     return rows, style_cmds
 
 
@@ -3837,7 +3976,7 @@ def _tar_build_comparison_table_flowable(page_spec: Mapping[str, object], *, rl:
     font_size = int(page_spec.get("font_size") or 8)
     pad = 4 if font_size >= 9 else 3
     leading = font_size + 2
-    rows, extra_style_commands = _tar_build_comparison_page_matrix(page_spec)
+    rows, extra_style_commands, link_cells = _tar_build_comparison_page_matrix_details(page_spec)
 
     header_left_style = ParagraphStyle(
         f"EdatComparisonHeaderLeft{font_size}",
@@ -3889,6 +4028,16 @@ def _tar_build_comparison_table_flowable(page_spec: Mapping[str, object], *, rl:
         textColor="#0f172a",
         spaceAfter=0,
     )
+    body_link_style = ParagraphStyle(
+        f"EdatComparisonBodyLink{font_size}",
+        parent=styles["BodyText"],
+        fontName="Helvetica-Bold",
+        fontSize=font_size,
+        leading=leading,
+        alignment=TA_CENTER,
+        textColor="#1d4ed8",
+        spaceAfter=0,
+    )
     metric_style = ParagraphStyle(
         f"EdatComparisonMetric{font_size}",
         parent=styles["BodyText"],
@@ -3910,6 +4059,8 @@ def _tar_build_comparison_table_flowable(page_spec: Mapping[str, object], *, rl:
                 style = header_left_style if col_index < 3 else units_style
             elif col_index == 2:
                 style = metric_style
+            elif (row_index, col_index) in link_cells:
+                style = body_link_style
             elif col_index >= 3:
                 style = body_center_style
             else:
@@ -4058,9 +4209,12 @@ def _tar_build_comparison_story(ctx: Mapping[str, Any]) -> list[Any]:
     page_specs = [dict(page) for page in (ctx.get("comparison_page_specs") or _tar_plan_comparison_pages(ctx)) if isinstance(page, Mapping)]
     if not page_specs:
         return []
+    chart_destinations = _tar_comparison_chart_destinations(list(ctx.get("plot_navigation") or []))
 
     story: list[Any] = []
     for page_index, page_spec in enumerate(page_specs):
+        page_spec = dict(page_spec)
+        page_spec["comparison_chart_destinations"] = chart_destinations
         serial = str(page_spec.get("serial") or "").strip() or "(unknown)"
         title = f"Run Comparison - {_tar_display_serial(ctx, serial) or serial}"
         if bool(page_spec.get("continued")):
@@ -4083,6 +4237,54 @@ def _tar_build_comparison_story(ctx: Mapping[str, Any]) -> list[Any]:
         if page_index != len(page_specs) - 1:
             story.append(PageBreak())
     return story
+
+
+def _tar_build_comparison_chart_links(
+    ctx: Mapping[str, Any],
+    *,
+    comparison_page_index_offset: int,
+) -> list[dict[str, Any]]:
+    page_specs = [dict(page) for page in (ctx.get("comparison_page_specs") or _tar_plan_comparison_pages(ctx)) if isinstance(page, Mapping)]
+    if not page_specs:
+        return []
+    chart_destinations = _tar_comparison_chart_destinations(list(ctx.get("plot_navigation") or []))
+    if not any(chart_destinations.get(key) for key in ("metric_by_pair_id", "curve_by_pair_id")):
+        return []
+
+    links: list[dict[str, Any]] = []
+    for raw_page_spec in page_specs:
+        page_spec = dict(raw_page_spec)
+        report_page_index = int(page_spec.get("report_page_index") or 0)
+        if report_page_index <= 0:
+            continue
+        page_spec["comparison_chart_destinations"] = chart_destinations
+        matrix_rows, _, link_cells = _tar_build_comparison_page_matrix_details(page_spec)
+        if not link_cells:
+            continue
+        source_page_index = max(0, int(comparison_page_index_offset) + report_page_index - 1)
+        text_occurrences: dict[str, int] = {}
+        for row_index, row in enumerate(matrix_rows):
+            for col_index, value in enumerate(row):
+                text = str(value or "").strip()
+                if not text:
+                    continue
+                occurrence_index = int(text_occurrences.get(text, 0))
+                text_occurrences[text] = occurrence_index + 1
+                cell_meta = link_cells.get((row_index, col_index))
+                if not cell_meta:
+                    continue
+                links.append(
+                    {
+                        "source_page_index": source_page_index,
+                        "link_label": text,
+                        "occurrence_index": occurrence_index,
+                        "destination_page_index": int(cell_meta.get("destination_page_index")),
+                        "metric_label": str(cell_meta.get("metric_label") or "").strip(),
+                        "pair_id": str(cell_meta.get("pair_id") or "").strip(),
+                        "parameter": str(cell_meta.get("parameter") or "").strip(),
+                    }
+                )
+    return links
 
 
 def _render_tabloid_landscape_story_pdf(
@@ -4140,7 +4342,7 @@ def _merge_report_pdfs(output_pdf: Path, parts: list[Path]) -> None:
         merged.close()
 
 
-_TAR_PLOT_TOC_BACKLINK_TEXT = "Back to Plot TOC"
+_TAR_PLOT_BACKLINK_TEXT = "Back to Run Comparison"
 
 
 def _apply_plot_page_header(
@@ -4151,7 +4353,7 @@ def _apply_plot_page_header(
     section_title: str,
     section_subtitle: str = "",
     plot_context_lines: Sequence[str] | None = None,
-    show_plot_toc_backlink: bool = True,
+    show_plot_backlink: bool = True,
 ) -> None:
     from matplotlib.patches import Rectangle  # type: ignore
 
@@ -4196,11 +4398,11 @@ def _apply_plot_page_header(
                 "linewidth": 1.0,
             },
         )
-    if show_plot_toc_backlink:
+    if show_plot_backlink:
         fig.text(
             0.96,
             title_y,
-            _TAR_PLOT_TOC_BACKLINK_TEXT,
+            _TAR_PLOT_BACKLINK_TEXT,
             color="#1d4ed8",
             fontsize=9.5,
             fontweight="bold",
@@ -4218,7 +4420,7 @@ def _create_landscape_plot_page(
     section_title: str,
     section_subtitle: str = "",
     plot_context_lines: Sequence[str] | None = None,
-    show_plot_toc_backlink: bool = True,
+    show_plot_backlink: bool = True,
 ) -> tuple[Any, Any]:
     import matplotlib.pyplot as plt  # type: ignore
 
@@ -4230,7 +4432,7 @@ def _create_landscape_plot_page(
         section_title=section_title,
         section_subtitle=section_subtitle,
         plot_context_lines=plot_context_lines,
-        show_plot_toc_backlink=show_plot_toc_backlink,
+        show_plot_backlink=show_plot_backlink,
     )
     ax = fig.add_axes([0.06, 0.09, 0.90, 0.73])
     return fig, ax
@@ -8351,6 +8553,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
+                "member_pair_ids": [str(pair_id or "").strip() for pair_id in (cohort_spec.get("member_pair_ids") or []) if str(pair_id or "").strip()],
                 "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
                 "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
                 "page_number": page_number,
@@ -8371,6 +8574,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
+                "member_pair_ids": [str(pair_id or "").strip() for pair_id in (cohort_spec.get("member_pair_ids") or []) if str(pair_id or "").strip()],
                 "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
                 "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
                 "page_number": page_number,
@@ -8399,6 +8603,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
+                "member_pair_ids": [str(pair_id or "").strip() for pair_id in (cohort_spec.get("member_pair_ids") or []) if str(pair_id or "").strip()],
                 "suppression_voltage_label": suppression_value,
                 "valve_voltage_label": valve_value,
                 "page_number": page_number,
@@ -8419,6 +8624,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
+                "member_pair_ids": [str(pair_id or "").strip() for pair_id in (cohort_spec.get("member_pair_ids") or []) if str(pair_id or "").strip()],
                 "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
                 "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
                 "page_number": page_number,
@@ -8736,18 +8942,19 @@ def _tar_apply_pdf_navigation(
     output_pdf: Path,
     *,
     plot_navigation: list[dict] | None,
-    plot_toc_layout: list[dict] | None,
+    comparison_chart_links: list[dict] | None = None,
+    comparison_section_start_page_index: int | None = None,
     exception_chart_links: list[dict] | None = None,
 ) -> None:
     try:
         import fitz  # type: ignore
     except Exception as exc:
-        raise RuntimeError("PyMuPDF is required to add plot table-of-contents navigation.") from exc
+        raise RuntimeError("PyMuPDF is required to add plot navigation.") from exc
 
     nav_entries = [dict(entry) for entry in (plot_navigation or []) if isinstance(entry, Mapping)]
-    toc_layout = [dict(page) for page in (plot_toc_layout or []) if isinstance(page, Mapping)]
+    comparison_links = [dict(entry) for entry in (comparison_chart_links or []) if isinstance(entry, Mapping)]
     chart_links = [dict(entry) for entry in (exception_chart_links or []) if isinstance(entry, Mapping)]
-    if not (nav_entries or toc_layout or chart_links):
+    if not (nav_entries or comparison_links or chart_links):
         return
 
     doc = fitz.open(str(Path(output_pdf).expanduser()))
@@ -8801,78 +9008,16 @@ def _tar_apply_pdf_navigation(
                 except Exception:
                     pass
 
-        resolved_toc_layout = _tar_resolve_plot_toc_page_numbers(doc, toc_layout)
-        toc_target_page_index: int | None = None
-        if resolved_toc_layout:
-            toc_target_page_number = int(
-                resolved_toc_layout[0].get("resolved_toc_page_number")
-                or resolved_toc_layout[0].get("toc_page_number")
-                or 0
-            )
-            if 1 <= toc_target_page_number <= int(doc.page_count or 0):
-                toc_target_page_index = toc_target_page_number - 1
-        for toc_page in resolved_toc_layout:
-            toc_page_number = int(toc_page.get("resolved_toc_page_number") or toc_page.get("toc_page_number") or 0)
-            if toc_page_number <= 0 or toc_page_number > doc.page_count:
-                continue
-            page = doc.load_page(toc_page_number - 1)
-            text_occurrences: dict[str, int] = {}
+        comparison_target_page_index: int | None = None
+        try:
+            if comparison_section_start_page_index is not None:
+                candidate_index = int(comparison_section_start_page_index)
+                if 0 <= candidate_index < int(doc.page_count or 0):
+                    comparison_target_page_index = candidate_index
+        except Exception:
+            comparison_target_page_index = None
 
-            def _valid_toc_destination(value: object) -> int | None:
-                try:
-                    page_index = int(value)
-                except Exception:
-                    return None
-                if page_index < 0 or page_index >= int(doc.page_count or 0):
-                    return None
-                return page_index
-
-            for navigator in (toc_page.get("navigator_sections") or []):
-                label = str(navigator.get("label") or "").strip()
-                if not label:
-                    continue
-                target_page = _valid_toc_destination(navigator.get("target_page_index"))
-                if target_page is None:
-                    continue
-                match_index = int(text_occurrences.get(label, 0))
-                rects = list(page.search_for(label))
-                if match_index >= len(rects):
-                    continue
-                text_occurrences[label] = match_index + 1
-                _tar_insert_page_link(page, rects[match_index], target_page)
-
-            for row in (toc_page.get("rows") or []):
-                label = str(row.get("text") or "").strip()
-                if not label:
-                    continue
-                target_page = _valid_toc_destination(row.get("target_page_index"))
-                if target_page is None:
-                    continue
-                page_text = str(row.get("page_text") or "").strip()
-                page_text_key = f"__page_text__:{page_text}" if page_text else ""
-                page_text_match_index = int(text_occurrences.get(page_text_key, 0)) if page_text_key else 0
-                match_index = int(text_occurrences.get(label, 0))
-                rects = list(page.search_for(label))
-                if match_index < len(rects):
-                    text_occurrences[label] = match_index + 1
-                    if page_text_key:
-                        text_occurrences[page_text_key] = page_text_match_index + 1
-                    label_rect = rects[match_index]
-                    row_rect = _tar_plot_toc_row_link_rect(
-                        page,
-                        label_rect,
-                        row,
-                        fitz_module=fitz,
-                    )
-                    _tar_insert_page_link(page, row_rect, target_page)
-                    continue
-                if page_text:
-                    page_rects = list(page.search_for(page_text))
-                    if page_text_match_index < len(page_rects):
-                        text_occurrences[page_text_key] = page_text_match_index + 1
-                        _tar_insert_page_link(page, page_rects[page_text_match_index], target_page)
-
-        if toc_target_page_index is not None:
+        if comparison_target_page_index is not None:
             linked_plot_pages: set[int] = set()
             for entry in nav_entries:
                 try:
@@ -8883,9 +9028,9 @@ def _tar_apply_pdf_navigation(
                     continue
                 linked_plot_pages.add(page_index)
                 page = doc.load_page(page_index)
-                backlink_rects = list(page.search_for(_TAR_PLOT_TOC_BACKLINK_TEXT))
+                backlink_rects = list(page.search_for(_TAR_PLOT_BACKLINK_TEXT))
                 if backlink_rects:
-                    _tar_insert_page_link(page, backlink_rects[0], toc_target_page_index)
+                    _tar_insert_page_link(page, backlink_rects[0], comparison_target_page_index)
                     continue
                 fallback_rect = fitz.Rect(
                     max(36.0, float(page.rect.width) - 190.0),
@@ -8893,7 +9038,43 @@ def _tar_apply_pdf_navigation(
                     max(36.0, float(page.rect.width) - 36.0),
                     100.0,
                 )
-                _tar_insert_page_link(page, fallback_rect, toc_target_page_index)
+                _tar_insert_page_link(page, fallback_rect, comparison_target_page_index)
+
+        grouped_comparison_links: dict[int, list[dict[str, Any]]] = {}
+        for link in comparison_links:
+            label = str(link.get("link_label") or "").strip()
+            if not label:
+                continue
+            try:
+                source_page_index = int(link.get("source_page_index"))
+                target_page_index = int(link.get("destination_page_index"))
+                occurrence_index = int(link.get("occurrence_index") or 0)
+            except Exception:
+                continue
+            if source_page_index < 0 or source_page_index >= int(doc.page_count or 0):
+                continue
+            if target_page_index < 0 or target_page_index >= int(doc.page_count or 0):
+                continue
+            grouped_comparison_links.setdefault(source_page_index, []).append(
+                {
+                    "link_label": label,
+                    "occurrence_index": occurrence_index,
+                    "destination_page_index": target_page_index,
+                }
+            )
+        for source_page_index, links_for_page in grouped_comparison_links.items():
+            page = doc.load_page(source_page_index)
+            rect_cache: dict[str, list[Any]] = {}
+            for link in sorted(
+                links_for_page,
+                key=lambda item: (str(item.get("link_label") or ""), int(item.get("occurrence_index") or 0)),
+            ):
+                label = str(link.get("link_label") or "").strip()
+                occurrence_index = int(link.get("occurrence_index") or 0)
+                rects = rect_cache.setdefault(label, list(page.search_for(label)))
+                if occurrence_index < 0 or occurrence_index >= len(rects):
+                    continue
+                _tar_insert_page_link(page, rects[occurrence_index], int(link.get("destination_page_index")))
 
         for link in chart_links:
             label = str(link.get("chart_label") or "").strip()
@@ -11419,11 +11600,6 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
 
-    plot_toc_story = _tar_build_plot_toc_story(ctx, styles=styles, rl=rl)
-    if plot_toc_story:
-        story.append(PageBreak())
-        story.extend(plot_toc_story)
-
     if not comparison_rows:
         story.append(PageBreak())
         story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
@@ -11569,7 +11745,7 @@ def _tar_render_metric_cohort_page(
         section_title="" if hide_header_details else str(section_title or "").strip(),
         section_subtitle="",
         plot_context_lines=plot_context_lines,
-        show_plot_toc_backlink=not hide_header_details,
+        show_plot_backlink=not hide_header_details,
     )
     serials = list(ctx.get("all_serials") or [])
     serial_index = {serial: idx for idx, serial in enumerate(serials)}
@@ -11657,6 +11833,7 @@ def _tar_render_metric_cohort_page(
         "run_condition_label": run_condition_label,
         "base_condition_label": str(cohort_spec.get("base_condition_label") or ""),
         "selection_labels": list(cohort_spec.get("selection_labels") or []),
+        "member_pair_ids": [str(pair_id or "").strip() for pair_id in (cohort_spec.get("member_pair_ids") or []) if str(pair_id or "").strip()],
         "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
         "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
         "page_number": page_number,
@@ -11704,7 +11881,7 @@ def _tar_render_curve_cohort_page(
         section_title="" if full_width_layout else str(section_title or "").strip(),
         section_subtitle="",
         plot_context_lines=plot_context_lines,
-        show_plot_toc_backlink=not full_width_layout,
+        show_plot_backlink=not full_width_layout,
     )
     ax_side = None
     if not full_width_layout:
@@ -11788,6 +11965,7 @@ def _tar_render_curve_cohort_page(
         "run_condition_label": run_condition_label,
         "base_condition_label": str(cohort_spec.get("base_condition_label") or ""),
         "selection_labels": list(cohort_spec.get("selection_labels") or []),
+        "member_pair_ids": [str(pair_id or "").strip() for pair_id in (cohort_spec.get("member_pair_ids") or []) if str(pair_id or "").strip()],
         "suppression_voltage_label": str(cohort_spec.get("suppression_voltage_label") or ""),
         "valve_voltage_label": str(cohort_spec.get("valve_voltage_label") or ""),
         "page_number": page_number,
@@ -12782,7 +12960,6 @@ def _tar_prepare_intro_story_with_navigation(
     plot_navigation = _tar_build_plot_navigation(planned_plot_specs)
     ctx["planned_plot_specs"] = planned_plot_specs
     ctx["plot_navigation"] = plot_navigation
-    ctx["plot_toc_layout"] = _tar_paginate_plot_navigation(plot_navigation)
     return _tar_build_intro_story(ctx)
 
 
@@ -12794,25 +12971,9 @@ def _tar_render_stabilized_intro_pdf(
     comparison_page_count: int | None = None,
     progress_cb: Callable[[str], None] | None = None,
 ) -> tuple[int, list[Any]]:
-    guess = 0
-    story: list[Any] = []
-    for attempt in range(6):
-        story = _tar_prepare_intro_story_with_navigation(
-            ctx,
-            intro_pages=guess,
-            plot_specs_override=plot_specs_override,
-            comparison_page_count=comparison_page_count,
-        )
-        if attempt:
-            _tar_emit_progress(progress_cb, f"Re-rendering summary pages to stabilize plot TOC page references ({attempt + 1}/6)")
-        actual_pages = _render_portrait_story_pdf(intro_pdf, story=story, print_ctx=ctx["print_ctx"], page_number_offset=0)
-        if actual_pages == guess:
-            return int(actual_pages), story
-        guess = int(actual_pages)
-
     story = _tar_prepare_intro_story_with_navigation(
         ctx,
-        intro_pages=guess,
+        intro_pages=0,
         plot_specs_override=plot_specs_override,
         comparison_page_count=comparison_page_count,
     )
@@ -12878,7 +13039,7 @@ def generate_test_data_auto_report(
             closing_pdf = tmp_root / "05_closing.pdf"
 
             intro_render_start = time.perf_counter()
-            _tar_emit_progress(progress_cb, "Rendering cover, TOC, and summary pages")
+            _tar_emit_progress(progress_cb, "Rendering cover and summary pages")
             intro_pages, intro_story = _tar_render_stabilized_intro_pdf(intro_pdf, ctx=ctx, progress_cb=progress_cb)
             timings["render_intro_pages_seconds"] = round(time.perf_counter() - intro_render_start, 3)
 
@@ -12907,7 +13068,8 @@ def generate_test_data_auto_report(
             actual_plot_specs = [dict(spec) for spec in (plot_counts.get("plot_specs") or []) if isinstance(spec, Mapping)]
 
             actual_intro_render_start = time.perf_counter()
-            _tar_emit_progress(progress_cb, "Re-rendering cover, TOC, and summary pages from actual plot inventory")
+            _tar_emit_progress(progress_cb, "Re-rendering cover and summary pages from actual plot inventory")
+            prior_intro_pages = int(intro_pages)
             intro_pages, intro_story = _tar_render_stabilized_intro_pdf(
                 intro_pdf,
                 ctx=ctx,
@@ -12918,9 +13080,11 @@ def generate_test_data_auto_report(
             timings["render_actual_intro_pages_seconds"] = round(time.perf_counter() - actual_intro_render_start, 3)
 
             comparison_rerender_start = time.perf_counter()
+            comparison_story = _tar_build_comparison_story(ctx)
+            previous_comparison_pages = int(comparison_pages)
             comparison_pages = 0
             if comparison_story:
-                _tar_emit_progress(progress_cb, "Re-rendering run comparison pages with final page offsets")
+                _tar_emit_progress(progress_cb, "Re-rendering run comparison pages from actual plot inventory")
                 comparison_pages = _render_tabloid_landscape_story_pdf(
                     comparison_pdf,
                     story=comparison_story,
@@ -12929,67 +13093,29 @@ def generate_test_data_auto_report(
                 )
             timings["rerender_comparison_pages_seconds"] = round(time.perf_counter() - comparison_rerender_start, 3)
 
-            final_plot_render_start = time.perf_counter()
-            _tar_emit_progress(progress_cb, "Re-rendering plot pages with final TOC page references")
-            plot_counts = _tar_render_plot_sections(
-                ctx,
-                intro_pages=intro_pages + comparison_pages,
-                plots_pdf=plots_pdf,
-                progress_cb=progress_cb,
-            )
-            timings["rerender_plot_pages_seconds"] = round(time.perf_counter() - final_plot_render_start, 3)
-
-            toc_finalize_start = time.perf_counter()
-            toc_stabilized = False
-            for toc_attempt in range(3):
-                final_plot_specs = [dict(spec) for spec in (plot_counts.get("plot_specs") or []) if isinstance(spec, Mapping)]
-                previous_intro_pages = int(intro_pages)
-                _tar_emit_progress(progress_cb, f"Finalizing plot TOC against rendered plot inventory ({toc_attempt + 1}/3)")
-                intro_pages, intro_story = _tar_render_stabilized_intro_pdf(
-                    intro_pdf,
-                    ctx=ctx,
-                    plot_specs_override=final_plot_specs,
-                    comparison_page_count=comparison_pages,
-                    progress_cb=progress_cb,
-                )
-                if int(intro_pages) == previous_intro_pages:
-                    toc_stabilized = True
-                    break
-
-                comparison_pages = 0
-                if comparison_story:
-                    _tar_emit_progress(progress_cb, "Re-rendering run comparison pages after TOC page-count change")
-                    comparison_pages = _render_tabloid_landscape_story_pdf(
-                        comparison_pdf,
-                        story=comparison_story,
-                        print_ctx=ctx["print_ctx"],
-                        page_number_offset=intro_pages,
-                    )
-                _tar_emit_progress(progress_cb, "Re-rendering plot pages after TOC page-count change")
+            if int(intro_pages) != prior_intro_pages or int(comparison_pages) != previous_comparison_pages:
+                final_plot_render_start = time.perf_counter()
+                _tar_emit_progress(progress_cb, "Re-rendering plot pages with final comparison offsets")
                 plot_counts = _tar_render_plot_sections(
                     ctx,
                     intro_pages=intro_pages + comparison_pages,
                     plots_pdf=plots_pdf,
                     progress_cb=progress_cb,
                 )
-            if not toc_stabilized:
-                final_plot_specs = [dict(spec) for spec in (plot_counts.get("plot_specs") or []) if isinstance(spec, Mapping)]
-                _tar_emit_progress(progress_cb, "Final plot TOC stabilization reached attempt limit; rendering latest TOC inventory")
-                intro_pages, intro_story = _tar_render_stabilized_intro_pdf(
-                    intro_pdf,
-                    ctx=ctx,
-                    plot_specs_override=final_plot_specs,
-                    comparison_page_count=comparison_pages,
-                    progress_cb=progress_cb,
-                )
-            timings["finalize_plot_toc_seconds"] = round(time.perf_counter() - toc_finalize_start, 3)
+                timings["rerender_plot_pages_seconds"] = round(time.perf_counter() - final_plot_render_start, 3)
+            else:
+                timings["rerender_plot_pages_seconds"] = 0.0
+
             actual_plot_navigation = _tar_build_plot_navigation(list(plot_counts.get("plot_specs") or []))
             plot_counts = dict(plot_counts)
             plot_counts["plot_specs"] = actual_plot_navigation
             ctx["plot_navigation"] = actual_plot_navigation
-            ctx["plot_toc_layout"] = _tar_paginate_plot_navigation(actual_plot_navigation)
             ctx["comparison_exception_rows"] = _tar_build_exec_exception_rows(ctx)
             ctx["exception_chart_links"] = _tar_build_exception_chart_links(ctx)
+            ctx["comparison_chart_links"] = _tar_build_comparison_chart_links(
+                ctx,
+                comparison_page_index_offset=int(intro_pages),
+            )
 
             equation_render_start = time.perf_counter()
             _tar_emit_progress(progress_cb, "Rendering performance equation pages")
@@ -13003,8 +13129,6 @@ def generate_test_data_auto_report(
             plot_counts["equation_page_count"] = int(equation_pages)
 
             section_order = ["cover"]
-            if ctx.get("plot_navigation"):
-                section_order.append("plot_toc")
             section_order.extend(["executive_summary", "comparison_table"])
             if plot_counts["run_condition_metric_plot_count"]:
                 section_order.append("run_condition_plot_metrics")
@@ -13055,11 +13179,12 @@ def generate_test_data_auto_report(
             _merge_report_pdfs(out_pdf, merge_parts)
             timings["merge_pdf_seconds"] = round(time.perf_counter() - merge_start, 3)
             navigation_start = time.perf_counter()
-            _tar_emit_progress(progress_cb, "Adding plot TOC links and bookmarks")
+            _tar_emit_progress(progress_cb, "Adding comparison links and bookmarks")
             _tar_apply_pdf_navigation(
                 out_pdf,
                 plot_navigation=list(ctx.get("plot_navigation") or []),
-                plot_toc_layout=list(ctx.get("plot_toc_layout") or []),
+                comparison_chart_links=list(ctx.get("comparison_chart_links") or []),
+                comparison_section_start_page_index=(int(intro_pages) if comparison_pages else None),
                 exception_chart_links=list(ctx.get("exception_chart_links") or []),
             )
             timings["apply_pdf_navigation_seconds"] = round(time.perf_counter() - navigation_start, 3)

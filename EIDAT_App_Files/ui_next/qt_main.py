@@ -4669,6 +4669,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._auto_plots: list[dict] = []
         self._auto_plot_global_selection: dict[str, object] = {}
         self._last_plot_def: dict | None = None
+        self._last_life_metrics_excel_snapshot: dict | None = None
         self._pending_legend_highlight_labels: list[str] | None = None
         self._auto_plot_path = self._project_dir / "auto_plots_test_data.json"
         self._plot_base_xlim: tuple[float, float] | None = None
@@ -5122,12 +5123,15 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         life_axis_row_layout.addWidget(self.cb_life_axis, 1)
         life_layout.addWidget(self.life_axis_row)
 
-        life_y_row = QtWidgets.QHBoxLayout()
+        self.life_y_param_row = QtWidgets.QWidget(tab_life)
+        life_y_row = QtWidgets.QHBoxLayout(self.life_y_param_row)
+        life_y_row.setContentsMargins(0, 0, 0, 0)
         life_y_row.addWidget(QtWidgets.QLabel("Y Parameter:"))
         self.cb_life_y_param = QtWidgets.QComboBox(tab_life)
         self.cb_life_y_param.currentIndexChanged.connect(lambda *_: self._on_life_y_parameter_combo_changed())
         life_y_row.addWidget(self.cb_life_y_param, 1)
-        life_layout.addLayout(life_y_row)
+        self.life_y_param_row.hide()
+        life_layout.addWidget(self.life_y_param_row)
 
         self.list_life_y_params = QtWidgets.QListWidget(tab_life)
         self.list_life_y_params.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -5610,6 +5614,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_zone_zoom.setCheckable(True)
         self.btn_add_auto_plot = QtWidgets.QPushButton("Save Current Graph")
         self.btn_save_plot_pdf = QtWidgets.QPushButton("Save Plot PDF")
+        self.btn_export_life_metrics_excel = QtWidgets.QPushButton("Export Plot to Excel")
         self.btn_zoom_out = QtWidgets.QPushButton("Zoom -")
         self.btn_zoom_in = QtWidgets.QPushButton("Zoom +")
         self.btn_zoom_reset = QtWidgets.QPushButton("Reset")
@@ -5618,6 +5623,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_zone_zoom,
             self.btn_add_auto_plot,
             self.btn_save_plot_pdf,
+            self.btn_export_life_metrics_excel,
             self.btn_zoom_out,
             self.btn_zoom_in,
             self.btn_zoom_reset,
@@ -5628,12 +5634,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_zone_zoom.setToolTip("Magnify zones: click-drag a rectangle on the plot to zoom to that area")
         self.btn_add_auto_plot.setToolTip("Save the current plot as an Auto-Graph snapshot in the project folder")
         self.btn_save_plot_pdf.setToolTip("Save the current plot as a PDF")
+        self.btn_export_life_metrics_excel.setToolTip("Export the current Life Metrics plot snapshot to Excel")
         self.btn_zoom_out.setToolTip("Zoom out (mouse wheel also works)")
         self.btn_zoom_in.setToolTip("Zoom in (mouse wheel also works)")
         self.btn_zoom_reset.setToolTip("Reset zoom to the default view")
         self.btn_expand_plot.setToolTip("Open a larger popup for zooming/panning")
         self.btn_add_auto_plot.clicked.connect(self._add_current_plot_to_autoplots)
         self.btn_save_plot_pdf.clicked.connect(self._save_plot_pdf)
+        self.btn_export_life_metrics_excel.clicked.connect(self._export_life_metrics_plot_to_excel)
         self.btn_zoom_out.clicked.connect(lambda: self._zoom_main_plot(1.25))
         self.btn_zoom_in.clicked.connect(lambda: self._zoom_main_plot(0.8))
         self.btn_zoom_reset.clicked.connect(self._reset_main_plot_zoom)
@@ -5650,6 +5658,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         plot_header.addWidget(self.btn_zone_zoom)
         plot_header.addWidget(self.btn_add_auto_plot)
         plot_header.addWidget(self.btn_save_plot_pdf)
+        plot_header.addWidget(self.btn_export_life_metrics_excel)
         plot_header.addWidget(self.btn_zoom_out)
         plot_header.addWidget(self.btn_zoom_in)
         plot_header.addWidget(self.btn_zoom_reset)
@@ -6794,6 +6803,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         list_widget = getattr(self, "list_life_y_params", None)
         if isinstance(list_widget, QtWidgets.QListWidget):
             self._set_list_widget_selection_by_value(list_widget, selected)
+            selected = self._selected_list_widget_values(list_widget)
         if hasattr(self, "cb_life_y_param"):
             self.cb_life_y_param.blockSignals(True)
             try:
@@ -7707,6 +7717,123 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             ),
         }
 
+    def _clear_life_metrics_excel_snapshot(self) -> None:
+        self._last_life_metrics_excel_snapshot = None
+        if hasattr(self, "_sync_life_metrics_excel_export_action"):
+            self._sync_life_metrics_excel_export_action()
+
+    def _life_metrics_trace_id(
+        self,
+        *,
+        plot_type: str,
+        stat: str,
+        serial: str,
+        parameter: str,
+        x_parameter: str = "",
+        life_axis: str = "",
+    ) -> str:
+        parts = [
+            str(plot_type or "").strip().lower(),
+            str(stat or "").strip().lower(),
+            str(serial or "").strip().lower(),
+            str(parameter or "").strip().lower(),
+            str(x_parameter or "").strip().lower(),
+            str(life_axis or "").strip().lower(),
+        ]
+        return "|".join(part if part else "-" for part in parts)
+
+    def _register_plot_trace_artist(self, artist: object, trace_id: str) -> None:
+        if not artist or not trace_id:
+            return
+        try:
+            setattr(artist, "_td_trace_id", str(trace_id))
+        except Exception:
+            pass
+        try:
+            artist.set_gid(str(trace_id))
+        except Exception:
+            pass
+
+    def _current_plot_axis_view(self) -> dict[str, list[float] | None]:
+        out: dict[str, list[float] | None] = {"x_limits": None, "y_limits": None}
+        axes = getattr(self, "_axes", None)
+        if axes is None:
+            return out
+        if str(getattr(axes, "name", "") or "").strip().lower() == "3d":
+            return out
+        try:
+            x_limits = [float(value) for value in axes.get_xlim()]
+            if len(x_limits) == 2 and all(math.isfinite(value) for value in x_limits):
+                out["x_limits"] = [x_limits[0], x_limits[1]]
+        except Exception:
+            pass
+        try:
+            y_limits = [float(value) for value in axes.get_ylim()]
+            if len(y_limits) == 2 and all(math.isfinite(value) for value in y_limits):
+                out["y_limits"] = [y_limits[0], y_limits[1]]
+        except Exception:
+            pass
+        return out
+
+    def _current_life_metrics_visible_trace_ids(self, *, trace_ids: Sequence[object] | None = None) -> list[str]:
+        fallback = [str(value).strip() for value in (trace_ids or []) if str(value).strip()]
+        axes = getattr(self, "_axes", None)
+        artists = list(getattr(axes, "lines", []) or []) if axes is not None else []
+        visible: list[str] = []
+        seen: set[str] = set()
+        for artist in artists:
+            trace_id = str(getattr(artist, "_td_trace_id", "") or "").strip()
+            if not trace_id:
+                try:
+                    trace_id = str(artist.get_gid() or "").strip()
+                except Exception:
+                    trace_id = ""
+            if not trace_id or trace_id in seen:
+                continue
+            is_visible = True
+            try:
+                is_visible = bool(artist.get_visible())
+            except Exception:
+                is_visible = True
+            if is_visible:
+                visible.append(trace_id)
+                seen.add(trace_id)
+        return visible or fallback
+
+    def _refresh_life_metrics_excel_snapshot_live_state(self) -> dict | None:
+        snapshot = getattr(self, "_last_life_metrics_excel_snapshot", None)
+        if not isinstance(snapshot, dict):
+            self._sync_life_metrics_excel_export_action()
+            return None
+        trace_ids = [
+            str((trace or {}).get("trace_id") or "").strip()
+            for trace in (snapshot.get("traces") or [])
+            if isinstance(trace, Mapping) and str((trace or {}).get("trace_id") or "").strip()
+        ]
+        snapshot["axis_view"] = self._current_plot_axis_view()
+        snapshot["visible_trace_ids"] = self._current_life_metrics_visible_trace_ids(trace_ids=trace_ids)
+        self._sync_life_metrics_excel_export_action()
+        return snapshot
+
+    def _sync_life_metrics_excel_export_action(self) -> None:
+        button = getattr(self, "btn_export_life_metrics_excel", None)
+        if button is None:
+            return
+        export_busy = bool(getattr(self, "_export_worker", None) and self._export_worker.isRunning())
+        plot_def = dict(getattr(self, "_last_plot_def", {}) or {})
+        plot_mode = str(plot_def.get("mode") or "").strip().lower()
+        snapshot = getattr(self, "_last_life_metrics_excel_snapshot", None)
+        snapshot_ready = isinstance(snapshot, dict) and bool(snapshot.get("traces"))
+        button.setEnabled(
+            bool(
+                self._plot_ready
+                and getattr(self, "_db_path", None)
+                and plot_mode == "life_metrics"
+                and snapshot_ready
+                and not export_busy
+            )
+        )
+
     def _normalize_auto_plot_filter_state(
         self,
         raw: object,
@@ -8399,6 +8526,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 pass
         self._sync_main_auto_plot_actions()
+        if hasattr(self, "_sync_life_metrics_excel_export_action"):
+            self._sync_life_metrics_excel_export_action()
 
     def _zoom_main_plot(self, factor: float) -> None:
         if not self._axes or not self._canvas:
@@ -14694,6 +14823,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         for widget_name in (
             "btn_zone_zoom",
             "btn_save_plot_pdf",
+            "btn_export_life_metrics_excel",
             "btn_zoom_out",
             "btn_zoom_in",
             "btn_zoom_reset",
@@ -14736,6 +14866,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 self.btn_plot.setEnabled(bool(getattr(self, "_db_path", None)) and not busy)
             elif not busy and getattr(self, "_cache_worker", None) is None:
                 self.btn_plot.setEnabled(True)
+        if hasattr(self, "_sync_life_metrics_excel_export_action"):
+            self._sync_life_metrics_excel_export_action()
 
     def _clear_smart_solver_result(self, *, clear_saved: bool = True) -> None:
         if clear_saved:
@@ -15366,9 +15498,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         stats = self._selected_life_stats()
 
         self._axes.clear()
+        self._clear_life_metrics_excel_snapshot()
         any_plotted = False
         rows_for_note: list[dict] = []
+        trace_snapshots: list[dict[str, object]] = []
+        snapshot_rows: list[dict[str, object]] = []
+        trace_id_counts: dict[str, int] = {}
         hi_set = {str(v).strip() for v in (self._highlight_sns or []) if str(v).strip()}
+        title_text = ""
+        x_label = ""
+        y_label = ""
+        plot_snapshot_extra: dict[str, object] = {}
 
         if plot_type == "metric_xy":
             x_param = self._current_life_x_parameter()
@@ -15447,17 +15587,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if len(y_unit_values) == 1
                 else (y_display if not multi_y_param else "Life metric value")
             )
-            self._axes.set_title(
-                self._compose_run_title(
-                    selection,
-                    self._life_graph_type_text(
-                        plot_type=plot_type,
-                        x_parameter=x_display,
-                        y_parameter=y_display,
-                        stats=stats,
-                    ),
-                )
+            title_text = self._compose_run_title(
+                selection,
+                self._life_graph_type_text(
+                    plot_type=plot_type,
+                    x_parameter=x_display,
+                    y_parameter=y_display,
+                    stats=stats,
+                ),
             )
+            self._axes.set_title(title_text)
             self._axes.set_xlabel(x_label)
             self._axes.set_ylabel(y_label)
             multi_stat = len(rows_by_stat) > 1
@@ -15490,7 +15629,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             stat=(stat if multi_stat else ""),
                             parameter=param_label,
                         )
-                        self._axes.plot(
+                        trace_key = self._life_metrics_trace_id(
+                            plot_type=plot_type,
+                            stat=stat,
+                            serial=sn,
+                            parameter=y_param,
+                            x_parameter=x_param,
+                        )
+                        trace_id_counts[trace_key] = trace_id_counts.get(trace_key, 0) + 1
+                        trace_id = (
+                            trace_key
+                            if trace_id_counts[trace_key] == 1
+                            else f"{trace_key}|{trace_id_counts[trace_key]}"
+                        )
+                        artists = self._axes.plot(
                             xs,
                             ys,
                             marker="o",
@@ -15498,6 +15650,54 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             alpha=(1.0 if sn in hi_set else 0.82),
                             label=label,
                         )
+                        for artist in (artists or []):
+                            self._register_plot_trace_artist(artist, trace_id)
+                        trace_rows = [dict(row) for row in points if isinstance(row, dict)]
+                        trace_snapshots.append(
+                            {
+                                "trace_id": trace_id,
+                                "label": label,
+                                "serial": sn,
+                                "stat": stat,
+                                "plot_type": plot_type,
+                                "x_parameter": x_param,
+                                "x_parameter_label": x_display,
+                                "y_parameter": y_param,
+                                "y_parameter_label": y_display_names.get(y_param, y_param),
+                                "x_units": str(
+                                    next(
+                                        (row.get("x_units") for row in trace_rows if str(row.get("x_units") or "").strip()),
+                                        "",
+                                    )
+                                    or ""
+                                ).strip(),
+                                "y_units": str(
+                                    next(
+                                        (row.get("y_units") for row in trace_rows if str(row.get("y_units") or "").strip()),
+                                        "",
+                                    )
+                                    or ""
+                                ).strip(),
+                                "x_values": list(xs),
+                                "y_values": list(ys),
+                                "rows": trace_rows,
+                            }
+                        )
+                        for point_index, point_row in enumerate(trace_rows, start=1):
+                            export_row = dict(point_row)
+                            export_row["trace_id"] = trace_id
+                            export_row["trace_label"] = label
+                            export_row["point_index"] = point_index
+                            export_row["plot_type"] = plot_type
+                            export_row["life_axis"] = ""
+                            export_row["life_axis_label"] = ""
+                            export_row["x_parameter"] = x_param
+                            export_row["x_parameter_label"] = x_display
+                            export_row["x_units"] = str(export_row.get("x_units") or "").strip()
+                            export_row["y_parameter"] = y_param
+                            export_row["y_parameter_label"] = y_display_names.get(y_param, y_param)
+                            export_row["y_units"] = str(export_row.get("y_units") or "").strip()
+                            snapshot_rows.append(export_row)
                         any_plotted = True
             last_plot_extra = {
                 "stats": list(stats),
@@ -15509,9 +15709,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "y_parameter_label": y_display_names.get(y_params[0], y_params[0]),
                 "y_parameter_labels": [y_display_names.get(value, value) for value in y_params],
             }
+            plot_snapshot_extra = dict(last_plot_extra)
         else:
             life_axis = self._current_life_axis()
             life_axis_label = str(self.cb_life_axis.currentText() if hasattr(self, "cb_life_axis") else "").strip() or life_axis
+            x_label = life_axis_label
             try:
                 rows_by_stat: dict[str, list[dict]] = {}
                 for stat in stats:
@@ -15562,17 +15764,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if len(y_unit_values) == 1
                 else (y_display if not multi_y_param else "Life metric value")
             )
-            self._axes.set_title(
-                self._compose_run_title(
-                    selection,
-                    self._life_graph_type_text(
-                        plot_type=plot_type,
-                        life_axis_label=life_axis_label,
-                        y_parameter=y_display,
-                        stats=stats,
-                    ),
-                )
+            title_text = self._compose_run_title(
+                selection,
+                self._life_graph_type_text(
+                    plot_type=plot_type,
+                    life_axis_label=life_axis_label,
+                    y_parameter=y_display,
+                    stats=stats,
+                ),
             )
+            self._axes.set_title(title_text)
             self._axes.set_xlabel(life_axis_label)
             self._axes.set_ylabel(y_label)
             multi_stat = len(rows_by_stat) > 1
@@ -15605,7 +15806,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             stat=(stat if multi_stat else ""),
                             parameter=param_label,
                         )
-                        self._axes.plot(
+                        trace_key = self._life_metrics_trace_id(
+                            plot_type=plot_type,
+                            stat=stat,
+                            serial=sn,
+                            parameter=y_param,
+                            life_axis=life_axis,
+                        )
+                        trace_id_counts[trace_key] = trace_id_counts.get(trace_key, 0) + 1
+                        trace_id = (
+                            trace_key
+                            if trace_id_counts[trace_key] == 1
+                            else f"{trace_key}|{trace_id_counts[trace_key]}"
+                        )
+                        artists = self._axes.plot(
                             xs,
                             ys,
                             marker="o",
@@ -15613,6 +15827,52 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             alpha=(1.0 if sn in hi_set else 0.82),
                             label=label,
                         )
+                        for artist in (artists or []):
+                            self._register_plot_trace_artist(artist, trace_id)
+                        trace_rows = [dict(row) for row in points if isinstance(row, dict)]
+                        trace_snapshots.append(
+                            {
+                                "trace_id": trace_id,
+                                "label": label,
+                                "serial": sn,
+                                "stat": stat,
+                                "plot_type": plot_type,
+                                "life_axis": life_axis,
+                                "life_axis_label": life_axis_label,
+                                "y_parameter": y_param,
+                                "y_parameter_label": y_display_names.get(y_param, y_param),
+                                "x_units": "",
+                                "y_units": str(
+                                    next(
+                                        (
+                                            row.get("units")
+                                            for row in trace_rows
+                                            if str(row.get("units") or "").strip()
+                                        ),
+                                        "",
+                                    )
+                                    or ""
+                                ).strip(),
+                                "x_values": list(xs),
+                                "y_values": list(ys),
+                                "rows": trace_rows,
+                            }
+                        )
+                        for point_index, point_row in enumerate(trace_rows, start=1):
+                            export_row = dict(point_row)
+                            export_row["trace_id"] = trace_id
+                            export_row["trace_label"] = label
+                            export_row["point_index"] = point_index
+                            export_row["plot_type"] = plot_type
+                            export_row["life_axis"] = life_axis
+                            export_row["life_axis_label"] = life_axis_label
+                            export_row["x_parameter"] = ""
+                            export_row["x_parameter_label"] = ""
+                            export_row["x_units"] = ""
+                            export_row["y_parameter"] = y_param
+                            export_row["y_parameter_label"] = y_display_names.get(y_param, y_param)
+                            export_row["y_units"] = str(export_row.get("units") or "").strip()
+                            snapshot_rows.append(export_row)
                         any_plotted = True
             last_plot_extra = {
                 "stats": list(stats),
@@ -15624,6 +15884,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "y_parameter_label": y_display_names.get(y_params[0], y_params[0]),
                 "y_parameter_labels": [y_display_names.get(value, value) for value in y_params],
             }
+            plot_snapshot_extra = dict(last_plot_extra)
 
         if not any_plotted:
             QtWidgets.QMessageBox.information(self, "Life Metrics", "No life metric values found for this selection.")
@@ -15688,6 +15949,37 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "legend_highlight_labels": list(legend_highlight_labels),
             **last_plot_extra,
         }
+        trace_id_order = [
+            str((trace or {}).get("trace_id") or "").strip()
+            for trace in trace_snapshots
+            if isinstance(trace, Mapping) and str((trace or {}).get("trace_id") or "").strip()
+        ]
+        self._last_life_metrics_excel_snapshot = {
+            "plot_metadata": {
+                "mode": "life_metrics",
+                "plot_title": title_text,
+                "x_label": x_label,
+                "y_label": y_label,
+                "plot_type": plot_type,
+                "stats": list(stats),
+                "selection_id": str(selection.get("id") or ""),
+                "selection_ids": list(selection_ids),
+                "selection_labels": list(selection_labels),
+                "display_text": self._selection_display_text(selection),
+                "run_condition": self._selection_condition_label(selection),
+                "run_conditions": list(run_conditions),
+                "member_runs": list(runs),
+                "member_sequences": list(selection.get("member_sequences") or []),
+                "active_serials": list(serials),
+                "global_filters": self._current_auto_plot_filter_state(),
+                "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                **plot_snapshot_extra,
+            },
+            "axis_view": self._current_plot_axis_view(),
+            "visible_trace_ids": self._current_life_metrics_visible_trace_ids(trace_ids=trace_id_order),
+            "traces": trace_snapshots,
+            "rows": snapshot_rows,
+        }
         self._update_plot_zoom_actions()
         self.btn_add_auto_plot.setEnabled(True)
 
@@ -15746,6 +16038,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         y_label = stats[0] if len(stats) == 1 else "Metric value"
         plot_bounds = bool(getattr(self, "cb_plot_metric_bounds", None) and self.cb_plot_metric_bounds.isChecked())
         self._axes.clear()
+        self._clear_life_metrics_excel_snapshot()
         self._axes.set_title(
             self._compose_run_title(selection, self._metric_graph_type_text(list(y_display_names.values()), stats))
         )
@@ -15960,6 +16253,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             return
 
         self._axes.clear()
+        self._clear_life_metrics_excel_snapshot()
         y_axis_label = self._plot_value_summary(list(y_display_names.values())) or "Y"
         self._axes.set_title(self._compose_run_title(selection, f"{x_label} vs {y_axis_label}"))
         self._axes.set_xlabel(x_label)
@@ -18572,6 +18866,52 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 pass
             self._export_progress_visible = False
 
+    def _start_life_metrics_excel_snapshot_export(
+        self,
+        output_path: Path,
+        *,
+        snapshot: Mapping[str, object],
+    ) -> None:
+        output = Path(output_path).expanduser()
+        snapshot_payload = json.loads(json.dumps(dict(snapshot or {}), ensure_ascii=True, default=str))
+
+        def _task(report):
+            return be.td_export_life_metrics_snapshot_workbook(
+                output,
+                snapshot=snapshot_payload,
+                progress_cb=report,
+            )
+
+        self._start_perf_export_task(
+            heading="Export Plot to Excel",
+            status_text=f"Exporting Life Metrics snapshot to {output.name}",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_perf_excel_export_success(
+                payload,
+                heading="Export Plot to Excel",
+            ),
+        )
+
+    def _export_life_metrics_plot_to_excel(self) -> None:
+        plot_def = dict(getattr(self, "_last_plot_def", {}) or {})
+        if str(plot_def.get("mode") or "").strip().lower() != "life_metrics":
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Plot to Excel",
+                "Plot a Life Metrics graph before exporting to Excel.",
+            )
+            return
+        snapshot = self._refresh_life_metrics_excel_snapshot_live_state()
+        if not isinstance(snapshot, Mapping) or not snapshot.get("traces"):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Plot to Excel",
+                "No Life Metrics plot snapshot is available to export.",
+            )
+            return
+        output_path = Path(getattr(self, "_project_dir", Path.cwd())).expanduser() / "life_metrics_plot_snapshot.xlsx"
+        self._start_life_metrics_excel_snapshot_export(output_path, snapshot=snapshot)
+
     def _start_perf_equation_excel_export(
         self,
         output_path: Path,
@@ -20001,6 +20341,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._update_perf_highlight_models()
         self._fill_perf_equations_table()
         self._redraw_performance_view()
+        self._clear_life_metrics_excel_snapshot()
         self.btn_save_plot_pdf.setEnabled(True)
         selection = self._current_run_selection()
         current_stat = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""
@@ -20163,6 +20504,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._update_perf_highlight_models()
         self._fill_perf_equations_table()
         self._redraw_performance_view()
+        self._clear_life_metrics_excel_snapshot()
         self.btn_save_plot_pdf.setEnabled(True)
         selection = self._current_run_selection()
         current_stat = str(self.cb_perf_view_stat.currentText() or "").strip().lower() if hasattr(self, "cb_perf_view_stat") else ""

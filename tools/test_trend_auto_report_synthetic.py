@@ -2555,9 +2555,80 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(matrix_rows[5][:5], ["", "", "Deviation Score", "-1", "-1"])
         self.assertEqual(matrix_rows[6][:5], ["", "", "Official Grade", "WATCH", "PASS"])
         self.assertEqual(matrix_rows[7][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
-        self.assertIn(("SPAN", (0, 2), (0, 7)), style_cmds)
-        self.assertIn(("SPAN", (1, 2), (1, 7)), style_cmds)
-        self.assertIn(("BACKGROUND", (3, 2), (3, 7), "#fef3c7"), style_cmds)
+        self.assertEqual(matrix_rows[8][:5], ["", "", "Metric Chart", "", ""])
+        self.assertEqual(matrix_rows[9][:5], ["", "", "Plot Curves", "", ""])
+        self.assertIn(("SPAN", (0, 2), (0, 9)), style_cmds)
+        self.assertIn(("SPAN", (1, 2), (1, 9)), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 2), (3, 9), "#fef3c7"), style_cmds)
+
+    def test_build_comparison_chart_links_tracks_repeated_metric_and_curve_labels(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        ctx = {
+            "comparison_page_specs": [
+                {
+                    "serial": "SN1",
+                    "report_page_index": 1,
+                    "param_names": ["Pressure", "Flow"],
+                    "param_units": {"Pressure": "psi", "Flow": "kg/s"},
+                    "blocks": [
+                        {
+                            "run_condition": "Condition A",
+                            "sequence_text": "Seq A",
+                            "rows_by_parameter": {
+                                "Pressure": {"pair_id": "pair-pressure", "parameter": "Pressure"},
+                                "Flow": {"pair_id": "pair-flow", "parameter": "Flow"},
+                            },
+                        },
+                        {
+                            "run_condition": "Condition B",
+                            "sequence_text": "Seq B",
+                            "rows_by_parameter": {
+                                "Pressure": {"pair_id": "pair-pressure", "parameter": "Pressure"},
+                                "Flow": {"pair_id": "pair-flow", "parameter": "Flow"},
+                            },
+                        },
+                    ],
+                }
+            ],
+            "plot_navigation": [
+                {
+                    "section_key": "run_condition_plot_metrics",
+                    "stat": "median",
+                    "member_pair_ids": ["pair-pressure"],
+                    "destination_page_index": 7,
+                },
+                {
+                    "section_key": "run_condition_plot_metrics",
+                    "stat": "mean",
+                    "member_pair_ids": ["pair-pressure", "pair-flow"],
+                    "destination_page_index": 8,
+                },
+                {
+                    "section_key": "run_condition_curve_overlays",
+                    "member_pair_ids": ["pair-pressure", "pair-flow"],
+                    "destination_page_index": 9,
+                },
+            ],
+        }
+
+        links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=3)
+
+        metric_links = [link for link in links if link["metric_label"] == "Metric Chart"]
+        curve_links = [link for link in links if link["metric_label"] == "Plot Curves"]
+        self.assertEqual(len(metric_links), 4)
+        self.assertEqual(len(curve_links), 4)
+        self.assertTrue(all(link["source_page_index"] == 3 for link in links))
+        self.assertTrue(all(link["destination_page_index"] == 8 for link in metric_links))
+        self.assertTrue(all(link["destination_page_index"] == 9 for link in curve_links))
+        self.assertEqual(
+            [link["occurrence_index"] for link in metric_links],
+            [1, 2, 4, 5],
+        )
+        self.assertEqual(
+            [link["occurrence_index"] for link in curve_links],
+            [1, 2, 4, 5],
+        )
 
     def test_generate_auto_report_merges_tabloid_comparison_pages_before_plots(self):
         fitz = __import__("fitz")

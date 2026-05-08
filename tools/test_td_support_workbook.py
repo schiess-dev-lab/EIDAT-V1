@@ -1892,7 +1892,75 @@ class TestTDTrendDialogLayout(unittest.TestCase):
             self.assertEqual(dlg._current_life_x_parameter(), "")
             self.assertEqual(dlg.cb_life_y_param.itemData(0), "")
             self.assertEqual(dlg.cb_life_x_param.itemData(0), "")
+            self.assertTrue(dlg.life_y_param_row.isHidden())
+            self.assertEqual(dlg.lbl_life_y_params_summary.text(), "Y Parameters: None selected")
             self.assertEqual(dlg.lbl_life_summary.text(), "Life metrics: - over Sequence")
+        finally:
+            dlg.close()
+
+    def test_life_y_parameters_popup_is_primary_selector_and_preserves_hidden_combo_sync(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            from EIDAT_App_Files.ui_next import backend as be  # type: ignore
+
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._current_member_runs = lambda: ["RunA"]
+            dlg._current_run_selection = lambda: {"details_text": "Condition: RunA"}
+
+            with mock.patch.object(be, "td_list_raw_y_columns", return_value=[]), mock.patch.object(
+                be, "td_list_metric_y_columns", return_value=[]
+            ), mock.patch.object(be, "td_list_x_columns", return_value=[]), mock.patch.object(
+                be,
+                "td_list_life_parameter_options",
+                return_value=[
+                    {"name": "Life Metric A", "units": "psi"},
+                    {"name": "Life Metric B", "units": "ms"},
+                ],
+            ), mock.patch.object(
+                be,
+                "td_list_life_axes",
+                return_value=[{"key": "sequence_index", "label": "Sequence"}],
+            ):
+                dlg._refresh_columns_for_run()
+
+            self.assertTrue(dlg.life_y_param_row.isHidden())
+            self.assertEqual(dlg.lbl_life_y_params_summary.text(), "Y Parameters: None selected")
+            available_values = dlg._list_widget_values(dlg.list_life_y_params)
+            self.assertEqual(len(available_values), 2)
+
+            with mock.patch.object(dlg, "_show_filter_checklist_popup", return_value=list(available_values)):
+                dlg._open_life_y_parameters_popup()
+
+            self.assertEqual(dlg._selected_life_y_parameters(), list(available_values))
+            self.assertEqual(dlg._current_life_y_parameter(), available_values[0])
+            self.assertEqual(dlg.cb_life_y_param.currentData(), available_values[0])
+            self.assertEqual(dlg.lbl_life_y_params_summary.text(), "Y Parameters: All (2)")
+
+            with mock.patch.object(be, "td_list_raw_y_columns", return_value=[]), mock.patch.object(
+                be, "td_list_metric_y_columns", return_value=[]
+            ), mock.patch.object(be, "td_list_x_columns", return_value=[]), mock.patch.object(
+                be,
+                "td_list_life_parameter_options",
+                return_value=[
+                    {"name": "Life Metric A", "units": "psi"},
+                    {"name": "Life Metric B", "units": "ms"},
+                ],
+            ), mock.patch.object(
+                be,
+                "td_list_life_axes",
+                return_value=[{"key": "sequence_index", "label": "Sequence"}],
+            ):
+                dlg._refresh_columns_for_run()
+
+            self.assertEqual(dlg._selected_life_y_parameters(), list(available_values))
+            self.assertEqual(dlg._current_life_y_parameter(), available_values[0])
+            self.assertEqual(dlg.cb_life_y_param.currentData(), available_values[0])
+
+            with mock.patch.object(dlg, "_show_filter_checklist_popup", return_value=None):
+                dlg._open_life_y_parameters_popup()
+
+            self.assertEqual(dlg._selected_life_y_parameters(), list(available_values))
+            self.assertEqual(dlg.cb_life_y_param.currentData(), available_values[0])
         finally:
             dlg.close()
 
@@ -1938,6 +2006,79 @@ class TestTDTrendDialogLayout(unittest.TestCase):
 
         self.assertEqual([item.text() for item in harness.list_y_metrics.selectedItems()], ["Pressure"])
         self.assertTrue(harness._plot_metrics_called)
+
+    def test_open_selected_auto_plot_restores_multiple_life_y_selection(self) -> None:
+        from PySide6 import QtCore, QtWidgets
+        from EIDAT_App_Files.ui_next.qt_main import TestDataTrendDialog  # type: ignore
+
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._plot_ready = True
+            apply_plot = getattr(
+                TestDataTrendDialog,
+                "_apply_auto_graph_quickcheck_plot_to_live_gui",
+            ).__get__(dlg, type(dlg))
+            selection = {
+                "mode": "condition",
+                "id": "condition:RunA",
+                "run_name": "RunA",
+                "display_text": "RunA",
+                "run_condition": "RunA",
+                "member_runs": ["RunA"],
+                "member_sequences": ["RunA"],
+                "details_text": "Condition: RunA",
+            }
+            dlg._run_selection_views = {"sequence": [], "condition": [selection]}
+            dlg.cb_run_mode.blockSignals(True)
+            dlg.cb_run_mode.clear()
+            dlg.cb_run_mode.addItem("Run Conditions", "condition")
+            dlg.cb_run_mode.setCurrentIndex(0)
+            dlg.cb_run_mode.blockSignals(False)
+            dlg.cb_run.clear()
+            dlg.cb_run.addItem("RunA", selection)
+            dlg.cb_life_plot_type.clear()
+            dlg.cb_life_plot_type.addItem("Parameter vs Life", "life_axis")
+            dlg.cb_life_axis.clear()
+            dlg.cb_life_axis.addItem("Cumulative Impulse", "cumulative_impulse")
+            dlg.cb_life_y_param.clear()
+            dlg.list_life_y_params.clear()
+            for name in ("feed pressure", "thrust"):
+                dlg.cb_life_y_param.addItem(name, name)
+                item = QtWidgets.QListWidgetItem(name)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+                dlg.list_life_y_params.addItem(item)
+
+            captured: dict[str, object] = {}
+            dlg._plot_life_metrics = lambda: captured.update(
+                {
+                    "y_values": dlg._selected_life_y_parameters(),
+                    "combo_value": str(dlg.cb_life_y_param.currentData() or "").strip(),
+                    "summary": dlg.lbl_life_y_params_summary.text(),
+                }
+            )
+
+            plot_def = {
+                "mode": "life_metrics",
+                "selector_mode": "condition",
+                "selection_id": "condition:RunA",
+                "plot_type": "life_axis",
+                "life_axis": "cumulative_impulse",
+                "stats": ["mean"],
+                "y_parameters": ["feed pressure", "thrust"],
+                "y_parameter": "feed pressure",
+            }
+
+            with mock.patch.object(dlg, "_set_mode", return_value=None), mock.patch.object(
+                dlg, "_set_metric_condition_selection_ids", return_value=None
+            ):
+                apply_plot(plot_def)
+
+            self.assertEqual(captured.get("y_values"), ["feed pressure", "thrust"])
+            self.assertEqual(captured.get("combo_value"), "feed pressure")
+            self.assertEqual(captured.get("summary"), "Y Parameters: All (2)")
+        finally:
+            dlg.close()
 
     def test_auto_report_certification_serial_selection_uses_raw_user_role_value(self) -> None:
         from PySide6 import QtCore, QtWidgets

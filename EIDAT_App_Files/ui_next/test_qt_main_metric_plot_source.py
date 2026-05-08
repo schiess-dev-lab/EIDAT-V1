@@ -29,15 +29,35 @@ except Exception:  # pragma: no cover - optional dependency guard for local runs
 
 
 class _DummyLine:
+    def __init__(self) -> None:
+        self._visible = True
+        self._gid = ""
+
     def get_color(self) -> str:
         return "#1f77b4"
+
+    def set_gid(self, value: object) -> None:
+        self._gid = str(value or "")
+
+    def get_gid(self) -> str:
+        return self._gid
+
+    def get_visible(self) -> bool:
+        return self._visible
+
+    def set_visible(self, value: object) -> None:
+        self._visible = bool(value)
 
 
 class _DummyAxes:
     def __init__(self) -> None:
         self.plot_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.lines: list[_DummyLine] = []
+        self._xlim = (0.0, 1.0)
+        self._ylim = (0.0, 1.0)
 
     def clear(self) -> None:
+        self.lines = []
         return None
 
     def set_title(self, _value: str) -> None:
@@ -51,9 +71,13 @@ class _DummyAxes:
 
     def plot(self, *args: object, **kwargs: object):
         self.plot_calls.append((args, dict(kwargs)))
-        return [_DummyLine()]
+        line = _DummyLine()
+        self.lines.append(line)
+        return [line]
 
     def set_xlim(self, *_args) -> None:
+        if len(_args) >= 2:
+            self._xlim = (float(_args[0]), float(_args[1]))
         return None
 
     def set_xticks(self, *_args) -> None:
@@ -64,6 +88,12 @@ class _DummyAxes:
 
     def grid(self, *_args, **_kwargs) -> None:
         return None
+
+    def get_xlim(self) -> tuple[float, float]:
+        return self._xlim
+
+    def get_ylim(self) -> tuple[float, float]:
+        return self._ylim
 
 
 class _DummyFigure:
@@ -772,13 +802,27 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                 labels = [str(kwargs.get("label") or "") for _, kwargs in axes.plot_calls]
                 self.assertIn("SN-001 | Program Alpha (mean)", labels)
                 self.assertIn("SN-001 | Program Alpha (max)", labels)
+                snapshot = window._last_life_metrics_excel_snapshot
+                self.assertIsInstance(snapshot, dict)
+                self.assertEqual(snapshot.get("plot_metadata", {}).get("plot_type"), "life_axis")
+                self.assertEqual(snapshot.get("plot_metadata", {}).get("stats"), ["mean", "max"])
+                self.assertEqual(len(snapshot.get("traces") or []), 2)
+                self.assertEqual(
+                    [str(trace.get("stat") or "") for trace in (snapshot.get("traces") or [])],
+                    ["mean", "max"],
+                )
+                self.assertEqual(
+                    [str(row.get("observation_id") or "") for row in (snapshot.get("rows") or [])],
+                    ["obs-mean", "obs-max"],
+                )
+                self.assertTrue(window.btn_export_life_metrics_excel.isEnabled())
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
 
-    def test_plot_life_metrics_allows_multiple_y_parameters(self) -> None:
+    def test_plot_life_metrics_allows_multiple_y_parameters_over_cumulative_impulse(self) -> None:
         window = self._make_window()
         try:
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
@@ -795,15 +839,16 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                     "member_sequences": ["Seq-1"],
                 }
                 requested_params: list[str] = []
+                requested_axes: list[str] = []
                 window.cb_life_y_param.clear()
                 window.list_life_y_params.clear()
-                for name in ("LifeMetricA", "LifeMetricB"):
+                for name in ("feed pressure", "thrust"):
                     window.cb_life_y_param.addItem(name, name)
                     window.list_life_y_params.addItem(name)
                 window.cb_life_axis.clear()
-                window.cb_life_axis.addItem("Sequence", "sequence_index")
+                window.cb_life_axis.addItem("Cumulative Impulse", "cumulative_impulse")
                 self._ensure_selected_items(window.list_life_stats, ["mean"])
-                window._set_life_y_parameter_selection(["LifeMetricA", "LifeMetricB"])
+                window._set_life_y_parameter_selection(["feed pressure", "thrust"])
 
                 def _fake_loader(
                     run_names: list[str],
@@ -814,9 +859,10 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                     serials: list[str] | None = None,
                     filter_state: object = None,
                 ) -> list[dict]:
-                    del run_names, life_axis, stat, serials, filter_state
+                    del run_names, stat, serials, filter_state
                     param = str(parameter_value)
                     requested_params.append(param)
+                    requested_axes.append(str(life_axis))
                     return [
                         {
                             "serial": "SN-001",
@@ -824,7 +870,7 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                             "sequence_index": 1,
                             "condition_key": "CondA",
                             "x_value": 1.0,
-                            "y_value": 1.0 if param == "LifeMetricA" else 2.0,
+                            "y_value": 1.0 if param == "feed pressure" else 2.0,
                             "units": "psi",
                             "program_title": "Program Alpha",
                         }
@@ -860,13 +906,224 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
                     window._plot_life_metrics()
 
                 info_mock.assert_not_called()
-                self.assertEqual(requested_params, ["LifeMetricA", "LifeMetricB"])
-                self.assertEqual(window._last_plot_def.get("y_parameters"), ["LifeMetricA", "LifeMetricB"])
-                self.assertEqual(window._last_plot_def.get("y_parameter"), "LifeMetricA")
+                self.assertEqual(requested_params, ["feed pressure", "thrust"])
+                self.assertEqual(requested_axes, ["cumulative_impulse", "cumulative_impulse"])
+                self.assertEqual(window._last_plot_def.get("y_parameters"), ["feed pressure", "thrust"])
+                self.assertEqual(window._last_plot_def.get("y_parameter"), "feed pressure")
                 self.assertEqual(len(axes.plot_calls), 2)
                 labels = [str(kwargs.get("label") or "") for _, kwargs in axes.plot_calls]
-                self.assertIn("LifeMetricA | SN-001 | Program Alpha", labels)
-                self.assertIn("LifeMetricB | SN-001 | Program Alpha", labels)
+                self.assertIn("feed pressure | SN-001 | Program Alpha", labels)
+                self.assertIn("thrust | SN-001 | Program Alpha", labels)
+                self.assertEqual(window._last_plot_def.get("life_axis"), "cumulative_impulse")
+                self.assertEqual(window._last_plot_def.get("life_axis_label"), "Cumulative Impulse")
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_plot_life_metrics_metric_xy_allows_multiple_y_parameters(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                axes = self._prepare_plot_window(window, db_path, mode="life_metrics")
+                selection = {
+                    "mode": "condition",
+                    "id": "condition:CondA",
+                    "run_name": "CondA",
+                    "display_text": "Condition A",
+                    "run_condition": "Condition A",
+                    "member_runs": ["CondA"],
+                    "member_sequences": ["Seq-1"],
+                }
+                requested_pairs: list[tuple[str, str]] = []
+                window.cb_life_plot_type.clear()
+                window.cb_life_plot_type.addItem("Parameter vs Life", "life_axis")
+                window.cb_life_plot_type.addItem("Parameter vs Parameter", "metric_xy")
+                window.cb_life_plot_type.setCurrentIndex(window.cb_life_plot_type.findData("metric_xy"))
+                window.cb_life_y_param.clear()
+                window.list_life_y_params.clear()
+                for name in ("feed pressure", "thrust"):
+                    window.cb_life_y_param.addItem(name, name)
+                    window.list_life_y_params.addItem(name)
+                window.cb_life_x_param.clear()
+                window.cb_life_x_param.addItem("Cumulative impulse", "Cumulative impulse")
+                window.cb_life_x_param.setCurrentIndex(0)
+                self._ensure_selected_items(window.list_life_stats, ["mean"])
+                window._set_life_y_parameter_selection(["feed pressure", "thrust"])
+
+                def _fake_loader(
+                    run_names: list[str],
+                    x_parameter_value: object,
+                    y_parameter_value: object,
+                    *,
+                    stat: object = "mean",
+                    serials: list[str] | None = None,
+                    filter_state: object = None,
+                ) -> list[dict]:
+                    del run_names, stat, serials, filter_state
+                    x_param = str(x_parameter_value)
+                    y_param = str(y_parameter_value)
+                    requested_pairs.append((x_param, y_param))
+                    return [
+                        {
+                            "serial": "SN-001",
+                            "observation_id": f"obs-{y_param}",
+                            "sequence_index": 1,
+                            "condition_key": "CondA",
+                            "x_value": 10.0,
+                            "y_value": 1.0 if y_param == "feed pressure" else 2.0,
+                            "x_units": "lbf-s",
+                            "y_units": "psi",
+                            "program_title": "Program Alpha",
+                        }
+                    ]
+
+                with patch.object(window, "_current_run_selector_mode", return_value="condition"), patch.object(
+                    window, "_current_run_selection", return_value=selection
+                ), patch.object(
+                    window, "_current_run_selections", return_value=[selection]
+                ), patch.object(
+                    window, "_current_member_runs", return_value=["CondA"]
+                ), patch.object(
+                    window, "_active_serials", return_value=["SN-001"]
+                ), patch.object(
+                    window, "_ensure_main_axes", return_value=None
+                ), patch.object(
+                    window, "_compose_run_title", return_value="Life XY Plot"
+                ), patch.object(
+                    window, "_apply_interactive_legend_policy", return_value=[]
+                ), patch.object(
+                    window, "_apply_plot_view_bands_to_axes", return_value=None
+                ), patch.object(
+                    window, "_refresh_plot_note", return_value=None
+                ), patch.object(
+                    window, "_capture_main_plot_base_view", return_value=None
+                ), patch.object(
+                    window, "_update_perf_primary_equation_banner", return_value=None
+                ), patch.object(
+                    window, "_load_life_metric_xy_for_selection", side_effect=_fake_loader
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._plot_life_metrics()
+
+                info_mock.assert_not_called()
+                self.assertEqual(
+                    requested_pairs,
+                    [("Cumulative impulse", "feed pressure"), ("Cumulative impulse", "thrust")],
+                )
+                self.assertEqual(window._last_plot_def.get("plot_type"), "metric_xy")
+                self.assertEqual(window._last_plot_def.get("x_parameter"), "Cumulative impulse")
+                self.assertEqual(window._last_plot_def.get("y_parameters"), ["feed pressure", "thrust"])
+                self.assertEqual(window._last_plot_def.get("y_parameter"), "feed pressure")
+                self.assertEqual(len(axes.plot_calls), 2)
+                labels = [str(kwargs.get("label") or "") for _, kwargs in axes.plot_calls]
+                self.assertIn("feed pressure | SN-001 | Program Alpha", labels)
+                self.assertIn("thrust | SN-001 | Program Alpha", labels)
+                snapshot = window._last_life_metrics_excel_snapshot
+                self.assertIsInstance(snapshot, dict)
+                self.assertEqual(snapshot.get("plot_metadata", {}).get("plot_type"), "metric_xy")
+                self.assertEqual(snapshot.get("plot_metadata", {}).get("x_parameter"), "Cumulative impulse")
+                self.assertEqual(snapshot.get("plot_metadata", {}).get("y_parameters"), ["feed pressure", "thrust"])
+                self.assertEqual(len(snapshot.get("traces") or []), 2)
+                self.assertEqual(
+                    [str(trace.get("y_parameter") or "") for trace in (snapshot.get("traces") or [])],
+                    ["feed pressure", "thrust"],
+                )
+                self.assertEqual(
+                    [str(row.get("observation_id") or "") for row in (snapshot.get("rows") or [])],
+                    ["obs-feed pressure", "obs-thrust"],
+                )
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_life_metrics_excel_export_button_tracks_snapshot_state(self) -> None:
+        window = self._make_window()
+        try:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                db_path = Path(tmpdir) / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                self._prepare_plot_window(window, db_path, mode="life_metrics")
+                selection = {
+                    "mode": "condition",
+                    "id": "condition:CondA",
+                    "run_name": "CondA",
+                    "display_text": "Condition A",
+                    "run_condition": "Condition A",
+                    "member_runs": ["CondA"],
+                    "member_sequences": ["Seq-1"],
+                }
+                window.cb_life_y_param.clear()
+                window.cb_life_y_param.addItem("LifeMetric", "LifeMetric")
+                window.cb_life_axis.clear()
+                window.cb_life_axis.addItem("Sequence", "sequence_index")
+                self.assertFalse(window.btn_export_life_metrics_excel.isEnabled())
+
+                def _fake_loader(
+                    run_names: list[str],
+                    parameter_value: object,
+                    life_axis: str,
+                    *,
+                    stat: object = "mean",
+                    serials: list[str] | None = None,
+                    filter_state: object = None,
+                ) -> list[dict]:
+                    del run_names, parameter_value, life_axis, serials, filter_state
+                    return [
+                        {
+                            "serial": "SN-001",
+                            "observation_id": f"obs-{stat}",
+                            "sequence_index": 1,
+                            "condition_key": "CondA",
+                            "x_value": 1.0,
+                            "y_value": 1.0,
+                            "units": "psi",
+                            "program_title": "Program Alpha",
+                        }
+                    ]
+
+                with patch.object(window, "_current_run_selector_mode", return_value="condition"), patch.object(
+                    window, "_current_run_selection", return_value=selection
+                ), patch.object(
+                    window, "_current_run_selections", return_value=[selection]
+                ), patch.object(
+                    window, "_current_member_runs", return_value=["CondA"]
+                ), patch.object(
+                    window, "_active_serials", return_value=["SN-001"]
+                ), patch.object(
+                    window, "_ensure_main_axes", return_value=None
+                ), patch.object(
+                    window, "_compose_run_title", return_value="Life Plot"
+                ), patch.object(
+                    window, "_apply_interactive_legend_policy", return_value=[]
+                ), patch.object(
+                    window, "_apply_plot_view_bands_to_axes", return_value=None
+                ), patch.object(
+                    window, "_refresh_plot_note", return_value=None
+                ), patch.object(
+                    window, "_capture_main_plot_base_view", return_value=None
+                ), patch.object(
+                    window, "_update_perf_primary_equation_banner", return_value=None
+                ), patch.object(
+                    window, "_load_life_metric_series_for_selection", side_effect=_fake_loader
+                ), patch(
+                    "ui_next.qt_main.QtWidgets.QMessageBox.information"
+                ) as info_mock:
+                    window._plot_life_metrics()
+
+                info_mock.assert_not_called()
+                self.assertTrue(window.btn_export_life_metrics_excel.isEnabled())
+                window._last_plot_def = {"mode": "metrics"}
+                window._sync_life_metrics_excel_export_action()
+                self.assertFalse(window.btn_export_life_metrics_excel.isEnabled())
+                window._clear_life_metrics_excel_snapshot()
+                self.assertFalse(window.btn_export_life_metrics_excel.isEnabled())
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
@@ -1288,6 +1545,73 @@ class TestQtMainMetricPlotSource(unittest.TestCase):
             self.assertEqual(captured.get("labels"), ["Pressure.mean", "Bounds"])
             self.assertEqual(window._last_plot_def.get("legend_highlight_labels"), ["Pressure.mean", "Bounds"])
             self.assertIsNone(window._pending_legend_highlight_labels)
+        finally:
+            window.close()
+            tmpdir = getattr(window, "_test_tmpdir", "")
+            if tmpdir:
+                shutil.rmtree(str(tmpdir), ignore_errors=True)
+
+    def test_apply_auto_graph_quickcheck_plot_to_live_gui_restores_multiple_life_y_parameters(self) -> None:
+        window = self._make_window()
+        try:
+            db_path = Path(getattr(window, "_test_tmpdir", "")) / "cache.sqlite3"
+            db_path.write_text("", encoding="utf-8")
+            window._db_path = db_path
+            window._plot_ready = True
+            captured: dict[str, object] = {}
+            window.cb_run_mode.blockSignals(True)
+            window.cb_run_mode.clear()
+            window.cb_run_mode.addItem("Run Conditions", "condition")
+            window.cb_run_mode.setCurrentIndex(0)
+            window.cb_run_mode.blockSignals(False)
+            window.cb_life_y_param.clear()
+            window.list_life_y_params.clear()
+            for name in ("feed pressure", "thrust"):
+                window.cb_life_y_param.addItem(name, name)
+                item = QtWidgets.QListWidgetItem(name)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+                window.list_life_y_params.addItem(item)
+            window.cb_life_axis.clear()
+            window.cb_life_axis.addItem("Cumulative Impulse", "cumulative_impulse")
+
+            def _fake_plot_life_metrics() -> None:
+                captured["plot_type"] = window._selected_life_plot_type()
+                captured["y_values"] = window._selected_life_y_parameters()
+                captured["y_summary"] = window.lbl_life_y_params_summary.text()
+                captured["combo_value"] = str(window.cb_life_y_param.currentData() or "").strip()
+                window._last_plot_def = {
+                    "mode": "life_metrics",
+                    "plot_type": window._selected_life_plot_type(),
+                    "y_parameters": window._selected_life_y_parameters(),
+                }
+
+            plot_entry = {
+                "plot_definition": {
+                    "mode": "life_metrics",
+                    "selector_mode": "condition",
+                    "selection_id": "condition:CondA",
+                    "plot_type": "life_axis",
+                    "life_axis": "cumulative_impulse",
+                    "stats": ["mean"],
+                    "y_parameters": ["feed pressure", "thrust"],
+                    "y_parameter": "feed pressure",
+                }
+            }
+
+            with patch.object(window, "_selection_from_plot_def", return_value={"id": "condition:CondA"}), patch.object(
+                window, "_set_mode", return_value=None
+            ), patch.object(
+                window, "_set_metric_condition_selection_ids", return_value=None
+            ), patch.object(
+                window, "_plot_life_metrics", side_effect=_fake_plot_life_metrics
+            ):
+                window._apply_auto_graph_quickcheck_plot_to_live_gui(plot_entry)
+
+            self.assertEqual(captured.get("plot_type"), "life_axis")
+            self.assertEqual(captured.get("y_values"), ["feed pressure", "thrust"])
+            self.assertEqual(captured.get("combo_value"), "feed pressure")
+            self.assertEqual(captured.get("y_summary"), "Y Parameters: All (2)")
+            self.assertEqual(window._last_plot_def.get("y_parameters"), ["feed pressure", "thrust"])
         finally:
             window.close()
             tmpdir = getattr(window, "_test_tmpdir", "")
