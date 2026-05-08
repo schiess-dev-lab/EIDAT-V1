@@ -606,8 +606,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         self.assertEqual(len(row_specs), 1)
         spec = row_specs[0]
-        self.assertTrue(all(value == "steady_state" for value in be.curve_run_type_filters))
-        self.assertEqual(be.metric_run_type_filters, ["steady_state"])
+        self.assertTrue(all(value in (None, "") for value in be.curve_run_type_filters))
+        self.assertEqual(be.metric_run_type_filters, [None])
         self.assertEqual([curve.serial for curve in spec["series"]], ["SN_SS"])
         self.assertEqual(spec["metric_mean_by_serial"], {"SN_SS": 11.0})
         self.assertEqual([str(row.get("run_type") or "") for row in spec["condition_context_rows"]], ["SS"])
@@ -763,8 +763,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         self.assertEqual(len(row_specs), 1)
         spec = row_specs[0]
-        self.assertTrue(all(value == "pulsed_mode" for value in be.curve_run_type_filters))
-        self.assertEqual(be.metric_run_type_filters, ["pulsed_mode"])
+        self.assertTrue(all(value in (None, "") for value in be.curve_run_type_filters))
+        self.assertEqual(be.metric_run_type_filters, [None])
         self.assertEqual([curve.serial for curve in spec["series"]], ["SN_PM"])
         self.assertEqual(spec["metric_mean_by_serial"], {"SN_PM": 31.0})
         self.assertEqual([str(row.get("run_type") or "") for row in spec["condition_context_rows"]], ["PM"])
@@ -953,8 +953,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         self.assertEqual(len(row_specs), 1)
         spec = row_specs[0]
-        self.assertEqual(be.metric_sources, ["all_sequences"])
-        self.assertEqual(be.metric_run_type_filters, [None])
+        self.assertEqual(be.metric_sources, ["aggregate", "all_sequences"])
+        self.assertEqual(be.metric_run_type_filters, [None, None])
         self.assertTrue(all(value is None for value in be.curve_run_type_filters))
         self.assertEqual(spec["metric_mean_by_serial"], {"SN_CERT": 15.0, "SN_BASE": 30.0})
         self.assertEqual([curve.serial for curve in spec["series"]], ["SN_CERT", "SN_CERT", "SN_BASE"])
@@ -997,7 +997,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             filter_state={},
         )
 
-        self.assertEqual(be.sources, ["all_sequences", "aggregate"])
+        self.assertEqual(be.sources, ["aggregate"])
         self.assertEqual([(row.get("serial"), row.get("run_name"), row.get("value_num")) for row in rows], [("SN1", "Run1", 42.0)])
 
     def test_resampled_trace_helpers_aggregate_duplicate_serials_without_losing_entries(self):
@@ -2555,6 +2555,155 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(rows[0]["raw_parameter"], "feed_pressure_raw")
         self.assertEqual(rows[0]["units"], "psia")
         self.assertEqual(rows[0]["raw_units"], "psi")
+
+    def test_comparison_rows_disambiguate_duplicate_display_parameters(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        pair_specs = [
+            {
+                "pair_id": "pair-a",
+                "selection_id": "selection-1",
+                "run": "Run1",
+                "run_title": "Run 1",
+                "param": "feed_pressure_raw",
+                "param_display": "Chamber Feed Pressure",
+                "units": "psi",
+                "display_units": "psia",
+                "selection_fields": {"mode": "condition", "condition_text": "Condition A", "sequence_text": "Seq 1"},
+                "base_condition_label": "Condition A",
+                "initial_plot_payload": {"master_y": [1.0, 1.0], "y_resampled_by_sn": {"SN1": [1.1, 1.1], "SN2": [1.0, 1.0]}},
+            },
+            {
+                "pair_id": "pair-b",
+                "selection_id": "selection-1",
+                "run": "Run1",
+                "run_title": "Run 1",
+                "param": "feed_pressure_cmd_raw",
+                "param_display": "Chamber Feed Pressure",
+                "units": "psi",
+                "display_units": "psia",
+                "selection_fields": {"mode": "condition", "condition_text": "Condition A", "sequence_text": "Seq 1"},
+                "base_condition_label": "Condition A",
+                "initial_plot_payload": {"master_y": [2.0, 2.0], "y_resampled_by_sn": {"SN1": [2.1, 2.1], "SN2": [2.0, 2.0]}},
+            },
+        ]
+
+        def _metric_map_side_effect(_ctx, pair_spec_arg, stat, *, filter_state_override=None):
+            self.assertEqual(stat, "mean")
+            pair_id = str(pair_spec_arg.get("pair_id") or "")
+            if pair_id == "pair-a":
+                return {"SN1": 1.1, "SN2": 1.0}
+            if pair_id == "pair-b":
+                return {"SN1": 2.1, "SN2": 2.0}
+            return {}
+
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", side_effect=_metric_map_side_effect):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                {
+                    "filter_state": {},
+                    "be": object(),
+                    "db_path": Path("fake.sqlite3"),
+                    "options": {},
+                    "program_by_serial": {"SN1": "Program A", "SN2": "Program B"},
+                },
+                pair_specs=pair_specs,
+                all_serials=["SN1", "SN2"],
+                hi=["SN1"],
+                initial_grade_map_by_pair_serial={("pair-a", "SN1"): "PASS", ("pair-b", "SN1"): "PASS"},
+                final_grade_map_by_pair_serial={("pair-a", "SN1"): "PASS", ("pair-b", "SN1"): "PASS"},
+                finding_by_pair_serial={
+                    ("pair-a", "SN1"): {"initial_z": -0.1, "final_z": -0.1, "official_grade": "PASS", "initial_status": "PASS"},
+                    ("pair-b", "SN1"): {"initial_z": -0.2, "final_z": -0.2, "official_grade": "PASS", "initial_status": "PASS"},
+                },
+            )
+
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0]["parameter"], rows[1]["parameter"])
+        self.assertIn("Chamber Feed Pressure [feed_pressure_raw]", {str(row["parameter"]) for row in rows})
+        self.assertIn("Chamber Feed Pressure [feed_pressure_cmd_raw]", {str(row["parameter"]) for row in rows})
+        grouped = tar._tar_group_comparison_rows_by_serial(rows, serial_order=["SN1"])
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(len(grouped[0]["parameter_order"]), 2)
+
+    def test_metric_series_prefers_aggregate_before_all_sequences(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        calls: list[str] = []
+
+        class FakeBackend:
+            TD_METRIC_PLOT_SOURCE_AGGREGATE = "aggregate"
+            TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES = "all_sequences"
+
+            @staticmethod
+            def td_load_metric_series(_db_path, _run_name, _column_name, _stat, **kwargs):
+                metric_source = str(kwargs.get("metric_source") or "")
+                calls.append(metric_source)
+                if metric_source == "aggregate":
+                    return [
+                        {"observation_id": "agg-1", "serial": "SN1", "value_num": 10.0, "run_name": "Run1"},
+                        {"observation_id": "agg-2", "serial": "SN2", "value_num": 11.0, "run_name": "Run1"},
+                    ]
+                return [
+                    {"observation_id": "seq-1", "serial": "SN1", "value_num": 10.0, "run_name": "Run1"},
+                ]
+
+        rows = tar._load_metric_series_for_selection(
+            FakeBackend(),
+            Path("fake.sqlite3"),
+            "Run1",
+            "thrust",
+            "mean",
+            selection={"mode": "condition", "run_name": "Run1", "member_runs": ["Run1"]},
+            filter_state={},
+        )
+
+        self.assertEqual(calls, ["aggregate"])
+        self.assertEqual(sorted(str(row.get("serial") or "") for row in rows), ["SN1", "SN2"])
+
+    def test_curve_loader_matches_gui_filtering_for_condition_scope(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        seen_kwargs: list[dict[str, object]] = []
+
+        class FakeBackend:
+            @staticmethod
+            def td_load_curves(_db_path, _run_name, _y_name, _x_name, **kwargs):
+                seen_kwargs.append(dict(kwargs))
+                return [
+                    {
+                        "observation_id": "obs-1",
+                        "serial": "SN1",
+                        "run_name": "Run1",
+                        "source_run_name": "SeqA",
+                        "program_title": "Program A",
+                        "run_type": "",
+                        "control_period": 10.0,
+                        "x": [0.0, 1.0],
+                        "y": [5.0, 6.0],
+                    }
+                ]
+
+        curves = tar._load_curves_for_selection(
+            FakeBackend(),
+            Path("fake.sqlite3"),
+            "Run1",
+            "thrust_raw",
+            "Time",
+            selection={
+                "mode": "condition",
+                "run_name": "Run1",
+                "member_runs": ["Run1"],
+                "member_sequences": ["SeqA"],
+                "run_type_mode": "steady_state",
+            },
+            filter_state={"control_periods": ["10"]},
+        )
+
+        self.assertEqual(len(curves), 1)
+        self.assertEqual(curves[0].serial, "SN1")
+        self.assertEqual(len(seen_kwargs), 1)
+        self.assertEqual(seen_kwargs[0].get("control_period_filter"), "10")
+        self.assertTrue("run_type_filter" not in seen_kwargs[0] or seen_kwargs[0].get("run_type_filter") in (None, ""))
 
     def test_build_intro_story_renders_outcome_mix_and_exception_rows(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

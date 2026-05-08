@@ -330,6 +330,8 @@ def _row_matches_selection_run_type_mode(
     selection_run_type_mode: str,
     row_run_type_mode: str,
 ) -> bool:
+    if not str(row_run_type_mode or "").strip():
+        return True
     if selection_run_type_mode == "pulsed_mode":
         return row_run_type_mode == "pulsed_mode"
     if selection_run_type_mode == "steady_state":
@@ -818,6 +820,13 @@ def _filter_rows_for_report_selection(
     ]
 
 
+def _tar_single_control_period_filter_value(
+    filter_state: Mapping[str, object] | None,
+) -> object | None:
+    values = _filter_state_values(filter_state, "control_periods")
+    return values[0] if len(values) == 1 else None
+
+
 def _selection_for_run(run_name: str, options: dict) -> dict:
     run = str(run_name or "").strip()
     if not run:
@@ -1183,7 +1192,9 @@ def _tar_metric_source_candidates(be: Any, selection: Mapping[str, object] | Non
     aggregate_source = _tar_metric_source_aggregate(be)
     if not isinstance(selection, Mapping) or not selection:
         return [aggregate_source]
-    candidates = [_tar_metric_source_all_sequences(be), aggregate_source]
+    # Match the GUI default: aggregate condition means first, then fall back
+    # to sequence-level metric rows only when aggregate rows are unavailable.
+    candidates = [aggregate_source, _tar_metric_source_all_sequences(be)]
     out: list[object] = []
     seen: set[str] = set()
     for source in candidates:
@@ -1248,10 +1259,14 @@ def _load_metric_series_for_selection(
     filter_state: Mapping[str, object] | None = None,
 ) -> list[dict]:
     program_title, source_run_name = _selection_observation_filters(selection)
-    run_type_filter = _selection_single_run_type_mode(selection)
     run_names = _selection_member_runs(selection, fallback_run=run_name)
     if not run_names and str(run_name or "").strip():
         run_names = [str(run_name or "").strip()]
+    loader_control_period_filter = (
+        control_period_filter
+        if control_period_filter not in (None, "")
+        else _tar_single_control_period_filter_value(filter_state)
+    )
 
     for metric_source in _tar_metric_source_candidates(be, selection):
         rows: list[dict] = []
@@ -1265,8 +1280,8 @@ def _load_metric_series_for_selection(
                     stat,
                     program_title=program_title,
                     source_run_name=source_run_name,
-                    control_period_filter=control_period_filter,
-                    run_type_filter=run_type_filter,
+                    control_period_filter=loader_control_period_filter,
+                    run_type_filter="",
                     metric_source=metric_source,
                 )
             )
@@ -1275,7 +1290,7 @@ def _load_metric_series_for_selection(
             selection=selection,
             filter_state=filter_state,
         )
-        if filtered or str(metric_source or "").strip().casefold() == str(_tar_metric_source_aggregate(be) or "").strip().casefold():
+        if filtered:
             return filtered
     return []
 
@@ -1432,10 +1447,10 @@ def _load_curves_for_selection(
     filter_state: Mapping[str, object] | None = None,
 ) -> list[CurveSeries]:
     program_title, source_run_name = _selection_observation_filters(selection)
-    run_type_filter = _selection_single_run_type_mode(selection)
     run_names = _selection_member_runs(selection, fallback_run=run_name)
     if not run_names and str(run_name or "").strip():
         run_names = [str(run_name or "").strip()]
+    loader_control_period_filter = _tar_single_control_period_filter_value(filter_state)
     rows: list[dict] = []
     for candidate_run in run_names:
         try:
@@ -1447,7 +1462,7 @@ def _load_curves_for_selection(
                 serials=serials,
                 program_title=(program_title or None),
                 source_run_name=(source_run_name or None),
-                run_type_filter=(run_type_filter or None),
+                control_period_filter=loader_control_period_filter,
             )
         except Exception:
             loaded = []
@@ -7537,12 +7552,23 @@ def _tar_build_per_serial_comparison_rows(
     base_filter_state = ctx.get("filter_state")
     initial_suppression = _tar_filter_state_label(base_filter_state, "suppression_voltages", all_text="All", none_text="None")
     initial_valve = _tar_filter_state_label(base_filter_state, "valve_voltages", all_text="All", none_text="None")
+    display_to_raw_params: dict[str, set[str]] = {}
+    for spec in pair_specs:
+        if not isinstance(spec, Mapping):
+            continue
+        raw_param = str(spec.get("param") or "").strip()
+        display_param = _tar_pair_param_label(spec) or raw_param
+        if not raw_param or not display_param:
+            continue
+        display_to_raw_params.setdefault(display_param, set()).add(raw_param)
 
     for spec in pair_specs:
         pair_id = str(spec.get("pair_id") or "").strip()
         run_name = str(spec.get("run") or "").strip()
         param_name = str(spec.get("param") or "").strip()
         param_display = _tar_pair_param_label(spec) or param_name
+        if len(display_to_raw_params.get(param_display) or set()) > 1 and param_name:
+            param_display = f"{param_display} [{param_name}]"
         units = _tar_pair_units_label(spec)
         raw_units = str(spec.get("units") or "").strip()
         selection = dict(spec.get("selection") or {})
