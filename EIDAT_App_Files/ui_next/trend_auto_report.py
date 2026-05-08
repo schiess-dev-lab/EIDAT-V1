@@ -376,30 +376,79 @@ def _filter_rows_for_filter_state(
     return [dict(row) for row in (rows or []) if _row_matches_filter_state(row, filter_state)]
 
 
+def _selection_unique_text_values(values: Iterable[object] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _selection_member_runs(
+    selection: Mapping[str, object] | None,
+    *,
+    fallback_run: object = None,
+) -> list[str]:
+    values: list[object] = []
+    if isinstance(selection, Mapping):
+        run_name = str(selection.get("run_name") or "").strip()
+        if run_name:
+            values.append(run_name)
+        raw_members = selection.get("member_runs") or []
+        if isinstance(raw_members, list):
+            values.extend(raw_members)
+        elif str(raw_members or "").strip():
+            values.append(raw_members)
+    if str(fallback_run or "").strip():
+        values.append(fallback_run)
+    return _selection_unique_text_values(values)
+
+
+def _selection_member_sequences(selection: Mapping[str, object] | None) -> list[str]:
+    values: list[object] = []
+    if isinstance(selection, Mapping):
+        raw_sequences = selection.get("member_sequences") or []
+        if isinstance(raw_sequences, list):
+            values.extend(raw_sequences)
+        elif str(raw_sequences or "").strip():
+            values.append(raw_sequences)
+        if not values:
+            for candidate in (
+                selection.get("source_run_name"),
+                selection.get("sequence_name"),
+                selection.get("run_name"),
+            ):
+                text = str(candidate or "").strip()
+                if text:
+                    values.append(text)
+                    break
+    return _selection_unique_text_values(values)
+
+
 def _selection_matches_observation_row(
     selection: Mapping[str, object] | None,
     row: Mapping[str, object] | None,
 ) -> bool:
     if not isinstance(selection, Mapping) or not isinstance(row, Mapping):
         return False
-    sequence_values: list[str] = []
-    raw_sequences = selection.get("member_sequences") or []
-    if isinstance(raw_sequences, list):
-        sequence_values = [str(value).strip() for value in raw_sequences if str(value).strip()]
-    if not sequence_values:
-        for candidate in (
-            selection.get("source_run_name"),
-            selection.get("sequence_name"),
-            selection.get("run_name"),
-        ):
-            text = str(candidate or "").strip()
-            if text:
-                sequence_values = [text]
-                break
+    member_run_values = _selection_member_runs(selection)
+    member_run_set = {value.casefold() for value in member_run_values if value}
+    row_run = str(row.get("run_name") or "").strip()
+    if member_run_set and row_run and row_run.casefold() not in member_run_set:
+        return False
+
+    sequence_values = _selection_member_sequences(selection)
     sequence_set = {value.casefold() for value in sequence_values if value}
     row_sequence = str(row.get("source_run_name") or "").strip()
     if sequence_set:
-        if not row_sequence or row_sequence.casefold() not in sequence_set:
+        if row_sequence and row_sequence.casefold() not in sequence_set:
+            return False
+        if not row_sequence and not (member_run_set and row_run and row_run.casefold() in member_run_set):
             return False
 
     member_programs: list[str] = []
@@ -938,7 +987,7 @@ def _td_order_metric_serials(labels: list[str], serial_rows: list[dict]) -> list
 
 
 def _series_rows_to_metric_map(rows: list[dict]) -> dict[str, float]:
-    out: dict[str, float] = {}
+    values_by_serial: dict[str, list[float]] = {}
     for row in rows or []:
         if not isinstance(row, dict):
             continue
@@ -946,7 +995,12 @@ def _series_rows_to_metric_map(rows: list[dict]) -> dict[str, float]:
         val = row.get("value_num")
         if not sn or not isinstance(val, (int, float)) or not math.isfinite(float(val)):
             continue
-        out[sn] = float(val)
+        values_by_serial.setdefault(sn, []).append(float(val))
+    out: dict[str, float] = {}
+    for serial, values in values_by_serial.items():
+        if not values:
+            continue
+        out[serial] = float(statistics.mean(values))
     return out
 
 
@@ -1117,6 +1171,71 @@ def _resolve_curve_x_key(be: Any, db_path: Path, run_name: str, x_label: str) ->
     return label
 
 
+def _tar_metric_source_all_sequences(be: Any) -> object:
+    return getattr(be, "TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES", "all_sequences")
+
+
+def _tar_metric_source_aggregate(be: Any) -> object:
+    return getattr(be, "TD_METRIC_PLOT_SOURCE_AGGREGATE", "aggregate")
+
+
+def _tar_metric_source_candidates(be: Any, selection: Mapping[str, object] | None) -> list[object]:
+    aggregate_source = _tar_metric_source_aggregate(be)
+    if not isinstance(selection, Mapping) or not selection:
+        return [aggregate_source]
+    candidates = [_tar_metric_source_all_sequences(be), aggregate_source]
+    out: list[object] = []
+    seen: set[str] = set()
+    for source in candidates:
+        key = str(source or "").strip().casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(source)
+    return out or [aggregate_source]
+
+
+def _tar_call_metric_series(
+    be: Any,
+    db_path: Path,
+    run_name: str,
+    column_name: str,
+    stat: str,
+    *,
+    program_title: str,
+    source_run_name: str,
+    control_period_filter: object,
+    run_type_filter: str,
+    metric_source: object,
+) -> list[dict]:
+    kwargs = {
+        "program_title": (program_title or None),
+        "source_run_name": (source_run_name or None),
+        "control_period_filter": control_period_filter,
+        "run_type_filter": (run_type_filter or None),
+        "metric_source": metric_source,
+    }
+    try:
+        rows = be.td_load_metric_series(db_path, run_name, column_name, stat, **kwargs)
+    except TypeError:
+        kwargs.pop("metric_source", None)
+        try:
+            rows = be.td_load_metric_series(db_path, run_name, column_name, stat, **kwargs)
+        except Exception:
+            rows = []
+    except Exception:
+        rows = []
+    out: list[dict] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        payload = dict(row)
+        if not str(payload.get("run_name") or "").strip():
+            payload["run_name"] = str(run_name or "").strip()
+        out.append(payload)
+    return out
+
+
 def _load_metric_series_for_selection(
     be: Any,
     db_path: Path,
@@ -1130,24 +1249,35 @@ def _load_metric_series_for_selection(
 ) -> list[dict]:
     program_title, source_run_name = _selection_observation_filters(selection)
     run_type_filter = _selection_single_run_type_mode(selection)
-    try:
-        rows = be.td_load_metric_series(
-            db_path,
-            run_name,
-            column_name,
-            stat,
-            program_title=(program_title or None),
-            source_run_name=(source_run_name or None),
-            control_period_filter=control_period_filter,
-            run_type_filter=(run_type_filter or None),
+    run_names = _selection_member_runs(selection, fallback_run=run_name)
+    if not run_names and str(run_name or "").strip():
+        run_names = [str(run_name or "").strip()]
+
+    for metric_source in _tar_metric_source_candidates(be, selection):
+        rows: list[dict] = []
+        for candidate_run in run_names:
+            rows.extend(
+                _tar_call_metric_series(
+                    be,
+                    db_path,
+                    candidate_run,
+                    column_name,
+                    stat,
+                    program_title=program_title,
+                    source_run_name=source_run_name,
+                    control_period_filter=control_period_filter,
+                    run_type_filter=run_type_filter,
+                    metric_source=metric_source,
+                )
+            )
+        filtered = _filter_rows_for_report_selection(
+            rows,
+            selection=selection,
+            filter_state=filter_state,
         )
-    except Exception:
-        rows = []
-    return _filter_rows_for_report_selection(
-        rows,
-        selection=selection,
-        filter_state=filter_state,
-    )
+        if filtered or str(metric_source or "").strip().casefold() == str(_tar_metric_source_aggregate(be) or "").strip().casefold():
+            return filtered
+    return []
 
 
 def _load_metric_map_for_selection(
@@ -1276,7 +1406,17 @@ def _curve_rows_to_series(rows: list[dict]) -> list[CurveSeries]:
             y_vals.append(float(yf))
         if len(x_vals) < 2 or len(y_vals) < 2:
             continue
-        out.append(CurveSeries(serial=sn, x=x_vals, y=y_vals))
+        out.append(
+            CurveSeries(
+                serial=sn,
+                x=x_vals,
+                y=y_vals,
+                observation_id=str(row.get("observation_id") or "").strip(),
+                source_run_name=str(row.get("source_run_name") or "").strip(),
+                program_title=str(row.get("program_title") or "").strip(),
+                run_name=str(row.get("run_name") or "").strip(),
+            )
+        )
     return out
 
 
@@ -1293,19 +1433,31 @@ def _load_curves_for_selection(
 ) -> list[CurveSeries]:
     program_title, source_run_name = _selection_observation_filters(selection)
     run_type_filter = _selection_single_run_type_mode(selection)
-    try:
-        rows = be.td_load_curves(
-            db_path,
-            run_name,
-            y_name,
-            x_name,
-            serials=serials,
-            program_title=(program_title or None),
-            source_run_name=(source_run_name or None),
-            run_type_filter=(run_type_filter or None),
-        )
-    except Exception:
-        rows = []
+    run_names = _selection_member_runs(selection, fallback_run=run_name)
+    if not run_names and str(run_name or "").strip():
+        run_names = [str(run_name or "").strip()]
+    rows: list[dict] = []
+    for candidate_run in run_names:
+        try:
+            loaded = be.td_load_curves(
+                db_path,
+                candidate_run,
+                y_name,
+                x_name,
+                serials=serials,
+                program_title=(program_title or None),
+                source_run_name=(source_run_name or None),
+                run_type_filter=(run_type_filter or None),
+            )
+        except Exception:
+            loaded = []
+        for row in loaded or []:
+            if not isinstance(row, dict):
+                continue
+            payload = dict(row)
+            if not str(payload.get("run_name") or "").strip():
+                payload["run_name"] = str(candidate_run or "").strip()
+            rows.append(payload)
     return _curve_rows_to_series(
         _filter_rows_for_report_selection(
             rows,
@@ -1632,6 +1784,10 @@ class CurveSeries:
     serial: str
     x: list[float]
     y: list[float]
+    observation_id: str = ""
+    source_run_name: str = ""
+    program_title: str = ""
+    run_name: str = ""
 
 
 def _load_curves(conn: sqlite3.Connection, run: str, y_name: str, x_name: str) -> list[CurveSeries]:
@@ -6682,6 +6838,42 @@ def _tar_metric_map_for_pair(
     return dict(loaded)
 
 
+def _tar_metric_series_for_pair(
+    ctx: Mapping[str, Any],
+    pair_spec: Mapping[str, Any],
+    stat: str,
+    *,
+    filter_state_override: Mapping[str, object] | None = None,
+) -> list[dict]:
+    cache = ctx.setdefault("metric_series_cache", {})
+    pair_id = str(pair_spec.get("pair_id") or "").strip()
+    run_name = str(pair_spec.get("run") or "").strip()
+    column_name = str(pair_spec.get("param") or "").strip()
+    key = (
+        pair_id or run_name,
+        column_name,
+        str(stat or "").strip().lower(),
+        json.dumps(_tar_clone_filter_state(filter_state_override), sort_keys=True) if filter_state_override is not None else "",
+    )
+    if key in cache:
+        cached = cache.get(key)
+        return [dict(row) for row in (cached or []) if isinstance(row, dict)]
+
+    be = ctx["be"]
+    selection = pair_spec.get("selection") or _selection_for_run(run_name, ctx["options"])
+    loaded = _load_metric_series_for_selection(
+        be,
+        ctx["db_path"],
+        run_name,
+        column_name,
+        stat,
+        selection=selection,
+        filter_state=(filter_state_override if filter_state_override is not None else ctx["filter_state"]),
+    )
+    cache[key] = [dict(row) for row in loaded if isinstance(row, dict)]
+    return [dict(row) for row in (cache.get(key) or []) if isinstance(row, dict)]
+
+
 def _tar_metric_map_for_run(ctx: Mapping[str, Any], run_name: str, column_name: str, stat: str) -> dict[str, float]:
     return _tar_metric_map_for_pair(
         ctx,
@@ -6759,7 +6951,11 @@ def _tar_curve_plot_payload_for_pair(
     hi_dom = float(domain[1])
     grid_points = max(2, int(ctx.get("grid_points") or 200))
     x_grid = [lo + (hi_dom - lo) * (idx / (grid_points - 1)) for idx in range(grid_points)]
-    y_resampled_by_sn = {curve.serial: _interp_linear(curve.x, curve.y, x_grid) for curve in series}
+    y_resampled_by_sn = _tar_resampled_trace_map(
+        series,
+        x_grid=x_grid,
+        program_by_serial=(ctx.get("program_by_serial") if isinstance(ctx, Mapping) else None),
+    )
     program_traces = _tar_program_trace_map(
         y_resampled_by_sn,
         program_by_serial=(ctx.get("program_by_serial") if isinstance(ctx, Mapping) else None),
@@ -9802,7 +9998,7 @@ def _tar_resampled_trace_map(
         for value in (allowed_programs or [])
         if _td_display_program_title(value)
     }
-    out: dict[str, list[float]] = {}
+    buckets: dict[str, list[list[float]]] = {}
     for curve in (series or []):
         if not isinstance(curve, CurveSeries):
             continue
@@ -9812,8 +10008,74 @@ def _tar_resampled_trace_map(
         program = _tar_program_label(program_by_serial, serial)
         if allowed and program not in allowed:
             continue
-        out[serial] = _interp_linear(curve.x, curve.y, x_grid)
+        buckets.setdefault(serial, []).append(_interp_linear(curve.x, curve.y, x_grid))
+    return {
+        serial: _tar_mean_trace(traces)
+        for serial, traces in buckets.items()
+        if traces
+    }
+
+
+def _tar_curve_trace_id(curve: CurveSeries, ordinal: int) -> str:
+    parts = [
+        str(curve.serial or "").strip(),
+        str(curve.run_name or "").strip(),
+        str(curve.source_run_name or "").strip(),
+        str(curve.observation_id or "").strip(),
+    ]
+    text = "|".join(part for part in parts if part)
+    return text or f"trace:{ordinal}"
+
+
+def _tar_resampled_trace_entries(
+    series: Iterable[CurveSeries] | None,
+    *,
+    x_grid: list[float],
+    program_by_serial: Mapping[str, str] | None = None,
+    allowed_programs: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
+    allowed = {
+        _td_display_program_title(value)
+        for value in (allowed_programs or [])
+        if _td_display_program_title(value)
+    }
+    out: list[dict[str, Any]] = []
+    for ordinal, curve in enumerate(series or [], start=1):
+        if not isinstance(curve, CurveSeries):
+            continue
+        serial = str(curve.serial or "").strip()
+        if not serial:
+            continue
+        program = _tar_program_label(program_by_serial, serial)
+        if allowed and program not in allowed:
+            continue
+        out.append(
+            {
+                "trace_id": _tar_curve_trace_id(curve, ordinal),
+                "serial": serial,
+                "run_name": str(curve.run_name or "").strip(),
+                "source_run_name": str(curve.source_run_name or "").strip(),
+                "observation_id": str(curve.observation_id or "").strip(),
+                "program_title": str(curve.program_title or "").strip(),
+                "y_curve": _interp_linear(curve.x, curve.y, x_grid),
+            }
+        )
     return out
+
+
+def _tar_merge_resampled_trace_map(
+    target: dict[str, list[float]],
+    incoming: Mapping[str, list[float]] | None,
+) -> None:
+    for raw_serial, raw_trace in (incoming or {}).items():
+        serial = str(raw_serial or "").strip()
+        trace = list(raw_trace or [])
+        if not serial or not trace:
+            continue
+        if serial in target:
+            target[serial] = _tar_mean_trace([list(target.get(serial) or []), trace])
+        else:
+            target[serial] = trace
 
 
 def _tar_initial_skip_row(
@@ -9938,17 +10200,24 @@ def _tar_analyze_curve_groups(
             continue
         x_grid = list(initial_scope_model.get("x_grid") or [])
         full_trace_map_by_spec: dict[str, dict[str, list[float]]] = {}
+        visual_trace_entries_by_spec: dict[str, list[dict[str, Any]]] = {}
         full_trace_map_all: dict[str, list[float]] = {}
         full_metric_mean_all: dict[str, float] = {}
         for spec in members:
             pair_id = str(spec.get("pair_id") or "").strip()
+            spec_series = list(spec.get("series") or [])
             resampled = _tar_resampled_trace_map(
-                spec.get("series") or [],
+                spec_series,
+                x_grid=x_grid,
+                program_by_serial=program_by_serial,
+            )
+            visual_trace_entries_by_spec[pair_id] = _tar_resampled_trace_entries(
+                spec_series,
                 x_grid=x_grid,
                 program_by_serial=program_by_serial,
             )
             full_trace_map_by_spec[pair_id] = dict(resampled)
-            full_trace_map_all.update(resampled)
+            _tar_merge_resampled_trace_map(full_trace_map_all, resampled)
             for raw_serial, raw_value in dict(spec.get("metric_mean_by_serial") or {}).items():
                 serial = str(raw_serial or "").strip()
                 value = _safe_float(raw_value)
@@ -10055,13 +10324,12 @@ def _tar_analyze_curve_groups(
         if isinstance(visual_initial_model, dict):
             for spec in members:
                 pair_id = str(spec.get("pair_id") or "").strip()
-                for serial, y_curve in dict(full_trace_map_by_spec.get(pair_id) or {}).items():
+                for trace in list(visual_trace_entries_by_spec.get(pair_id) or []):
                     visual_trace_curves.append(
                         {
                             "pair_id": pair_id,
                             "selection_label": str(spec.get("selection_label") or ""),
-                            "serial": serial,
-                            "y_curve": list(y_curve),
+                            **dict(trace),
                         }
                     )
         if isinstance(initial_model, dict):
@@ -10379,6 +10647,7 @@ def _tar_analyze_curve_groups(
                 continue
             x_grid = list(final_scope_model.get("x_grid") or [])
             full_trace_map_by_spec: dict[str, dict[str, list[float]]] = {}
+            visual_trace_entries_by_spec: dict[str, list[dict[str, Any]]] = {}
             full_trace_map_all: dict[str, list[float]] = {}
             for spec in member_specs:
                 pair_id = str(spec.get("pair_id") or "").strip()
@@ -10388,8 +10657,13 @@ def _tar_analyze_curve_groups(
                     x_grid=x_grid,
                     program_by_serial=program_by_serial,
                 )
+                visual_trace_entries_by_spec[pair_id] = _tar_resampled_trace_entries(
+                    condition_series,
+                    x_grid=x_grid,
+                    program_by_serial=program_by_serial,
+                )
                 full_trace_map_by_spec[pair_id] = dict(resampled)
-                full_trace_map_all.update(resampled)
+                _tar_merge_resampled_trace_map(full_trace_map_all, resampled)
             final_program_traces = _tar_program_trace_map(
                 full_trace_map_all,
                 program_by_serial=program_by_serial,
@@ -10434,15 +10708,15 @@ def _tar_analyze_curve_groups(
                     "program_weighting": "equal_program_weight",
                 }
                 spec.setdefault("final_programs_by_condition", {})[condition_key] = _tar_unique_text_values(list(final_program_traces.keys()))
-                for serial, y_curve in y_resampled_by_sn.items():
+                for trace in list(visual_trace_entries_by_spec.get(pair_id) or []):
                     trace_curves.append(
                         {
                             "pair_id": pair_id,
                             "selection_label": str(spec.get("selection_label") or ""),
-                            "serial": serial,
-                            "y_curve": list(y_curve),
+                            **dict(trace),
                         }
                     )
+                for serial, y_curve in y_resampled_by_sn.items():
                     dev = _tar_compute_curve_deviation(y_curve, final_master_y, x_grid, denom=final_denom)
                     if dev is not None:
                         all_entries.append((spec, serial, dev))
@@ -11754,29 +12028,57 @@ def _tar_render_metric_cohort_page(
     pair_by_id = ctx.get("pair_by_id") or {}
 
     family_values: list[float] = []
-    plotted: list[tuple[dict, list[float], str]] = []
+    plotted: list[tuple[dict, list[tuple[float, float, str]], str]] = []
     for member_index, pair_id in enumerate(cohort_spec.get("member_pair_ids") or []):
         pair_spec = pair_by_id.get(str(pair_id or "").strip()) or {}
         if not pair_spec:
             continue
-        vmap = _tar_metric_map_for_pair(
+        rows = _tar_metric_series_for_pair(
             ctx,
             pair_spec,
             metric_stat,
             filter_state_override=filter_state_override,
         )
-        yv = [
-            float(vmap.get(serial))
-            if isinstance(vmap.get(serial), (int, float)) and math.isfinite(float(vmap.get(serial)))
-            else float("nan")
-            for serial in serials
-        ]
-        finite_vals = [float(value) for value in yv if isinstance(value, float) and not math.isnan(value)]
+        raw_points: list[tuple[str, float]] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            serial = str(row.get("serial") or "").strip()
+            value = _safe_float(row.get("value_num"))
+            if not serial or serial not in serial_index or value is None or not math.isfinite(float(value)):
+                continue
+            raw_points.append((serial, float(value)))
+        if not raw_points:
+            vmap = _tar_metric_map_for_pair(
+                ctx,
+                pair_spec,
+                metric_stat,
+                filter_state_override=filter_state_override,
+            )
+            raw_points = [
+                (serial, float(value))
+                for serial, value in vmap.items()
+                if serial in serial_index and isinstance(value, (int, float)) and math.isfinite(float(value))
+            ]
+        serial_counts: dict[str, int] = {}
+        for serial, _value in raw_points:
+            serial_counts[serial] = serial_counts.get(serial, 0) + 1
+        serial_seen: dict[str, int] = {}
+        points: list[tuple[float, float, str]] = []
+        for serial, value in raw_points:
+            ordinal = serial_seen.get(serial, 0)
+            serial_seen[serial] = ordinal + 1
+            count = max(1, serial_counts.get(serial, 1))
+            offset = 0.0
+            if count > 1:
+                offset = ((ordinal - ((count - 1) / 2.0)) / max(1, count - 1)) * 0.24
+            points.append((float(serial_index[serial]) + offset, float(value), serial))
+        finite_vals = [float(value) for _x, value, _serial in points]
         if not finite_vals:
             continue
         color = colors[member_index % len(colors)]
         family_values.extend(finite_vals)
-        plotted.append((pair_spec, yv, color))
+        plotted.append((pair_spec, points, color))
 
     if not plotted:
         plt.close(fig)
@@ -11784,30 +12086,28 @@ def _tar_render_metric_cohort_page(
 
     _tar_set_plot_parameter_title(ax, f"{param_name} ({metric_stat})")
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
-    for pair_spec, yv, color in plotted:
+    for pair_spec, points, color in plotted:
         label = _tar_metric_pair_legend_label(
             pair_spec,
             param_name=param_name,
             run_by_name=(ctx.get("run_by_name") or {}),
         )
-        points = [
-            (float(idx), float(value))
-            for idx, value in enumerate(yv)
-            if isinstance(value, float) and not math.isnan(value)
-        ]
         if points:
             xs = [point[0] for point in points]
             ys = [point[1] for point in points]
             ax.scatter(xs, ys, s=22, alpha=0.62, color=color, label=label, zorder=2.0)
-        pair_id = str(pair_spec.get("pair_id") or "").strip()
-        for serial in (ctx.get("hi") or []):
-            xi = serial_index.get(serial)
-            if xi is None:
-                continue
-            y_val = yv[xi]
-            if math.isnan(y_val):
-                continue
-            ax.scatter([xi], [y_val], s=62, color=color, marker="x", linewidths=1.8, zorder=5.0)
+        hi_set = {str(serial or "").strip() for serial in (ctx.get("hi") or []) if str(serial or "").strip()}
+        hi_points = [(x_val, y_val) for x_val, y_val, serial in points if serial in hi_set]
+        if hi_points:
+            ax.scatter(
+                [point[0] for point in hi_points],
+                [point[1] for point in hi_points],
+                s=62,
+                color=color,
+                marker="x",
+                linewidths=1.8,
+                zorder=5.0,
+            )
     if show_family_overlay and family_values:
         ax.axhline(float(statistics.mean(family_values)), color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.70, label=family_mean_label)
     _tar_apply_metric_axis_format(fig, ax, serials=serials, meta_by_sn=(ctx.get("meta_by_sn") or {}))

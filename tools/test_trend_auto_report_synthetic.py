@@ -777,6 +777,258 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             ["Pulse Mode Condition | Feed Pressure: 350 psia | On Time: 5 sec | Off Time: 55 sec"],
         )
 
+    def test_prepare_row_specs_uses_all_member_sequences_for_mixed_condition(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        class _FakeBackend:
+            TD_METRIC_PLOT_SOURCE_AGGREGATE = "aggregate"
+            TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES = "all_sequences"
+
+            def __init__(self) -> None:
+                self.metric_sources: list[object] = []
+                self.metric_run_type_filters: list[object] = []
+                self.curve_run_type_filters: list[object] = []
+
+            def td_list_curve_y_columns(self, *_args, **_kwargs):
+                return [{"name": "thrust", "units": "lbf"}]
+
+            def td_load_curves(self, *_args, **kwargs):
+                self.curve_run_type_filters.append(kwargs.get("run_type_filter"))
+                return [
+                    {
+                        "observation_id": "obs_cert_seq1",
+                        "serial": "SN_CERT",
+                        "program_title": "Program A",
+                        "source_run_name": "Seq1",
+                        "run_type": "SS",
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "x": [0.0, 1.0, 2.0],
+                        "y": [10.0, 11.0, 12.0],
+                    },
+                    {
+                        "observation_id": "obs_cert_seq2",
+                        "serial": "SN_CERT",
+                        "program_title": "Program A",
+                        "source_run_name": "Seq2",
+                        "run_type": "PM",
+                        "control_period": 60.0,
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "x": [0.0, 1.0, 2.0],
+                        "y": [20.0, 21.0, 22.0],
+                    },
+                    {
+                        "observation_id": "obs_base_seq1",
+                        "serial": "SN_BASE",
+                        "program_title": "Program B",
+                        "source_run_name": "Seq1",
+                        "run_type": "SS",
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "x": [0.0, 1.0, 2.0],
+                        "y": [30.0, 31.0, 32.0],
+                    },
+                    {
+                        "observation_id": "obs_other_seq3",
+                        "serial": "SN_OTHER",
+                        "program_title": "Program C",
+                        "source_run_name": "Seq3",
+                        "run_type": "SS",
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "x": [0.0, 1.0, 2.0],
+                        "y": [40.0, 41.0, 42.0],
+                    },
+                ]
+
+            def td_load_metric_series(self, *_args, **kwargs):
+                self.metric_sources.append(kwargs.get("metric_source"))
+                self.metric_run_type_filters.append(kwargs.get("run_type_filter"))
+                if kwargs.get("metric_source") != self.TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES:
+                    return []
+                return [
+                    {
+                        "observation_id": "obs_cert_seq1",
+                        "serial": "SN_CERT",
+                        "program_title": "Program A",
+                        "source_run_name": "Seq1",
+                        "run_type": "SS",
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "value_num": 10.0,
+                    },
+                    {
+                        "observation_id": "obs_cert_seq2",
+                        "serial": "SN_CERT",
+                        "program_title": "Program A",
+                        "source_run_name": "Seq2",
+                        "run_type": "PM",
+                        "control_period": 60.0,
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "value_num": 20.0,
+                    },
+                    {
+                        "observation_id": "obs_base_seq1",
+                        "serial": "SN_BASE",
+                        "program_title": "Program B",
+                        "source_run_name": "Seq1",
+                        "run_type": "SS",
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "value_num": 30.0,
+                    },
+                    {
+                        "observation_id": "obs_other_seq3",
+                        "serial": "SN_OTHER",
+                        "program_title": "Program C",
+                        "source_run_name": "Seq3",
+                        "run_type": "SS",
+                        "suppression_voltage": 24.0,
+                        "valve_voltage": 12.0,
+                        "value_num": 40.0,
+                    },
+                ]
+
+        selection = {
+            "mode": "condition",
+            "id": "condition:Run1:mixed",
+            "run_name": "Run1",
+            "display_text": "350 psia, SS/PM",
+            "run_condition": "350 psia, SS/PM",
+            "member_runs": ["Run1"],
+            "member_sequences": ["Seq1", "Seq2"],
+            "member_suppression_voltages": ["24"],
+            "member_valve_voltages": ["12"],
+            "member_run_type_modes": ["steady_state", "pulsed_mode"],
+        }
+        filter_rows = [
+            {
+                "observation_id": "obs_cert_seq1",
+                "serial": "SN_CERT",
+                "program_title": "Program A",
+                "run_name": "Run1",
+                "source_run_name": "Seq1",
+                "run_type": "SS",
+                "suppression_voltage": 24.0,
+                "valve_voltage": 12.0,
+                "condition_display": "350 psia, SS",
+                "feed_pressure": 350.0,
+                "feed_pressure_units": "psia",
+            },
+            {
+                "observation_id": "obs_cert_seq2",
+                "serial": "SN_CERT",
+                "program_title": "Program A",
+                "run_name": "Run1",
+                "source_run_name": "Seq2",
+                "run_type": "PM",
+                "control_period": 60.0,
+                "suppression_voltage": 24.0,
+                "valve_voltage": 12.0,
+                "condition_display": "350 psia, PM, 5 Sec ON / 55 Sec OFF",
+                "feed_pressure": 350.0,
+                "feed_pressure_units": "psia",
+                "pulse_width": 5.0,
+                "pulse_width_on": 5.0,
+                "pulse_width_units": "sec",
+                "off_time": 55.0,
+                "off_time_units": "sec",
+            },
+        ]
+        be = _FakeBackend()
+
+        with sqlite3.connect(":memory:") as conn:
+            row_specs = tar._tar_prepare_row_specs(
+                be=be,
+                db_path=Path("fake.sqlite3"),
+                conn=conn,
+                run_by_name={"Run1": {"default_x": "Time", "display_name": "Run 1"}},
+                selections=[selection],
+                params=["thrust"],
+                filter_rows=filter_rows,
+                filter_state={},
+            )
+
+        self.assertEqual(len(row_specs), 1)
+        spec = row_specs[0]
+        self.assertEqual(be.metric_sources, ["all_sequences"])
+        self.assertEqual(be.metric_run_type_filters, [None])
+        self.assertTrue(all(value is None for value in be.curve_run_type_filters))
+        self.assertEqual(spec["metric_mean_by_serial"], {"SN_CERT": 15.0, "SN_BASE": 30.0})
+        self.assertEqual([curve.serial for curve in spec["series"]], ["SN_CERT", "SN_CERT", "SN_BASE"])
+        self.assertEqual(
+            [curve.source_run_name for curve in spec["series"] if curve.serial == "SN_CERT"],
+            ["Seq1", "Seq2"],
+        )
+        self.assertEqual([str(row.get("run_type") or "") for row in spec["condition_context_rows"]], ["SS", "PM"])
+
+    def test_metric_series_loader_falls_back_to_aggregate_cache_for_legacy_rows(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        class _FakeBackend:
+            TD_METRIC_PLOT_SOURCE_AGGREGATE = "aggregate"
+            TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES = "all_sequences"
+
+            def __init__(self) -> None:
+                self.sources: list[object] = []
+
+            def td_load_metric_series(self, *_args, **kwargs):
+                source = kwargs.get("metric_source")
+                self.sources.append(source)
+                if source == self.TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES:
+                    return []
+                return [{"serial": "SN1", "value_num": 42.0}]
+
+        be = _FakeBackend()
+        rows = tar._load_metric_series_for_selection(
+            be,
+            Path("fake.sqlite3"),
+            "Run1",
+            "thrust",
+            "mean",
+            selection={
+                "mode": "condition",
+                "run_name": "Run1",
+                "member_runs": ["Run1"],
+                "member_sequences": ["Seq1"],
+            },
+            filter_state={},
+        )
+
+        self.assertEqual(be.sources, ["all_sequences", "aggregate"])
+        self.assertEqual([(row.get("serial"), row.get("run_name"), row.get("value_num")) for row in rows], [("SN1", "Run1", 42.0)])
+
+    def test_resampled_trace_helpers_aggregate_duplicate_serials_without_losing_entries(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        curves = [
+            tar.CurveSeries(
+                serial="SN1",
+                x=[0.0, 1.0],
+                y=[10.0, 12.0],
+                observation_id="obs1",
+                source_run_name="Seq1",
+                run_name="Run1",
+            ),
+            tar.CurveSeries(
+                serial="SN1",
+                x=[0.0, 1.0],
+                y=[20.0, 24.0],
+                observation_id="obs2",
+                source_run_name="Seq2",
+                run_name="Run1",
+            ),
+        ]
+
+        trace_map = tar._tar_resampled_trace_map(curves, x_grid=[0.0, 1.0])
+        trace_entries = tar._tar_resampled_trace_entries(curves, x_grid=[0.0, 1.0])
+
+        self.assertEqual(trace_map, {"SN1": [15.0, 18.0]})
+        self.assertEqual([entry["source_run_name"] for entry in trace_entries], ["Seq1", "Seq2"])
+        self.assertEqual(len({entry["trace_id"] for entry in trace_entries}), 2)
+
     def test_td_cached_statistics_reads_existing_cache_meta(self):
         from EIDAT_App_Files.ui_next import backend as be
 

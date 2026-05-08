@@ -12703,6 +12703,10 @@ class TestTDSupportWorkbook(unittest.TestCase):
             [item.get("id") for item in harness._current_run_selections()],
             ["condition:a", "condition:b"],
         )
+        self.assertEqual(
+            [item.get("member_sequences") for item in harness._current_run_selections()],
+            [["Seq1", "Seq2"], ["Seq3"]],
+        )
         self.assertEqual(harness._current_member_runs(), ["RunA", "RunB"])
 
     @unittest.skipUnless(_have_pyside6(), "PySide6 not installed")
