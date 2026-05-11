@@ -2334,6 +2334,8 @@ def _tar_normalize_grade_token(grade: object) -> str:
     if not raw:
         return ""
     normalized = raw.replace("-", "_").replace(" ", "_")
+    if normalized in {"NOT_GRADED", "UNGRADED"}:
+        return "NOT_GRADED"
     if normalized in {"NO_DATA", "NODATA"}:
         return "NO_DATA"
     if normalized in {"LIMITED", "NO_SCORE", "NOSCORE"}:
@@ -3874,6 +3876,11 @@ def _tar_grade_basis_text(row: Mapping[str, object] | None) -> str:
     if not isinstance(row, Mapping):
         return ""
     pass_type = str(row.get("official_pass_type") or "").strip().lower()
+    if pass_type == "comparison_unavailable":
+        reason = _tar_skip_reason_label(row.get("final_unavailable_reason") or row.get("initial_skip_reason"))
+        if reason:
+            return f"Informational only\nComparison unavailable: {reason}"
+        return "Informational only\nComparison unavailable: raw curve data was present but no valid comparison cohort was available"
     if pass_type == "selected_program_pool" or (
         pass_type == "initial_prepass"
         and (
@@ -6082,6 +6089,38 @@ def _tar_subtitle_text(text: object) -> str:
     return textwrap.shorten(raw, width=180, placeholder="...")
 
 
+def _tar_resolved_condition_label(
+    spec: Mapping[str, object] | None = None,
+    *,
+    selection_fields: Mapping[str, object] | None = None,
+    run_name: object = "",
+) -> str:
+    raw_spec = dict(spec or {})
+    fields: Mapping[str, object] = {}
+    if isinstance(selection_fields, Mapping):
+        fields = selection_fields
+    elif isinstance(raw_spec.get("selection_fields"), Mapping):
+        fields = raw_spec.get("selection_fields") or {}
+    for value in (
+        raw_spec.get("condition_label"),
+        raw_spec.get("base_condition_label"),
+        fields.get("condition_text"),
+        fields.get("display_text"),
+        raw_spec.get("selection_label"),
+        raw_spec.get("run"),
+        run_name,
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _tar_condition_label_is_pulse(label: object) -> bool:
+    token = _norm_key(str(label or ""))
+    return token in {"pm", "pulsemode", "pulsedmode", "pulsemodecondition", "pulsedmodecondition"}
+
+
 def _tar_plot_condition_mode_label(row: Mapping[str, object] | None) -> str:
     if not isinstance(row, Mapping):
         return ""
@@ -6134,19 +6173,24 @@ def _tar_plot_condition_header_line(
     if not isinstance(row, Mapping):
         return str(fallback_condition_label or "").strip()
     mode_label = _tar_plot_condition_mode_label(row)
+    condition_label = str(row.get("condition_label") or fallback_condition_label or "").strip()
+    pulse_like = _tar_condition_label_is_pulse(condition_label)
+    if not condition_label:
+        condition_label = mode_label
+        pulse_like = mode_label == "Pulse Mode Condition"
     pressure_text = _td_value_with_units(row.get("feed_pressure"), row.get("feed_pressure_units"))
     on_time_text = _tar_plot_condition_on_time_text(row)
     off_time_text = _tar_plot_condition_off_time_text(row)
 
     parts: list[str] = []
-    if mode_label:
-        parts.append(mode_label)
-    if pressure_text:
+    if condition_label:
+        parts.append(condition_label)
+    if pressure_text and pressure_text not in condition_label:
         parts.append(f"Feed Pressure: {pressure_text}")
-    if mode_label == "Pulse Mode Condition":
-        if on_time_text:
+    if pulse_like:
+        if on_time_text and on_time_text not in condition_label:
             parts.append(f"On Time: {on_time_text}")
-        if off_time_text:
+        if off_time_text and off_time_text not in condition_label:
             parts.append(f"Off Time: {off_time_text}")
 
     if parts:
@@ -6211,7 +6255,8 @@ def _tar_plot_condition_header_lines(
     pair_by_id = ctx.get("pair_by_id") or {}
     suppression_text, valve_text = _tar_plot_condition_filter_labels(raw_spec, filter_state_override=filter_state_override)
     fallback_label = str(
-        raw_spec.get("base_condition_label")
+        raw_spec.get("condition_label")
+        or raw_spec.get("base_condition_label")
         or raw_spec.get("run_condition_label")
         or _tar_plot_run_condition_label(raw_spec, run_by_name=(ctx.get("run_by_name") or {}))
         or ""
@@ -6267,11 +6312,14 @@ def _tar_plot_run_condition_label(
     fallback_values: list[object] | None = None,
     max_items: int = 3,
 ) -> str:
+    if isinstance(spec, Mapping):
+        resolved = _tar_resolved_condition_label(spec)
+        if resolved:
+            return resolved
     values: list[object] = []
     if isinstance(spec, Mapping):
         values.extend(
             [
-                spec.get("base_condition_label"),
                 spec.get("selection_label"),
             ]
         )
@@ -6720,6 +6768,70 @@ def _tar_selection_valve_values(
     return []
 
 
+def _tar_selection_matching_rows(
+    selection: Mapping[str, object] | None,
+    rows: list[dict] | None,
+    *,
+    filter_state: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    matched: list[dict[str, object]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if not _row_matches_filter_state(row, filter_state):
+            continue
+        if not _selection_matches_observation_row(selection, row):
+            continue
+        matched.append(dict(row))
+    return matched
+
+
+def _tar_singleton_condition_value(values: Iterable[object] | None) -> str:
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text.casefold() in seen:
+            continue
+        seen.add(text.casefold())
+        resolved.append(text)
+        if len(resolved) > 1:
+            return ""
+    return resolved[0] if len(resolved) == 1 else ""
+
+
+def _tar_condition_voltage_defaults_from_rows(
+    rows: list[Mapping[str, object]] | None,
+) -> dict[str, str]:
+    return {
+        "suppression_voltage_label": _tar_singleton_condition_value(
+            _td_suppression_voltage_filter_value(row)
+            for row in (rows or [])
+            if isinstance(row, Mapping)
+        ),
+        "valve_voltage_label": _tar_singleton_condition_value(
+            _td_valve_voltage_filter_value(row)
+            for row in (rows or [])
+            if isinstance(row, Mapping)
+        ),
+    }
+
+
+def _tar_resolved_condition_voltage_labels(
+    row: Mapping[str, object] | None,
+    *,
+    suppression_default: object = None,
+    valve_default: object = None,
+) -> tuple[str, str]:
+    suppression_value = _td_suppression_voltage_filter_value(row)
+    valve_value = _td_valve_voltage_filter_value(row)
+    if not suppression_value:
+        suppression_value = str(suppression_default or "").strip()
+    if not valve_value:
+        valve_value = str(valve_default or "").strip()
+    return suppression_value, valve_value
+
+
 def _tar_selection_report_label(
     selection: Mapping[str, object] | None,
     run_by_name: Mapping[str, dict] | None = None,
@@ -6838,6 +6950,22 @@ def _tar_metric_map_for_pair(
         cached = cache.get(key)
         return dict(cached) if isinstance(cached, dict) else {}
 
+    condition_tokens = _tar_condition_match_tokens_for_pair(
+        pair_spec,
+        filter_state_override=filter_state_override,
+    )
+    if condition_tokens is not None:
+        loaded = _series_rows_to_metric_map(
+            _tar_metric_series_for_pair(
+                ctx,
+                pair_spec,
+                stat,
+                filter_state_override=filter_state_override,
+            )
+        )
+        cache[key] = dict(loaded)
+        return dict(loaded)
+
     be = ctx["be"]
     selection = pair_spec.get("selection") or _selection_for_run(run_name, ctx["options"])
     loaded = _load_metric_map_for_selection(
@@ -6874,6 +7002,37 @@ def _tar_metric_series_for_pair(
         cached = cache.get(key)
         return [dict(row) for row in (cached or []) if isinstance(row, dict)]
 
+    condition_tokens = _tar_condition_match_tokens_for_pair(
+        pair_spec,
+        filter_state_override=filter_state_override,
+    )
+    if condition_tokens is not None:
+        base_key = (pair_id or run_name, column_name, str(stat or "").strip().lower(), "__base_condition_rows__")
+        if base_key in cache:
+            base_rows = [dict(row) for row in (cache.get(base_key) or []) if isinstance(row, dict)]
+        else:
+            be = ctx["be"]
+            selection = pair_spec.get("selection") or _selection_for_run(run_name, ctx["options"])
+            base_filter_state = (
+                pair_spec.get("base_filter_state")
+                if isinstance(pair_spec.get("base_filter_state"), Mapping)
+                else ctx["filter_state"]
+            )
+            loaded_base = _load_metric_series_for_selection(
+                be,
+                ctx["db_path"],
+                run_name,
+                column_name,
+                stat,
+                selection=selection,
+                filter_state=base_filter_state,
+            )
+            cache[base_key] = [dict(row) for row in loaded_base if isinstance(row, dict)]
+            base_rows = [dict(row) for row in (cache.get(base_key) or []) if isinstance(row, dict)]
+        filtered_rows = _tar_filter_metric_rows_by_condition_tokens(base_rows, condition_tokens)
+        cache[key] = [dict(row) for row in filtered_rows if isinstance(row, dict)]
+        return [dict(row) for row in (cache.get(key) or []) if isinstance(row, dict)]
+
     be = ctx["be"]
     selection = pair_spec.get("selection") or _selection_for_run(run_name, ctx["options"])
     loaded = _load_metric_series_for_selection(
@@ -6908,6 +7067,99 @@ def _tar_condition_combo_key(suppression_voltage: object = None, valve_voltage: 
     return f"supp={suppression_text}|valve={valve_text}"
 
 
+def _tar_filter_state_condition_key(
+    filter_state: Mapping[str, object] | None,
+) -> str:
+    has_suppression = _filter_state_has_key(filter_state, "suppression_voltages")
+    has_valve = _filter_state_has_key(filter_state, "valve_voltages")
+    if not has_suppression and not has_valve:
+        return ""
+    suppression_values = _filter_state_values(filter_state, "suppression_voltages")
+    valve_values = _filter_state_values(filter_state, "valve_voltages")
+    suppression_text = suppression_values[0] if len(suppression_values) == 1 else ""
+    valve_text = valve_values[0] if len(valve_values) == 1 else ""
+    return _tar_condition_combo_key(suppression_text, valve_text)
+
+
+def _tar_condition_match_token_from_row(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    observation_id = str(row.get("observation_id") or "").strip()
+    if observation_id:
+        return f"obs:{observation_id}"
+    serial = _td_serial_value(row)
+    run_name = str(row.get("run_name") or "").strip()
+    source_run_name = str(row.get("source_run_name") or "").strip()
+    parts = [serial, source_run_name, run_name]
+    text = "|".join(part for part in parts if part)
+    return f"row:{text}" if text else ""
+
+
+def _tar_condition_match_token_from_curve(curve: CurveSeries) -> str:
+    if not isinstance(curve, CurveSeries):
+        return ""
+    observation_id = str(curve.observation_id or "").strip()
+    if observation_id:
+        return f"obs:{observation_id}"
+    parts = [
+        str(curve.serial or "").strip(),
+        str(curve.source_run_name or "").strip(),
+        str(curve.run_name or "").strip(),
+    ]
+    text = "|".join(part for part in parts if part)
+    return f"row:{text}" if text else ""
+
+
+def _tar_condition_match_tokens_for_pair(
+    pair_spec: Mapping[str, object] | None,
+    *,
+    filter_state_override: Mapping[str, object] | None = None,
+) -> set[str] | None:
+    condition_key = _tar_filter_state_condition_key(filter_state_override)
+    if not condition_key:
+        return None
+    raw = (dict(pair_spec or {}).get("condition_match_tokens_by_key") or {})
+    if not isinstance(raw, Mapping):
+        return None
+    values = raw.get(condition_key) or []
+    tokens = {str(value).strip() for value in values if str(value).strip()}
+    return tokens or None
+
+
+def _tar_filter_curve_series_by_condition_tokens(
+    series: Iterable[CurveSeries] | None,
+    tokens: Collection[str] | None,
+) -> list[CurveSeries]:
+    wanted = {str(token).strip() for token in (tokens or []) if str(token).strip()}
+    if not wanted:
+        return []
+    filtered: list[CurveSeries] = []
+    for curve in series or []:
+        if not isinstance(curve, CurveSeries):
+            continue
+        if _tar_condition_match_token_from_curve(curve) not in wanted:
+            continue
+        filtered.append(curve)
+    return filtered
+
+
+def _tar_filter_metric_rows_by_condition_tokens(
+    rows: list[dict] | None,
+    tokens: Collection[str] | None,
+) -> list[dict]:
+    wanted = {str(token).strip() for token in (tokens or []) if str(token).strip()}
+    if not wanted:
+        return []
+    filtered: list[dict] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if _tar_condition_match_token_from_row(row) not in wanted:
+            continue
+        filtered.append(dict(row))
+    return filtered
+
+
 def _tar_curve_plot_payload_for_pair(
     ctx: Mapping[str, Any],
     run_name: str,
@@ -6921,12 +7173,10 @@ def _tar_curve_plot_payload_for_pair(
     cache_key = pair_id or (str(run_name or "").strip(), str(param_name or "").strip())
     if cache_key in cache:
         cached = cache.get(cache_key)
-        return dict(cached) if isinstance(cached, dict) else None
-
-    if isinstance(spec.get("plot_payload"), dict):
-        payload = dict(spec.get("plot_payload") or {})
-        cache[cache_key] = payload
-        return dict(payload)
+        if isinstance(cached, dict) and cached:
+            return dict(cached)
+        if cached is None:
+            return None
 
     key = (str(run_name or "").strip(), str(param_name or "").strip())
     if not spec:
@@ -6937,35 +7187,62 @@ def _tar_curve_plot_payload_for_pair(
         cache[cache_key] = None
         return None
 
-    model = dict(spec.get("model") or {})
-    domain = model.get("domain") or []
-    if not isinstance(domain, list) or len(domain) < 2:
-        cache[cache_key] = None
-        return None
+    if isinstance(spec.get("plot_payload"), dict) and spec.get("plot_payload"):
+        payload = dict(spec.get("plot_payload") or {})
+        cache[cache_key] = payload
+        return dict(payload)
 
     selection = spec.get("selection") or _selection_for_run(run_name, ctx["options"])
     run_meta = (ctx.get("run_by_name") or {}).get(run_name) or {}
-    x_name = str(model.get("x_name") or "").strip()
+    override_filter_state = spec.get("filter_state_override")
+    if isinstance(override_filter_state, Mapping) and override_filter_state:
+        condition_tokens = _tar_condition_match_tokens_for_pair(
+            spec,
+            filter_state_override=override_filter_state,
+        )
+        series = _tar_filter_curve_series_by_condition_tokens(spec.get("series") or [], condition_tokens)
+    else:
+        series = [curve for curve in (spec.get("series") or []) if isinstance(curve, CurveSeries)]
+    model = dict(spec.get("model") or {})
+    x_name = str(spec.get("x_name") or model.get("x_name") or "").strip()
     if not x_name:
         x_name = _resolve_curve_x_key(ctx["be"], ctx["db_path"], run_name, str(run_meta.get("default_x") or "").strip() or "Time")
-    override_filter_state = spec.get("filter_state_override")
-    series = _load_curves_for_selection(
-        ctx["be"],
-        ctx["db_path"],
-        run_name,
-        param_name,
-        x_name,
-        selection=selection,
-        filter_state=(override_filter_state if isinstance(override_filter_state, Mapping) and override_filter_state else ctx["filter_state"]),
-    )
+    if not series:
+        series = _load_curves_for_selection(
+            ctx["be"],
+            ctx["db_path"],
+            run_name,
+            param_name,
+            x_name,
+            selection=selection,
+            filter_state=(override_filter_state if isinstance(override_filter_state, Mapping) and override_filter_state else ctx["filter_state"]),
+        )
     if not series:
         cache[cache_key] = None
         return None
 
-    lo = float(domain[0])
-    hi_dom = float(domain[1])
-    grid_points = max(2, int(ctx.get("grid_points") or 200))
-    x_grid = [lo + (hi_dom - lo) * (idx / (grid_points - 1)) for idx in range(grid_points)]
+    report_model_cfg = ((ctx.get("report_cfg") or {}).get("model") or {}) if isinstance(ctx, Mapping) else {}
+    grid_points = max(2, int(ctx.get("grid_points") or model.get("grid_points") or report_model_cfg.get("grid_points") or 200))
+    if not isinstance(model.get("domain"), list) or len(model.get("domain") or []) < 2 or not list(model.get("x_grid") or []):
+        fallback_model = _tar_build_curve_model_for_series(
+            list(series),
+            x_name=x_name,
+            units=str(spec.get("units") or "").strip(),
+            grid_points=grid_points,
+            degree=int(report_model_cfg.get("degree") or 3) or 3,
+            normalize_x=bool(report_model_cfg.get("normalize_x", True)),
+        )
+        if isinstance(fallback_model, dict):
+            model = fallback_model
+    domain = model.get("domain") or []
+    x_grid = list(model.get("x_grid") or [])
+    if not x_grid:
+        if not isinstance(domain, list) or len(domain) < 2:
+            cache[cache_key] = None
+            return None
+        lo = float(domain[0])
+        hi_dom = float(domain[1])
+        x_grid = [lo + (hi_dom - lo) * (idx / (grid_points - 1)) for idx in range(grid_points)]
     y_resampled_by_sn = _tar_resampled_trace_map(
         series,
         x_grid=x_grid,
@@ -6991,8 +7268,8 @@ def _tar_curve_plot_payload_for_pair(
         "y_resampled_by_sn": y_resampled_by_sn,
         "program_traces_by_program": dict(program_traces),
         "program_weighting": "equal_program_weight",
-        "master_y": _tar_mean_trace(y_matrix),
-        "std_y": _nan_std(y_matrix),
+        "master_y": list(model.get("master_y") or _tar_mean_trace(y_matrix)),
+        "std_y": list(model.get("std_y") or _nan_std(y_matrix)),
     }
     cache[cache_key] = payload
     return dict(payload)
@@ -7013,6 +7290,50 @@ def _tar_finite_mean(items: Iterable[object] | None) -> float | None:
 
 def _tar_finite_mean_for_serials(vmap: Mapping[str, object], serials: list[str]) -> float | None:
     return _tar_finite_mean([vmap.get(serial) for serial in (serials or [])])
+
+
+def _tar_pair_spec_selected_serial_mean(
+    pair_spec: Mapping[str, Any] | None,
+    *,
+    serial: str,
+) -> float | None:
+    serial_text = str(serial or "").strip()
+    if not serial_text:
+        return None
+    metric_map = (dict(pair_spec or {}).get("metric_mean_by_serial") or {})
+    if isinstance(metric_map, Mapping):
+        metric_value = _safe_float(metric_map.get(serial_text))
+        if metric_value is not None:
+            return metric_value
+    payload = dict((dict(pair_spec or {}).get("initial_plot_payload") or {}))
+    payload_serial_mean = _tar_payload_metric_pair(payload, serial=serial_text)[1]
+    if payload_serial_mean is not None:
+        return payload_serial_mean
+    y_values: list[float] = []
+    for curve in (dict(pair_spec or {}).get("series") or []):
+        if not isinstance(curve, CurveSeries) or str(curve.serial or "").strip() != serial_text:
+            continue
+        for value in curve.y or []:
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                y_values.append(float(value))
+    return _tar_finite_mean(y_values)
+
+
+def _tar_pair_spec_has_serial_selected_data(
+    pair_spec: Mapping[str, Any] | None,
+    *,
+    serial: str,
+) -> bool:
+    if _tar_pair_spec_selected_serial_mean(pair_spec, serial=serial) is not None:
+        return True
+    serial_text = str(serial or "").strip()
+    return any(
+        isinstance(curve, CurveSeries)
+        and str(curve.serial or "").strip() == serial_text
+        and bool(curve.x)
+        and bool(curve.y)
+        for curve in (dict(pair_spec or {}).get("series") or [])
+    )
 
 
 def _tar_payload_metric_pair(
@@ -7104,6 +7425,19 @@ def _tar_comparison_metric_pair(
     payload: Mapping[str, Any] | None = None,
 ) -> tuple[float | None, float | None]:
     metric_map: dict[str, float] = {}
+    payload_family_mean, payload_serial_mean = _tar_payload_metric_pair(
+        payload,
+        serial=serial,
+        program_by_serial=(ctx.get("program_by_serial") if isinstance(ctx, Mapping) else None),
+        allowed_programs=(
+            list((pair_spec or {}).get("prepass_included_programs") or [])
+            if not (
+                _filter_state_has_key(filter_state_override, "suppression_voltages")
+                or _filter_state_has_key(filter_state_override, "valve_voltages")
+            )
+            else None
+        ),
+    )
     allowed_programs = (
         list((pair_spec or {}).get("prepass_included_programs") or [])
         if not (
@@ -7142,13 +7476,12 @@ def _tar_comparison_metric_pair(
             ).values()
         )
         serial_mean = _safe_float(metric_map.get(str(serial or "").strip()))
+        if family_mean is None:
+            family_mean = payload_family_mean
+        if serial_mean is None:
+            serial_mean = payload_serial_mean
         return family_mean, serial_mean
-    return _tar_payload_metric_pair(
-        payload,
-        serial=serial,
-        program_by_serial=(ctx.get("program_by_serial") if isinstance(ctx, Mapping) else None),
-        allowed_programs=allowed_programs,
-    )
+    return payload_family_mean, payload_serial_mean
 
 
 def _tar_meta(ctx: Mapping[str, Any], serial: str, key: str) -> str:
@@ -7600,13 +7933,7 @@ def _tar_build_per_serial_comparison_rows(
         if not final_valve:
             final_valve = initial_valve
 
-        run_condition = (
-            str(spec.get("base_condition_label") or "").strip()
-            or str(selection_fields.get("condition_text") or "").strip()
-            or str(selection_fields.get("display_text") or "").strip()
-            or str(spec.get("selection_label") or "").strip()
-            or run_name
-        )
+        run_condition = _tar_resolved_condition_label(spec, selection_fields=selection_fields, run_name=run_name)
         sequence_text = str(selection_fields.get("sequence_text") or spec.get("run_title") or run_name).strip() or run_name
 
         for serial in hi:
@@ -7685,8 +8012,19 @@ def _tar_build_per_serial_comparison_rows(
                 if final_pass_applied
                 else initial_has_data
             )
+            informational_only = False
+            selected_serial_mean = None
             if not initial_has_data and not final_has_data:
-                continue
+                selected_serial_mean = _tar_pair_spec_selected_serial_mean(spec, serial=serial)
+                if selected_serial_mean is None and not _tar_pair_spec_has_serial_selected_data(spec, serial=serial):
+                    continue
+                informational_only = True
+
+            if informational_only:
+                initial_family_mean = None
+                final_family_mean = None
+                initial_serial_mean = selected_serial_mean
+                final_serial_mean = selected_serial_mean
 
             initial_zscore = _safe_float(finding_row.get("initial_z"))
             if initial_zscore is None:
@@ -7701,6 +8039,12 @@ def _tar_build_per_serial_comparison_rows(
             final_grade = _tar_normalize_grade_token(
                 final_grade_map_by_pair_serial.get((pair_id, serial), initial_grade) or initial_grade
             ) or initial_grade
+            if informational_only:
+                initial_zscore = None
+                final_zscore = None
+                initial_grade = "NOT_GRADED"
+                final_grade = "NOT_GRADED"
+                official_pass_type = "comparison_unavailable"
             row_final_suppression = regrade_suppression or final_suppression
             row_final_valve = regrade_valve or final_valve
             official_baseline_override = _safe_float(finding_row.get("official_baseline_mean"))
@@ -7718,6 +8062,10 @@ def _tar_build_per_serial_comparison_rows(
             official_zscore = final_zscore if official_pass_type == "final_exact_condition" and final_pass_applied else initial_zscore
             official_suppression = row_final_suppression if official_pass_type == "final_exact_condition" and final_pass_applied else initial_suppression
             official_valve = row_final_valve if official_pass_type == "final_exact_condition" and final_pass_applied else initial_valve
+            if informational_only:
+                official_baseline_mean = None
+                official_serial_mean = selected_serial_mean
+                official_zscore = None
             row_data = {
                 "pair_id": pair_id,
                 "selection_id": str(spec.get("selection_id") or "").strip(),
@@ -7747,12 +8095,17 @@ def _tar_build_per_serial_comparison_rows(
                 "initial_grade": initial_grade,
                 "final_grade": final_grade,
                 "grade": final_grade,
-                "grade_text": _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=(regrade_applied or final_pass_applied or initial_skipped)),
+                "grade_text": (
+                    "NOT_GRADED"
+                    if informational_only
+                    else _tar_comparison_grade_text(initial_grade, final_grade, regrade_applied=(regrade_applied or final_pass_applied or initial_skipped))
+                ),
                 "selection_mode": selection_fields.get("mode") or "sequence",
                 "selection_program_title": selection_program_title,
                 "selection_member_programs": list(selection_member_programs),
                 "selection_member_sequences": list(selection_member_sequences),
                 "selection_member_runs": list(selection_member_runs),
+                "condition_label": run_condition,
                 "base_condition_label": str(spec.get("base_condition_label") or "").strip(),
                 "initial_suppression_voltage_label": initial_suppression,
                 "final_suppression_voltage_label": row_final_suppression,
@@ -7760,7 +8113,7 @@ def _tar_build_per_serial_comparison_rows(
                 "final_valve_voltage_label": row_final_valve,
                 "initial_skipped": initial_skipped,
                 "initial_skip_reason": initial_skip_reason,
-                "initial_status": initial_status or ("SKIPPED" if initial_skipped else initial_grade),
+                "initial_status": ("NOT_GRADED" if informational_only else (initial_status or ("SKIPPED" if initial_skipped else initial_grade))),
                 "final_pass_requested": final_pass_requested,
                 "final_pass_available": final_pass_available,
                 "final_pass_applied": final_pass_applied,
@@ -7786,8 +8139,12 @@ def _tar_build_per_serial_comparison_rows(
                 "official_baseline_mean": official_baseline_mean,
                 "official_serial_mean": official_serial_mean,
                 "official_zscore": official_zscore,
-                "official_deviation_score": _safe_float(finding_row.get("official_deviation_score")) if _safe_float(finding_row.get("official_deviation_score")) is not None else official_zscore,
-                "official_grade": str(finding_row.get("official_grade") or final_grade or initial_grade).strip().upper() or "NO_DATA",
+                "official_deviation_score": (
+                    None
+                    if informational_only
+                    else (_safe_float(finding_row.get("official_deviation_score")) if _safe_float(finding_row.get("official_deviation_score")) is not None else official_zscore)
+                ),
+                "official_grade": ("NOT_GRADED" if informational_only else (str(finding_row.get("official_grade") or final_grade or initial_grade).strip().upper() or "NO_DATA")),
                 "official_suppression_voltage_label": str(finding_row.get("official_suppression_voltage_label") or official_suppression or "").strip(),
                 "official_valve_voltage_label": str(finding_row.get("official_valve_voltage_label") or official_valve or "").strip(),
                 "selected_program_count": int(finding_row.get("selected_program_count") or len(finding_row.get("selected_programs") or spec.get("prepass_included_programs") or [])),
@@ -7878,13 +8235,13 @@ def _tar_final_grade_token_from_row(row: Mapping[str, Any] | None) -> str:
     if not isinstance(row, Mapping):
         return "NO_DATA"
     token = _tar_normalize_grade_token(row.get("official_grade") or row.get("final_grade") or row.get("grade"))
-    if token in {"PASS", "WATCH", "FAIL", "LIMITED"}:
+    if token in {"PASS", "WATCH", "FAIL", "LIMITED", "NOT_GRADED"}:
         return token
     return "NO_DATA"
 
 
 def _tar_grade_counts_from_rows(rows: list[Mapping[str, Any]] | None) -> dict[str, int]:
-    counts = {"PASS": 0, "WATCH": 0, "FAIL": 0, "LIMITED": 0, "NO_DATA": 0}
+    counts = {"PASS": 0, "WATCH": 0, "FAIL": 0, "LIMITED": 0, "NO_DATA": 0, "NOT_GRADED": 0}
     for row in rows or []:
         token = _tar_final_grade_token_from_row(row)
         counts[token if token in counts else "NO_DATA"] += 1
@@ -8772,6 +9129,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "stat": str(metric_stat or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "condition_label": str(cohort_spec.get("condition_label") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
@@ -8793,6 +9151,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "param": _tar_pair_param_label(cohort_spec),
                 "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "condition_label": str(cohort_spec.get("condition_label") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
@@ -8822,6 +9181,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "stat": str(metric_stat or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "condition_label": str(cohort_spec.get("condition_label") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
@@ -8843,6 +9203,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "param": _tar_pair_param_label(cohort_spec),
                 "raw_param": str(cohort_spec.get("param") or "").strip(),
                 "x_name": str(cohort_spec.get("x_name") or "").strip(),
+                "condition_label": str(cohort_spec.get("condition_label") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(cohort_spec, run_by_name=(ctx.get("run_by_name") or {})),
                 "base_condition_label": str(cohort_spec.get("base_condition_label") or "").strip(),
                 "selection_labels": list(cohort_spec.get("selection_labels") or []),
@@ -8894,6 +9255,7 @@ def _tar_plan_plot_specs(ctx: Mapping[str, Any], *, intro_pages: int) -> list[di
                 "run": str(pair_spec.get("run") or "").strip(),
                 "param": _tar_pair_param_label(pair_spec),
                 "raw_param": str(pair_spec.get("param") or "").strip(),
+                "condition_label": str(pair_spec.get("condition_label") or "").strip(),
                 "run_condition_label": _tar_plot_run_condition_label(
                     pair_spec,
                     selection=(pair_spec.get("selection") if isinstance(pair_spec.get("selection"), Mapping) else None),
@@ -9766,8 +10128,12 @@ def _tar_prepare_row_specs(
         y_cols = _tar_curve_y_columns_for_run(be, db_path, conn, run_name, x_name)
         y_by_norm = {_norm_key(str(col.get("name") or "")): dict(col) for col in y_cols if str(col.get("name") or "").strip()}
         selection_fields = _selection_display_fields(selection, run_by_name)
-        suppression_values = _tar_selection_suppression_values(selection, filter_rows=filter_rows, filter_state=filter_state)
-        valve_values = _tar_selection_valve_values(selection, filter_rows=filter_rows, filter_state=filter_state)
+        selection_filter_rows = _tar_selection_matching_rows(selection, filter_rows, filter_state=filter_state)
+        voltage_defaults = _tar_condition_voltage_defaults_from_rows(selection_filter_rows)
+        suppression_default = str(voltage_defaults.get("suppression_voltage_label") or "").strip()
+        valve_default = str(voltage_defaults.get("valve_voltage_label") or "").strip()
+        suppression_values = _tar_selection_suppression_values(selection, filter_rows=selection_filter_rows, filter_state=None)
+        valve_values = _tar_selection_valve_values(selection, filter_rows=selection_filter_rows, filter_state=None)
         base_condition_label = _tar_base_condition_label(selection, run_by_name) or (_run_display_text(run_name, run_by_name) or run_name)
         selection_label = _tar_selection_report_label(selection, run_by_name)
         if not selection_label:
@@ -9780,6 +10146,15 @@ def _tar_prepare_row_specs(
                 label_parts.append(f"Valve {'/'.join(valve_values)}")
             selection_label = f"{base_condition_label} | {' | '.join(label_parts)}"
         selection_id = str(selection.get("id") or f"{selection.get('mode') or 'selection'}:{selection_index}:{run_name}").strip()
+        condition_label = _tar_resolved_condition_label(
+            {
+                "base_condition_label": base_condition_label,
+                "selection_label": selection_label,
+                "run": run_name,
+            },
+            selection_fields=selection_fields,
+            run_name=run_name,
+        )
 
         for target_param in params:
             pair_index += 1
@@ -9815,16 +10190,17 @@ def _tar_prepare_row_specs(
             seen_condition_keys: set[str] = set()
             condition_context_rows: list[dict[str, object]] = []
             seen_condition_contexts: set[tuple[str, ...]] = set()
-            for row in filter_rows or []:
-                if not isinstance(row, dict):
-                    continue
-                if not _row_matches_filter_state(row, filter_state):
-                    continue
-                if not _selection_matches_observation_row(selection, row):
-                    continue
+            condition_match_tokens_by_key: dict[str, list[str]] = {}
+            for row in selection_filter_rows:
+                resolved_suppression, resolved_valve = _tar_resolved_condition_voltage_labels(
+                    row,
+                    suppression_default=suppression_default,
+                    valve_default=valve_default,
+                )
                 context_row = {
                     "run_name": str(row.get("run_name") or run_name).strip(),
                     "source_run_name": str(row.get("source_run_name") or "").strip(),
+                    "condition_label": condition_label,
                     "condition_display": str(row.get("condition_display") or run_meta.get("condition_display") or base_condition_label).strip(),
                     "run_type": str(row.get("run_type") or run_meta.get("run_type") or "").strip(),
                     "feed_pressure": row.get("feed_pressure", run_meta.get("feed_pressure")),
@@ -9835,8 +10211,8 @@ def _tar_prepare_row_specs(
                     "off_time": row.get("off_time", run_meta.get("off_time")),
                     "off_time_units": str(row.get("off_time_units") or run_meta.get("off_time_units") or "").strip(),
                     "control_period": row.get("control_period", run_meta.get("control_period")),
-                    "suppression_voltage": row.get("suppression_voltage"),
-                    "valve_voltage": row.get("valve_voltage"),
+                    "suppression_voltage": resolved_suppression or row.get("suppression_voltage"),
+                    "valve_voltage": resolved_valve or row.get("valve_voltage"),
                 }
                 context_key = (
                     _norm_key(context_row.get("run_type") or ""),
@@ -9854,9 +10230,14 @@ def _tar_prepare_row_specs(
                 if any(context_key) and context_key not in seen_condition_contexts:
                     seen_condition_contexts.add(context_key)
                     condition_context_rows.append(context_row)
-                suppression_value = _td_suppression_voltage_filter_value(row)
-                valve_value = _td_valve_voltage_filter_value(row)
+                suppression_value = resolved_suppression
+                valve_value = resolved_valve
                 condition_key = _tar_condition_combo_key(suppression_value, valve_value)
+                match_token = _tar_condition_match_token_from_row(row)
+                if match_token:
+                    condition_match_tokens_by_key.setdefault(condition_key, [])
+                    if match_token not in condition_match_tokens_by_key[condition_key]:
+                        condition_match_tokens_by_key[condition_key].append(match_token)
                 if condition_key in seen_condition_keys:
                     continue
                 seen_condition_keys.add(condition_key)
@@ -9899,27 +10280,34 @@ def _tar_prepare_row_specs(
             condition_pairs: list[dict[str, str]] = []
             series_by_condition_key: dict[str, list[CurveSeries]] = {}
             for condition_pair in raw_condition_pairs:
-                filtered_state = _tar_clone_filter_state(
-                    filter_state,
-                    suppression_voltage=str(condition_pair.get("suppression_voltage_label") or ""),
-                    valve_voltage=str(condition_pair.get("valve_voltage_label") or ""),
+                condition_key = str(condition_pair.get("key") or "").strip()
+                filtered_series = _tar_filter_curve_series_by_condition_tokens(
+                    series,
+                    condition_match_tokens_by_key.get(condition_key) or [],
                 )
-                filtered_series = _load_curves_for_selection(
-                    be,
-                    db_path,
-                    run_name,
-                    param_name,
-                    x_name,
-                    selection=selection,
-                    filter_state=filtered_state,
-                )
+                if not filtered_series:
+                    filtered_state = _tar_clone_filter_state(
+                        filter_state,
+                        suppression_voltage=str(condition_pair.get("suppression_voltage_label") or ""),
+                        valve_voltage=str(condition_pair.get("valve_voltage_label") or ""),
+                    )
+                    filtered_series = _load_curves_for_selection(
+                        be,
+                        db_path,
+                        run_name,
+                        param_name,
+                        x_name,
+                        selection=selection,
+                        filter_state=filtered_state,
+                    )
                 if filtered_series:
                     condition_pairs.append(dict(condition_pair))
-                    series_by_condition_key[str(condition_pair.get("key") or "")] = filtered_series
+                    series_by_condition_key[condition_key] = filtered_series
             if not condition_context_rows:
                 fallback_context_row = {
                     "run_name": run_name,
                     "source_run_name": run_name,
+                    "condition_label": condition_label,
                     "condition_display": str(run_meta.get("condition_display") or base_condition_label).strip(),
                     "run_type": str(run_meta.get("run_type") or "").strip(),
                     "feed_pressure": run_meta.get("feed_pressure"),
@@ -9930,8 +10318,8 @@ def _tar_prepare_row_specs(
                     "off_time": run_meta.get("off_time"),
                     "off_time_units": str(run_meta.get("off_time_units") or "").strip(),
                     "control_period": run_meta.get("control_period"),
-                    "suppression_voltage": run_meta.get("suppression_voltage"),
-                    "valve_voltage": run_meta.get("valve_voltage"),
+                    "suppression_voltage": suppression_default or run_meta.get("suppression_voltage"),
+                    "valve_voltage": valve_default or run_meta.get("valve_voltage"),
                 }
                 if any(
                     [
@@ -9952,6 +10340,7 @@ def _tar_prepare_row_specs(
                     "selection": dict(selection),
                     "selection_fields": dict(selection_fields),
                     "selection_label": selection_label,
+                    "condition_label": condition_label,
                     "base_condition_label": base_condition_label,
                     "condition_context_rows": list(condition_context_rows),
                     "suppression_values": list(suppression_values),
@@ -9967,6 +10356,7 @@ def _tar_prepare_row_specs(
                     "base_filter_state": _tar_clone_filter_state(filter_state),
                     "series": list(series),
                     "metric_mean_by_serial": dict(metric_mean_by_serial),
+                    "condition_match_tokens_by_key": {key: list(values) for key, values in condition_match_tokens_by_key.items()},
                     "series_by_condition_key": dict(series_by_condition_key),
                     "initial_model": {},
                     "initial_plot_payload": {},
@@ -10567,6 +10957,7 @@ def _tar_analyze_curve_groups(
                     "units": str(members[0].get("units") or ""),
                     "display_units": _tar_pair_units_label(members[0]),
                     "x_name": str(cohort_model.get("x_name") or ""),
+                    "condition_label": str(members[0].get("condition_label") or ""),
                     "base_condition_label": str(members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": "",
                     "valve_voltage_label": "",
@@ -10768,6 +11159,7 @@ def _tar_analyze_curve_groups(
                         "units": str(spec.get("units") or ""),
                         "display_units": _tar_pair_units_label(spec),
                         "x_name": str(spec.get("x_name") or ""),
+                        "condition_label": str(spec.get("condition_label") or ""),
                         "base_condition_label": str(spec.get("base_condition_label") or ""),
                         "suppression_voltage_label": suppression_value,
                         "valve_voltage_label": valve_value,
@@ -10792,6 +11184,7 @@ def _tar_analyze_curve_groups(
                     "units": str(member_specs[0].get("units") or members[0].get("units") or ""),
                     "display_units": _tar_pair_units_label(member_specs[0] if member_specs else members[0]),
                     "x_name": str(final_model.get("x_name") or ""),
+                    "condition_label": str(member_specs[0].get("condition_label") or members[0].get("condition_label") or ""),
                     "base_condition_label": str(member_specs[0].get("base_condition_label") or members[0].get("base_condition_label") or ""),
                     "suppression_voltage_label": suppression_value,
                     "valve_voltage_label": valve_value,
@@ -11562,6 +11955,51 @@ def _tar_prepare_base(
         }
         for key, value in (finding_by_pair_serial or {}).items()
     }
+    grading_keys = {
+        (str(row.get("pair_id") or "").strip(), str(row.get("serial") or "").strip())
+        for row in grading_rows
+        if isinstance(row, Mapping)
+    }
+    for row in comparison_rows:
+        if not isinstance(row, Mapping):
+            continue
+        pair_key = (str(row.get("pair_id") or "").strip(), str(row.get("serial") or "").strip())
+        if pair_key in grading_keys:
+            continue
+        grading_rows.append(
+            {
+                **dict(row),
+                "initial_grade": _tar_normalize_grade_token(row.get("initial_grade") or row.get("initial_status") or "NO_DATA") or "NO_DATA",
+                "final_grade": _tar_normalize_grade_token(row.get("final_grade") or row.get("official_grade") or row.get("grade") or "NO_DATA") or "NO_DATA",
+                "grade": _tar_normalize_grade_token(row.get("final_grade") or row.get("official_grade") or row.get("grade") or "NO_DATA") or "NO_DATA",
+            }
+        )
+        grading_keys.add(pair_key)
+    for row in comparison_rows:
+        if not isinstance(row, Mapping):
+            continue
+        pair_id = str(row.get("pair_id") or "").strip()
+        run_name = str(row.get("run") or "").strip()
+        param_name = str(row.get("param") or "").strip()
+        serial = str(row.get("serial") or "").strip()
+        if not run_name or not param_name or not serial:
+            continue
+        initial_grade_map[(run_name, param_name, serial)] = (
+            _tar_normalize_grade_token(row.get("initial_status") or row.get("initial_grade") or "NO_DATA") or "NO_DATA"
+        )
+        final_grade_map[(run_name, param_name, serial)] = (
+            _tar_normalize_grade_token(row.get("official_grade") or row.get("final_grade") or row.get("grade") or "NO_DATA") or "NO_DATA"
+        )
+        grade_map[(run_name, param_name, serial)] = final_grade_map[(run_name, param_name, serial)]
+        finding_by_key[(run_name, param_name, serial)] = {
+            **dict(finding_by_key.get((run_name, param_name, serial)) or {}),
+            **dict(row),
+        }
+        if pair_id:
+            finding_by_pair_serial[(pair_id, serial)] = {
+                **dict(finding_by_pair_serial.get((pair_id, serial)) or {}),
+                **dict(row),
+            }
     nonpass_findings = sorted(
         [row for row in grading_rows if str(row.get("final_grade") or "").strip().upper() in {"WATCH", "FAIL"}],
         key=_finding_sort_key,
@@ -12156,6 +12594,7 @@ def _tar_render_metric_cohort_page(
         "raw_param": raw_param_name,
         "stat": metric_stat,
         "x_name": x_name,
+        "condition_label": str(cohort_spec.get("condition_label") or ""),
         "run_condition_label": run_condition_label,
         "base_condition_label": str(cohort_spec.get("base_condition_label") or ""),
         "selection_labels": list(cohort_spec.get("selection_labels") or []),
@@ -12288,6 +12727,7 @@ def _tar_render_curve_cohort_page(
         "param": param_name,
         "raw_param": raw_param_name,
         "x_name": x_name,
+        "condition_label": str(cohort_spec.get("condition_label") or ""),
         "run_condition_label": run_condition_label,
         "base_condition_label": str(cohort_spec.get("base_condition_label") or ""),
         "selection_labels": list(cohort_spec.get("selection_labels") or []),
@@ -12404,6 +12844,7 @@ def _tar_render_watch_curve_page(
         "run": run_name,
         "param": param_name,
         "raw_param": raw_param_name,
+        "condition_label": str(pair_spec.get("condition_label") or "").strip(),
         "run_condition_label": run_condition_label,
         "selection_label": str(pair_spec.get("selection_label") or "").strip(),
         "base_condition_label": str(pair_spec.get("base_condition_label") or "").strip(),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from pathlib import Path
 import sys
@@ -250,6 +251,67 @@ class _FakePyplot:
 
 
 class TestTrendAutoReportFilters(unittest.TestCase):
+    def _prepare_row_specs_for_condition_rows(self, filter_rows: list[dict[str, object]]) -> list[dict]:
+        selection = {
+            "id": "sel-1",
+            "mode": "condition",
+            "run_name": "Run A",
+            "member_runs": ["Run A"],
+            "display_text": "Condition A",
+            "run_condition": "Condition A",
+        }
+        run_by_name = {"Run A": {"display_name": "Run A", "default_x": "Time"}}
+        base_series = [
+            tar.CurveSeries(
+                serial=str(row.get("serial") or ""),
+                x=[0.0, 1.0],
+                y=[1.0, 2.0],
+                observation_id=str(row.get("observation_id") or ""),
+                source_run_name=str(row.get("source_run_name") or ""),
+                run_name=str(row.get("run_name") or "Run A"),
+            )
+            for row in filter_rows
+        ]
+
+        def _load_curves(
+            _be: object,
+            _db_path: Path,
+            _run_name: str,
+            _y_name: str,
+            _x_name: str,
+            *,
+            selection: dict | None = None,
+            serials: list[str] | None = None,
+            filter_state: object = None,
+        ) -> list[tar.CurveSeries]:
+            if isinstance(filter_state, dict) and ("suppression_voltages" in filter_state or "valve_voltages" in filter_state):
+                return []
+            return list(base_series)
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            with mock.patch.object(tar, "_resolve_curve_x_key", return_value="Time"), mock.patch.object(
+                tar,
+                "_tar_curve_y_columns_for_run",
+                return_value=[{"name": "Pressure", "units": "psi"}],
+            ), mock.patch.object(tar, "_load_curves_for_selection", side_effect=_load_curves), mock.patch.object(
+                tar,
+                "_load_metric_map_for_selection",
+                return_value={str(row.get("serial") or ""): float(index + 1) for index, row in enumerate(filter_rows)},
+            ):
+                return tar._tar_prepare_row_specs(
+                    be=object(),
+                    db_path=Path("fake.sqlite3"),
+                    conn=conn,
+                    run_by_name=run_by_name,
+                    selections=[selection],
+                    params=["Pressure"],
+                    filter_rows=filter_rows,
+                    filter_state={},
+                )
+        finally:
+            conn.close()
+
     def test_filter_rows_respects_explicit_empty_filter_lists(self) -> None:
         rows = [
             {
@@ -556,6 +618,91 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(text, "Selected program pool\nPrograms used: 1 | Comparison series: 2")
         self.assertNotIn("Program A", text)
         self.assertNotIn("Program B", text)
+
+    def test_prepare_row_specs_resolves_singleton_suppression_for_blank_rows(self) -> None:
+        specs = self._prepare_row_specs_for_condition_rows(
+            [
+                {"observation_id": "obs-1", "run_name": "Run A", "serial": "SN-001", "suppression_voltage": 5.0, "valve_voltage": 28.0},
+                {"observation_id": "obs-2", "run_name": "Run A", "serial": "SN-002", "suppression_voltage": "", "valve_voltage": 28.0},
+            ]
+        )
+
+        self.assertEqual(len(specs), 1)
+        pair_key = tar._tar_condition_combo_key("5", "28")
+        self.assertEqual([pair["key"] for pair in specs[0]["condition_pairs"]], [pair_key])
+        self.assertEqual(len(specs[0]["series_by_condition_key"][pair_key]), 2)
+        self.assertEqual(
+            [tar._td_suppression_voltage_filter_value(row) for row in specs[0]["condition_context_rows"]],
+            ["5"],
+        )
+
+    def test_prepare_row_specs_resolves_singleton_valve_for_blank_rows(self) -> None:
+        specs = self._prepare_row_specs_for_condition_rows(
+            [
+                {"observation_id": "obs-1", "run_name": "Run A", "serial": "SN-001", "suppression_voltage": 5.0, "valve_voltage": 28.0},
+                {"observation_id": "obs-2", "run_name": "Run A", "serial": "SN-002", "suppression_voltage": 5.0, "valve_voltage": ""},
+            ]
+        )
+
+        self.assertEqual(len(specs), 1)
+        pair_key = tar._tar_condition_combo_key("5", "28")
+        self.assertEqual([pair["key"] for pair in specs[0]["condition_pairs"]], [pair_key])
+        self.assertEqual(len(specs[0]["series_by_condition_key"][pair_key]), 2)
+        self.assertEqual(
+            [tar._td_valve_voltage_filter_value(row) for row in specs[0]["condition_context_rows"]],
+            ["28"],
+        )
+
+    def test_prepare_row_specs_resolves_both_voltage_fields_for_mixed_blank_rows(self) -> None:
+        specs = self._prepare_row_specs_for_condition_rows(
+            [
+                {"observation_id": "obs-1", "run_name": "Run A", "serial": "SN-001", "suppression_voltage": 5.0, "valve_voltage": ""},
+                {"observation_id": "obs-2", "run_name": "Run A", "serial": "SN-002", "suppression_voltage": "", "valve_voltage": 28.0},
+            ]
+        )
+
+        self.assertEqual(len(specs), 1)
+        pair_key = tar._tar_condition_combo_key("5", "28")
+        self.assertEqual([pair["key"] for pair in specs[0]["condition_pairs"]], [pair_key])
+        self.assertEqual(len(specs[0]["series_by_condition_key"][pair_key]), 2)
+
+    def test_prepare_row_specs_keeps_blank_suppression_separate_when_multiple_real_values_exist(self) -> None:
+        specs = self._prepare_row_specs_for_condition_rows(
+            [
+                {"observation_id": "obs-1", "run_name": "Run A", "serial": "SN-001", "suppression_voltage": 5.0, "valve_voltage": 28.0},
+                {"observation_id": "obs-2", "run_name": "Run A", "serial": "SN-002", "suppression_voltage": 7.0, "valve_voltage": 28.0},
+                {"observation_id": "obs-3", "run_name": "Run A", "serial": "SN-003", "suppression_voltage": "", "valve_voltage": 28.0},
+            ]
+        )
+
+        pair_keys = [pair["key"] for pair in specs[0]["condition_pairs"]]
+        self.assertEqual(
+            pair_keys,
+            [
+                tar._tar_condition_combo_key("5", "28"),
+                tar._tar_condition_combo_key("7", "28"),
+                tar._tar_condition_combo_key("", "28"),
+            ],
+        )
+
+    def test_prepare_row_specs_keeps_blank_valve_separate_when_multiple_real_values_exist(self) -> None:
+        specs = self._prepare_row_specs_for_condition_rows(
+            [
+                {"observation_id": "obs-1", "run_name": "Run A", "serial": "SN-001", "suppression_voltage": 5.0, "valve_voltage": 28.0},
+                {"observation_id": "obs-2", "run_name": "Run A", "serial": "SN-002", "suppression_voltage": 5.0, "valve_voltage": 30.0},
+                {"observation_id": "obs-3", "run_name": "Run A", "serial": "SN-003", "suppression_voltage": 5.0, "valve_voltage": ""},
+            ]
+        )
+
+        pair_keys = [pair["key"] for pair in specs[0]["condition_pairs"]]
+        self.assertEqual(
+            pair_keys,
+            [
+                tar._tar_condition_combo_key("5", "28"),
+                tar._tar_condition_combo_key("5", "30"),
+                tar._tar_condition_combo_key("5", ""),
+            ],
+        )
 
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
@@ -904,6 +1051,111 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["serial"], "SN-001")
         self.assertEqual(rows[0]["parameter"], "Temperature")
 
+    def test_build_per_serial_comparison_rows_emits_not_graded_row_for_selected_serial_data(self) -> None:
+        ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
+        pair_specs = [
+            {
+                "pair_id": "pair-ng",
+                "selection_id": "sel-ng",
+                "run": "Run NG",
+                "run_title": "Sequence NG",
+                "base_condition_label": "Condition NG",
+                "selection_fields": {
+                    "mode": "condition",
+                    "sequence_text": "Sequence NG",
+                    "condition_text": "Condition NG",
+                },
+                "param": "Temperature",
+                "units": "F",
+                "metric_mean_by_serial": {"SN-002": 100.5},
+                "series": [
+                    tar.CurveSeries(
+                        serial="SN-002",
+                        x=[0.0, 1.0],
+                        y=[99.0, 102.0],
+                        observation_id="obs-ng",
+                        run_name="Run NG",
+                    )
+                ],
+                "initial_plot_payload": {},
+            }
+        ]
+
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", return_value={}):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                ctx,
+                pair_specs=pair_specs,
+                all_serials=["SN-002"],
+                hi=["SN-002"],
+                initial_grade_map_by_pair_serial={},
+                final_grade_map_by_pair_serial={},
+                finding_by_pair_serial={},
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["serial"], "SN-002")
+        self.assertEqual(rows[0]["initial_status"], "NOT_GRADED")
+        self.assertEqual(rows[0]["official_grade"], "NOT_GRADED")
+        self.assertEqual(rows[0]["official_pass_type"], "comparison_unavailable")
+        self.assertEqual(rows[0]["official_baseline_mean"], None)
+        self.assertEqual(rows[0]["official_serial_mean"], 100.5)
+        self.assertEqual(
+            rows[0]["grade_basis_text"],
+            "Informational only\nComparison unavailable: raw curve data was present but no valid comparison cohort was available",
+        )
+
+    def test_curve_plot_payload_for_pair_falls_back_to_base_series_when_cached_payload_is_empty(self) -> None:
+        pair_spec = {
+            "pair_id": "pair-plot",
+            "run": "Run Plot",
+            "param": "Pressure",
+            "units": "psi",
+            "x_name": "Time",
+            "selection": {"run_name": "Run Plot", "member_runs": ["Run Plot"]},
+            "series": [
+                tar.CurveSeries(serial="SN-001", x=[0.0, 1.0], y=[10.0, 12.0], observation_id="obs-plot", run_name="Run Plot"),
+            ],
+            "plot_payload": {},
+            "model": {},
+            "filter_state_override": {},
+        }
+        ctx = {
+            "curve_plot_cache": {"pair-plot": {}},
+            "grid_points": 5,
+            "report_cfg": {"model": {"degree": 3, "normalize_x": True}},
+            "program_by_serial": {},
+            "options": {},
+            "run_by_name": {"Run Plot": {"default_x": "Time"}},
+            "be": object(),
+            "db_path": Path("fake.sqlite3"),
+            "filter_state": {},
+        }
+
+        payload = tar._tar_curve_plot_payload_for_pair(ctx, "Run Plot", "Pressure", pair_spec=pair_spec)
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["x_name"], "Time")
+        self.assertIn("SN-001", payload["y_resampled_by_sn"])
+
+    def test_not_graded_rows_are_excluded_from_rollups(self) -> None:
+        rows = [
+            {"initial_status": "NOT_GRADED", "official_grade": "NOT_GRADED"},
+            {"initial_status": "PASS", "official_grade": "PASS"},
+        ]
+
+        counts = tar._tar_grade_counts_from_rows(rows)
+
+        self.assertEqual(counts["PASS"], 1)
+        self.assertEqual(counts["WATCH"], 0)
+        self.assertEqual(counts["FAIL"], 0)
+        self.assertEqual(counts["NOT_GRADED"], 1)
+        self.assertEqual(tar._tar_initial_overall_status_from_rows(rows), "CERTIFIED")
+        self.assertEqual(tar._tar_final_overall_status_from_rows(rows), "CERTIFIED")
+        self.assertEqual(
+            tar._tar_final_overall_status_from_rows([{"initial_status": "NOT_GRADED", "official_grade": "NOT_GRADED"}]),
+            "",
+        )
+
     def test_metric_program_segments_group_contiguous_programs(self) -> None:
         segments = tar._tar_metric_program_segments(
             ["SN-001", "SN-002", "SN-003", "SN-004"],
@@ -1034,7 +1286,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "selection_fields": {"sequence_text": "Run A", "condition_text": "Condition A"},
                     "condition_context_rows": [
                         {
-                            "run_type": "steady state",
+                            "condition_label": "Steady State Condition",
+                            "run_type": "pulsed mode",
                             "feed_pressure": 275.0,
                             "feed_pressure_units": "psia",
                             "suppression_voltage": 5.0,
@@ -1049,7 +1302,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "selection_fields": {"sequence_text": "Run B", "condition_text": "Condition A"},
                     "condition_context_rows": [
                         {
-                            "run_type": "pulsed mode",
+                            "condition_label": "Pulse Mode Condition",
+                            "run_type": "steady state",
                             "feed_pressure": 320.0,
                             "feed_pressure_units": "psia",
                             "pulse_width_on": 0.02,
@@ -1072,6 +1326,15 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 return {"SN-001": 10.0, "SN-002": 12.0, "SN-003": 14.0}
             return {"SN-001": 11.0, "SN-002": 13.0, "SN-003": 15.0}
 
+        def _fake_metric_rows(_ctx: object, pair_spec: object, _stat: str, *, filter_state_override: object = None) -> list[dict[str, object]]:
+            pair_id = str((pair_spec or {}).get("pair_id") or "")
+            values = (
+                [("SN-001", 10.0), ("SN-002", 12.0), ("SN-003", 14.0)]
+                if pair_id == "pair-1"
+                else [("SN-001", 11.0), ("SN-002", 13.0), ("SN-003", 15.0)]
+            )
+            return [{"serial": serial, "value_num": value} for serial, value in values]
+
         with mock.patch.dict(
             sys.modules,
             {
@@ -1084,6 +1347,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             tar,
             "_tar_metric_map_for_pair",
             side_effect=_fake_metric_map,
+        ), mock.patch.object(
+            tar,
+            "_tar_metric_series_for_pair",
+            side_effect=_fake_metric_rows,
         ):
             run_condition_spec = tar._tar_render_metric_cohort_page(
                 ctx,
@@ -1151,6 +1418,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             tar,
             "_tar_metric_map_for_pair",
             side_effect=_fake_metric_map,
+        ), mock.patch.object(
+            tar,
+            "_tar_metric_series_for_pair",
+            side_effect=_fake_metric_rows,
         ):
             regrade_spec = tar._tar_render_metric_cohort_page(
                 ctx,
@@ -1225,7 +1496,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "pair_id": "pair-1",
                     "condition_context_rows": [
                         {
-                            "run_type": "steady state",
+                            "condition_label": "Steady State Condition",
+                            "run_type": "pulsed mode",
                             "feed_pressure": 275.0,
                             "feed_pressure_units": "psia",
                         }
@@ -1235,7 +1507,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "pair_id": "pair-2",
                     "condition_context_rows": [
                         {
-                            "run_type": "pulsed mode",
+                            "condition_label": "Pulse Mode Condition",
+                            "run_type": "steady state",
                             "feed_pressure": 320.0,
                             "feed_pressure_units": "psia",
                             "pulse_width_on": 0.02,
@@ -1628,6 +1901,38 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         pulse = tar._tar_plot_condition_header_line(
             {
                 "run_type": "pulsed mode",
+                "feed_pressure": 320.0,
+                "feed_pressure_units": "psia",
+                "pulse_width_on": 0.02,
+                "pulse_width_units": "s",
+                "off_time": 0.08,
+                "off_time_units": "s",
+            }
+        )
+
+        self.assertEqual(steady, "Steady State Condition | Feed Pressure: 275 psia")
+        self.assertEqual(
+            pulse,
+            "Pulse Mode Condition | Feed Pressure: 320 psia | On Time: 0.02 s | Off Time: 0.08 s",
+        )
+
+    def test_plot_condition_header_line_prefers_explicit_condition_label_over_run_type(self) -> None:
+        steady = tar._tar_plot_condition_header_line(
+            {
+                "condition_label": "Steady State Condition",
+                "run_type": "pulsed mode",
+                "feed_pressure": 275.0,
+                "feed_pressure_units": "psia",
+                "pulse_width_on": 0.02,
+                "pulse_width_units": "s",
+                "off_time": 0.08,
+                "off_time_units": "s",
+            }
+        )
+        pulse = tar._tar_plot_condition_header_line(
+            {
+                "condition_label": "Pulse Mode Condition",
+                "run_type": "steady state",
                 "feed_pressure": 320.0,
                 "feed_pressure_units": "psia",
                 "pulse_width_on": 0.02,

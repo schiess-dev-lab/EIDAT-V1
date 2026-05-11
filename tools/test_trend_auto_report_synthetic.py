@@ -534,8 +534,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "mode": "condition",
             "id": "condition:Run1:ss",
             "run_name": "Run1",
-            "display_text": "350 psia, SS | Supp 24 | Valve 12",
-            "run_condition": "350 psia, SS",
+            "display_text": "Steady State Condition | Supp 24 | Valve 12",
+            "run_condition": "Steady State Condition",
             "member_runs": ["Run1"],
             "member_sequences": ["Seq1"],
             "member_programs": ["Program A"],
@@ -610,6 +610,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(be.metric_run_type_filters, [None])
         self.assertEqual([curve.serial for curve in spec["series"]], ["SN_SS"])
         self.assertEqual(spec["metric_mean_by_serial"], {"SN_SS": 11.0})
+        self.assertEqual(spec["condition_label"], "Steady State Condition")
+        self.assertEqual(
+            tar._tar_plot_run_condition_label(spec, run_by_name=run_by_name),
+            "Steady State Condition",
+        )
         self.assertEqual([str(row.get("run_type") or "") for row in spec["condition_context_rows"]], ["SS"])
         header_lines = tar._tar_plot_condition_header_lines(
             {"pair_by_id": {spec["pair_id"]: spec}, "run_by_name": run_by_name},
@@ -689,8 +694,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "mode": "condition",
             "id": "condition:Run1:pm",
             "run_name": "Run1",
-            "display_text": "350 psia, PM, 5 Sec ON / 55 Sec OFF | Supp 24 | Valve 12",
-            "run_condition": "350 psia, PM, 5 Sec ON / 55 Sec OFF",
+            "display_text": "Pulse Mode Condition | Supp 24 | Valve 12",
+            "run_condition": "Pulse Mode Condition",
             "member_runs": ["Run1"],
             "member_sequences": ["Seq1"],
             "member_programs": ["Program A"],
@@ -767,6 +772,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(be.metric_run_type_filters, [None])
         self.assertEqual([curve.serial for curve in spec["series"]], ["SN_PM"])
         self.assertEqual(spec["metric_mean_by_serial"], {"SN_PM": 31.0})
+        self.assertEqual(spec["condition_label"], "Pulse Mode Condition")
+        self.assertEqual(
+            tar._tar_plot_run_condition_label(spec, run_by_name=run_by_name),
+            "Pulse Mode Condition",
+        )
         self.assertEqual([str(row.get("run_type") or "") for row in spec["condition_context_rows"]], ["PM"])
         header_lines = tar._tar_plot_condition_header_lines(
             {"pair_by_id": {spec["pair_id"]: spec}, "run_by_name": run_by_name},
