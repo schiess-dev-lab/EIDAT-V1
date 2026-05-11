@@ -283,6 +283,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             selection: dict | None = None,
             serials: list[str] | None = None,
             filter_state: object = None,
+            parameter_context: object = None,
+            raw_names: object = None,
         ) -> list[tar.CurveSeries]:
             if isinstance(filter_state, dict) and ("suppression_voltages" in filter_state or "valve_voltages" in filter_state):
                 return []
@@ -704,6 +706,196 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             ],
         )
 
+    def test_resolve_params_for_report_groups_raw_names_under_normalized_selection(self) -> None:
+        fake_be = SimpleNamespace(
+            td_build_parameter_selector_options=lambda _ctx, **_kwargs: [
+                {
+                    "value": "td_param:thrust_nominal",
+                    "display_name": "Thrust nominal",
+                    "preferred_units": "N",
+                    "raw_names": ["thrust-end", "thrust-normalized"],
+                }
+            ],
+            td_parameter_selection_raw_names=lambda _ctx, _value, **_kwargs: ["thrust-end", "thrust-normalized"],
+            td_parameter_value_display_name=lambda _ctx, _value, **_kwargs: "Thrust nominal",
+        )
+        conn = sqlite3.connect(":memory:")
+        try:
+            with mock.patch.object(
+                tar,
+                "_tar_y_column_catalog",
+                return_value={
+                    tar._norm_key("thrust-end"): {"name": "thrust-end", "units": "N"},
+                    tar._norm_key("thrust-normalized"): {"name": "thrust-normalized", "units": "N"},
+                },
+            ):
+                groups, by_raw = tar._tar_resolve_params_for_report(
+                    fake_be,
+                    Path("fake.sqlite3"),
+                    conn,
+                    runs=["Run A"],
+                    options={"params": ["td_param:thrust_nominal"]},
+                    parameter_context={},
+                )
+        finally:
+            conn.close()
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["param_key"], "td_param:thrust_nominal")
+        self.assertEqual(groups[0]["display_name"], "Thrust nominal")
+        self.assertEqual(groups[0]["display_units"], "N")
+        self.assertEqual(groups[0]["raw_params"], ["thrust-end", "thrust-normalized"])
+        self.assertEqual(by_raw[tar._norm_key("thrust-end")]["selection_value"], "td_param:thrust_nominal")
+        self.assertEqual(by_raw[tar._norm_key("thrust-normalized")]["display_name"], "Thrust nominal")
+
+    def test_load_metric_map_for_selection_unions_mapped_raw_names(self) -> None:
+        fake_be = SimpleNamespace(
+            td_parameter_selection_raw_names=lambda _ctx, _value, **_kwargs: ["thrust-end", "thrust-normalized"],
+            td_parameter_selection_matches=lambda _ctx, selection_value, raw_name, *_args: (
+                str(selection_value) == "td_param:thrust_nominal"
+                and str(raw_name) in {"thrust-end", "thrust-normalized"}
+            ),
+            td_load_metric_series=lambda _db_path, _run_name, column_name, _stat, **_kwargs: (
+                [
+                    {
+                        "observation_id": "obs-1",
+                        "serial": "SN-CERT",
+                        "value_num": 10.0,
+                        "program_title": "Program A",
+                        "source_run_name": "Seq A",
+                    }
+                ]
+                if str(column_name) == "thrust-end"
+                else [
+                    {
+                        "observation_id": "obs-2",
+                        "serial": "SN-COMP",
+                        "value_num": 12.5,
+                        "program_title": "Program A",
+                        "source_run_name": "Seq A",
+                    }
+                ]
+            ),
+        )
+
+        metric_map = tar._load_metric_map_for_selection(
+            fake_be,
+            Path("fake.sqlite3"),
+            "Run A",
+            "td_param:thrust_nominal",
+            "mean",
+            selection={"run_name": "Run A", "member_runs": ["Run A"]},
+            filter_state={},
+            parameter_context={},
+            raw_names=["thrust-end", "thrust-normalized"],
+        )
+
+        self.assertEqual(metric_map, {"SN-CERT": 10.0, "SN-COMP": 12.5})
+
+    def test_load_curves_for_selection_unions_mapped_raw_names(self) -> None:
+        fake_be = SimpleNamespace(
+            td_parameter_selection_raw_names=lambda _ctx, _value, **_kwargs: ["thrust-end", "thrust-normalized"],
+            td_parameter_selection_matches=lambda _ctx, selection_value, raw_name, *_args: (
+                str(selection_value) == "td_param:thrust_nominal"
+                and str(raw_name) in {"thrust-end", "thrust-normalized"}
+            ),
+            td_load_curves=lambda _db_path, _run_name, column_name, _x_name, **_kwargs: (
+                [
+                    {
+                        "observation_id": "obs-1",
+                        "serial": "SN-CERT",
+                        "x": [0.0, 1.0],
+                        "y": [10.0, 11.0],
+                        "program_title": "Program A",
+                        "source_run_name": "Seq A",
+                    }
+                ]
+                if str(column_name) == "thrust-end"
+                else [
+                    {
+                        "observation_id": "obs-2",
+                        "serial": "SN-COMP",
+                        "x": [0.0, 1.0],
+                        "y": [12.0, 13.0],
+                        "program_title": "Program A",
+                        "source_run_name": "Seq A",
+                    }
+                ]
+            ),
+        )
+
+        series = tar._load_curves_for_selection(
+            fake_be,
+            Path("fake.sqlite3"),
+            "Run A",
+            "td_param:thrust_nominal",
+            "Time",
+            selection={"run_name": "Run A", "member_runs": ["Run A"]},
+            filter_state={},
+            parameter_context={},
+            raw_names=["thrust-end", "thrust-normalized"],
+        )
+
+        self.assertEqual([curve.serial for curve in series], ["SN-CERT", "SN-COMP"])
+
+    def test_prepare_row_specs_builds_single_normalized_parameter_spec(self) -> None:
+        selection = {
+            "id": "sel-1",
+            "mode": "sequence",
+            "run_name": "Run A",
+            "member_runs": ["Run A"],
+            "display_text": "Sequence A",
+        }
+        run_by_name = {"Run A": {"display_name": "Run A", "default_x": "Time"}}
+        conn = sqlite3.connect(":memory:")
+        fake_be = SimpleNamespace()
+        try:
+            with mock.patch.object(tar, "_resolve_curve_x_key", return_value="Time"), mock.patch.object(
+                tar,
+                "_tar_curve_y_columns_for_run",
+                return_value=[
+                    {"name": "thrust-end", "units": "N"},
+                    {"name": "thrust-normalized", "units": "N"},
+                ],
+            ), mock.patch.object(
+                tar,
+                "_load_curves_for_selection",
+                return_value=[
+                    tar.CurveSeries(serial="SN-CERT", x=[0.0, 1.0], y=[10.0, 11.0], observation_id="obs-1", run_name="Run A"),
+                    tar.CurveSeries(serial="SN-COMP", x=[0.0, 1.0], y=[12.0, 13.0], observation_id="obs-2", run_name="Run A"),
+                ],
+            ), mock.patch.object(
+                tar,
+                "_load_metric_map_for_selection",
+                return_value={"SN-CERT": 10.5, "SN-COMP": 12.5},
+            ):
+                specs = tar._tar_prepare_row_specs(
+                    be=fake_be,
+                    db_path=Path("fake.sqlite3"),
+                    conn=conn,
+                    run_by_name=run_by_name,
+                    selections=[selection],
+                    params=[
+                        {
+                            "param_key": "td_param:thrust_nominal",
+                            "selection_value": "td_param:thrust_nominal",
+                            "display_name": "Thrust nominal",
+                            "display_units": "N",
+                            "raw_params": ["thrust-end", "thrust-normalized"],
+                        }
+                    ],
+                    filter_rows=[],
+                    filter_state={},
+                    parameter_context={},
+                )
+        finally:
+            conn.close()
+
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["param"], "td_param:thrust_nominal")
+        self.assertEqual(specs[0]["param_display"], "Thrust nominal")
+        self.assertEqual(specs[0]["raw_params"], ["thrust-end", "thrust-normalized"])
+
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
         pair_specs = [
@@ -810,6 +1002,53 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["initial_valve_voltage_label"], "All")
         self.assertEqual(rows[0]["final_valve_voltage_label"], "28")
         self.assertTrue(rows[0]["regrade_applied"])
+
+    def test_build_per_serial_comparison_rows_uses_only_normalized_parameter_label(self) -> None:
+        ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
+        pair_specs = [
+            {
+                "pair_id": "pair-1",
+                "selection_id": "sel-1",
+                "run": "Run A",
+                "run_title": "Sequence A",
+                "base_condition_label": "Condition A",
+                "selection_fields": {
+                    "mode": "condition",
+                    "sequence_text": "Sequence A",
+                    "condition_text": "Condition A",
+                },
+                "param": "td_param:thrust_nominal",
+                "param_display": "Thrust nominal",
+                "raw_params": ["thrust-end", "thrust-normalized"],
+                "units": "N",
+                "display_units": "N",
+                "initial_plot_payload": {
+                    "master_y": [10.0, 20.0],
+                    "y_resampled_by_sn": {
+                        "SN-001": [8.0, 12.0],
+                    },
+                },
+                "regrade_plot_payloads": {},
+                "suppression_voltage_label": "5",
+                "valve_voltage_label": "28",
+            }
+        ]
+
+        with mock.patch.object(tar, "_tar_metric_map_for_pair", return_value={"SN-001": 10.0}):
+            rows = tar._tar_build_per_serial_comparison_rows(
+                ctx,
+                pair_specs=pair_specs,
+                all_serials=["SN-001"],
+                hi=["SN-001"],
+                initial_grade_map_by_pair_serial={("pair-1", "SN-001"): "PASS"},
+                final_grade_map_by_pair_serial={("pair-1", "SN-001"): "PASS"},
+                finding_by_pair_serial={("pair-1", "SN-001"): {"initial_status": "PASS"}},
+            )
+
+        self.assertEqual(rows[0]["parameter"], "Thrust nominal")
+        self.assertNotIn("[", rows[0]["parameter"])
+        self.assertEqual(rows[0]["param"], "td_param:thrust_nominal")
+        self.assertEqual(rows[0]["raw_parameters"], ["thrust-end", "thrust-normalized"])
 
     def test_build_per_serial_comparison_rows_falls_back_when_no_regrade_override_exists(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
