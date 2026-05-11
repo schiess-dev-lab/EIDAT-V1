@@ -1675,8 +1675,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             rms_pct_thr=None,
         )
 
-        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
-        self.assertEqual(analysis["initial_cohort_specs"][0]["prepass_included_programs"], ["Program A"])
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
         self.assertEqual(analysis["regrade_cohort_specs"], [])
         row = analysis["grading_rows"][0]
         self.assertEqual(row["pair_id"], "pair-100")
@@ -1692,6 +1691,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["selected_pool_series_count"], 1)
         self.assertEqual(row["target_excluded_comparison_series_count"], 0)
         pair_specs = {str(spec.get("pair_id") or ""): spec for spec in analysis["pair_specs"]}
+        self.assertEqual(pair_specs["pair-100"]["prepass_included_programs"], ["Program A"])
         self.assertEqual(pair_specs["pair-100"]["filter_state_override"], {})
         self.assertEqual(pair_specs["pair-200"]["filter_state_override"], {})
         self.assertEqual(analysis["initial_nonpass_findings"], [])
@@ -1752,8 +1752,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["selected_pool_series_count"], 3)
         self.assertEqual(row["target_excluded_comparison_series_count"], 2)
         self.assertEqual(row["target_comparison_text"], "HI graded against: 1 program, 2 comparison series")
-        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
         self.assertEqual(analysis["regrade_cohort_specs"], [])
+        self.assertEqual(pair_spec["prepass_included_programs"], ["Program A", "Program B"])
         self.assertEqual(pair_spec["filter_state_override"], {})
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
@@ -2337,6 +2338,472 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
         self.assertEqual(sorted(spec["x_name"] for spec in analysis["initial_cohort_specs"]), ["Pulse Number", "Time"])
 
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_initial_plot_cohorts_consolidate_steady_state_conditions_within_50_percent(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-ss-250",
+                run="RunSS250",
+                selection_label="250 psia steady",
+                base_condition_label="250 psia steady",
+                suppression_value="5",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[198.0, 200.0, 202.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[188.0, 190.0, 192.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "250 psia steady",
+                        "run_type": "SS",
+                        "feed_pressure": 250.0,
+                        "feed_pressure_units": "psia",
+                    }
+                ],
+                metric_mean_by_serial={"HI": 200.0, "ATP1": 190.0},
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-ss-225",
+                run="RunSS225",
+                selection_label="225 psia steady",
+                base_condition_label="225 psia steady",
+                suppression_value="15",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[188.0, 190.0, 192.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[178.0, 180.0, 182.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "225 psia steady",
+                        "run_type": "steady",
+                        "feed_pressure": 225.0,
+                        "feed_pressure_units": "psia",
+                    }
+                ],
+                metric_mean_by_serial={"HI": 190.0, "ATP1": 180.0},
+            ),
+        ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        cohort = analysis["initial_cohort_specs"][0]
+        self.assertEqual(cohort["condition_label"], "Consolidated Steady State Conditions")
+        self.assertEqual(cohort["consolidation_run_mode_signature"], "steady_state")
+        self.assertEqual(
+            cohort["consolidation_program_means_by_pair_id"]["pair-ss-250"],
+            {"Program A": 200.0, "Program B": 190.0},
+        )
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_initial_plot_cohorts_split_steady_state_conditions_over_50_percent(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-ss-high",
+                run="RunSSHigh",
+                selection_label="250 psia steady",
+                base_condition_label="250 psia steady",
+                suppression_value="5",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[198.0, 200.0, 202.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[188.0, 190.0, 192.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "250 psia steady",
+                        "run_type": "SS",
+                        "feed_pressure": 250.0,
+                        "feed_pressure_units": "psia",
+                    }
+                ],
+                metric_mean_by_serial={"HI": 200.0, "ATP1": 190.0},
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-ss-low",
+                run="RunSSLow",
+                selection_label="125 psia steady",
+                base_condition_label="125 psia steady",
+                suppression_value="15",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[78.0, 80.0, 82.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[73.0, 75.0, 77.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "125 psia steady",
+                        "run_type": "SS",
+                        "feed_pressure": 125.0,
+                        "feed_pressure_units": "psia",
+                    }
+                ],
+                metric_mean_by_serial={"HI": 80.0, "ATP1": 75.0},
+            ),
+        ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_initial_plot_cohorts_consolidate_pulsed_conditions_within_50_percent(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-pm-a",
+                run="RunPMA",
+                selection_label="250 psia pulse A",
+                base_condition_label="250 psia pulse A",
+                suppression_value="5",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[98.0, 100.0, 102.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[108.0, 110.0, 112.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "250 psia pulse A",
+                        "run_type": "PM",
+                        "feed_pressure": 250.0,
+                        "feed_pressure_units": "psia",
+                        "pulse_width_on": 0.1,
+                        "pulse_width_units": "sec",
+                        "off_time": 0.1,
+                        "off_time_units": "sec",
+                    }
+                ],
+                metric_mean_by_serial={"HI": 100.0, "ATP1": 110.0},
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-pm-b",
+                run="RunPMB",
+                selection_label="225 psia pulse B",
+                base_condition_label="225 psia pulse B",
+                suppression_value="15",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[118.0, 120.0, 122.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[128.0, 130.0, 132.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "225 psia pulse B",
+                        "run_type": "pulse",
+                        "feed_pressure": 225.0,
+                        "feed_pressure_units": "psia",
+                        "pulse_width_on": 0.15,
+                        "pulse_width_units": "sec",
+                        "off_time": 0.05,
+                        "off_time_units": "sec",
+                    }
+                ],
+                metric_mean_by_serial={"HI": 120.0, "ATP1": 130.0},
+            ),
+        ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertEqual(
+            analysis["initial_cohort_specs"][0]["condition_label"],
+            "Consolidated Pulse Mode Conditions",
+        )
+        self.assertEqual(
+            analysis["initial_cohort_specs"][0]["consolidation_run_mode_signature"],
+            "pulsed_mode",
+        )
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_initial_plot_cohorts_do_not_mix_steady_and_pulsed_conditions(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-ss",
+                run="RunSS",
+                selection_label="steady condition",
+                base_condition_label="steady condition",
+                suppression_value="5",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[98.0, 100.0, 102.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[108.0, 110.0, 112.0]),
+                ],
+                condition_context_rows=[{"condition_label": "steady condition", "run_type": "SS"}],
+                metric_mean_by_serial={"HI": 100.0, "ATP1": 110.0},
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-pm",
+                run="RunPM",
+                selection_label="pulse condition",
+                base_condition_label="pulse condition",
+                suppression_value="15",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[108.0, 110.0, 112.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[118.0, 120.0, 122.0]),
+                ],
+                condition_context_rows=[{"condition_label": "pulse condition", "run_type": "PM"}],
+                metric_mean_by_serial={"HI": 110.0, "ATP1": 120.0},
+            ),
+        ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_initial_plot_cohorts_ignore_voltage_differences_when_values_match(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-v1",
+                run="RunVolt1",
+                selection_label="Condition A | Supp 5 | Valve 28",
+                base_condition_label="Condition A",
+                suppression_value="5",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[148.0, 150.0, 152.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[158.0, 160.0, 162.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "Condition A",
+                        "run_type": "SS",
+                        "suppression_voltage": 5.0,
+                        "valve_voltage": 28.0,
+                    }
+                ],
+                metric_mean_by_serial={"HI": 150.0, "ATP1": 160.0},
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-v2",
+                run="RunVolt2",
+                selection_label="Condition A | Supp 15 | Valve 35",
+                base_condition_label="Condition A",
+                suppression_value="15",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[138.0, 140.0, 142.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[148.0, 150.0, 152.0]),
+                ],
+                condition_context_rows=[
+                    {
+                        "condition_label": "Condition A",
+                        "run_type": "SS",
+                        "suppression_voltage": 15.0,
+                        "valve_voltage": 35.0,
+                    }
+                ],
+                metric_mean_by_serial={"HI": 140.0, "ATP1": 150.0},
+            ),
+        ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        self.assertEqual(analysis["initial_cohort_specs"][0]["base_condition_label"], "Condition A")
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_initial_plot_cohorts_fall_back_to_curve_means_when_metric_means_are_missing(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = [
+            self._row_spec(
+                tar,
+                pair_id="pair-fallback-a",
+                run="RunFallbackA",
+                selection_label="Fallback A",
+                base_condition_label="Fallback A",
+                suppression_value="5",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[98.0, 100.0, 102.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[108.0, 110.0, 112.0]),
+                ],
+                condition_context_rows=[{"condition_label": "Fallback A", "run_type": "SS"}],
+                metric_mean_by_serial={},
+            ),
+            self._row_spec(
+                tar,
+                pair_id="pair-fallback-b",
+                run="RunFallbackB",
+                selection_label="Fallback B",
+                base_condition_label="Fallback B",
+                suppression_value="15",
+                series=[
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[118.0, 120.0, 122.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[128.0, 130.0, 132.0]),
+                ],
+                condition_context_rows=[{"condition_label": "Fallback B", "run_type": "SS"}],
+                metric_mean_by_serial={},
+            ),
+        ]
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        pair_specs = {str(spec.get("pair_id") or ""): spec for spec in analysis["pair_specs"]}
+        self.assertEqual(pair_specs["pair-fallback-a"]["consolidation_mean_source"], "curve_trace_mean")
+        self.assertEqual(pair_specs["pair-fallback-b"]["consolidation_mean_source"], "curve_trace_mean")
+
+    @unittest.skipUnless(_have_numpy(), "numpy not installed")
+    def test_consolidated_initial_cohort_uses_compact_label_and_truncated_condition_context(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        row_specs = []
+        for index, pressure in enumerate((250.0, 240.0, 230.0, 220.0), start=1):
+            label = f"{int(pressure)} psia steady"
+            row_specs.append(
+                self._row_spec(
+                    tar,
+                    pair_id=f"pair-ctx-{index}",
+                    run=f"RunCtx{index}",
+                    selection_label=label,
+                    base_condition_label=label,
+                    suppression_value=str(index),
+                    series=[
+                        tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[pressure - 2.0, pressure, pressure + 2.0]),
+                        tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[pressure + 8.0, pressure + 10.0, pressure + 12.0]),
+                    ],
+                    condition_context_rows=[
+                        {
+                            "condition_label": label,
+                            "run_type": "SS",
+                            "feed_pressure": pressure,
+                            "feed_pressure_units": "psia",
+                        }
+                    ],
+                    metric_mean_by_serial={"HI": pressure, "ATP1": pressure + 10.0},
+                )
+            )
+        program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
+
+        analysis = tar._tar_analyze_curve_groups(
+            row_specs,
+            hi=["HI"],
+            program_by_serial=program_by_serial,
+            certifying_program="Program A",
+            grid_points=3,
+            degree=1,
+            normalize_x=False,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+
+        self.assertEqual(len(analysis["initial_cohort_specs"]), 1)
+        cohort = analysis["initial_cohort_specs"][0]
+        self.assertEqual(cohort["condition_label"], "Consolidated Steady State Conditions")
+        self.assertEqual(tar._tar_plot_run_condition_label(cohort), "Consolidated Steady State Conditions")
+        header_lines = tar._tar_plot_condition_header_lines(
+            {"pair_by_id": {spec["pair_id"]: spec for spec in analysis["pair_specs"]}, "run_by_name": {}},
+            cohort,
+            max_items=2,
+        )
+        self.assertEqual(
+            header_lines,
+            [
+                "250 psia steady",
+                "240 psia steady",
+                "+2 more conditions",
+            ],
+        )
+
     def test_build_per_serial_comparison_rows_uses_plot_payload_metrics(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
@@ -2476,7 +2943,10 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             )
 
         raw_key = tar._norm_key("feed_pressure_raw")
-        self.assertEqual(params, ["feed_pressure_raw"])
+        self.assertEqual(len(params), 1)
+        self.assertEqual(params[0]["selection_value"], "parameter:chamber_feed_pressure")
+        self.assertEqual(params[0]["display_name"], "Chamber Feed Pressure")
+        self.assertEqual(params[0]["raw_params"], ["feed_pressure_raw"])
         self.assertEqual(display_by_raw[raw_key]["display_name"], "Chamber Feed Pressure")
         self.assertEqual(display_by_raw[raw_key]["display_units"], "psia")
         self.assertEqual(
@@ -2522,6 +2992,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "param_display": "Chamber Feed Pressure",
             "units": "psi",
             "display_units": "psia",
+            "raw_params": ["feed_pressure_raw"],
             "selection_fields": {
                 "mode": "condition",
                 "condition_text": "Condition A",
@@ -2579,6 +3050,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "param_display": "Chamber Feed Pressure",
                 "units": "psi",
                 "display_units": "psia",
+                "raw_params": ["feed_pressure_raw"],
                 "selection_fields": {"mode": "condition", "condition_text": "Condition A", "sequence_text": "Seq 1"},
                 "base_condition_label": "Condition A",
                 "initial_plot_payload": {"master_y": [1.0, 1.0], "y_resampled_by_sn": {"SN1": [1.1, 1.1], "SN2": [1.0, 1.0]}},
@@ -2592,6 +3064,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "param_display": "Chamber Feed Pressure",
                 "units": "psi",
                 "display_units": "psia",
+                "raw_params": ["feed_pressure_cmd_raw"],
                 "selection_fields": {"mode": "condition", "condition_text": "Condition A", "sequence_text": "Seq 1"},
                 "base_condition_label": "Condition A",
                 "initial_plot_payload": {"master_y": [2.0, 2.0], "y_resampled_by_sn": {"SN1": [2.1, 2.1], "SN2": [2.0, 2.0]}},
@@ -3402,6 +3875,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         x_name: str = "Time",
         param: str = "thrust",
         units: str = "lbf",
+        condition_context_rows: list[dict] | None = None,
+        metric_mean_by_serial: dict[str, float] | None = None,
     ) -> dict:
         return {
             "pair_id": pair_id,
@@ -3424,6 +3899,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             "units": units,
             "x_name": x_name,
             "series": list(series),
+            "condition_label": base_condition_label,
+            "condition_context_rows": [dict(row) for row in (condition_context_rows or []) if isinstance(row, dict)],
+            "metric_mean_by_serial": dict(metric_mean_by_serial or {}),
             "series_by_suppression": {suppression_value: list(series)} if suppression_value else {},
             "initial_model": {},
             "initial_plot_payload": {},

@@ -2083,6 +2083,382 @@ def _tar_program_trace_scalar_mean_map(
     return out
 
 
+def _tar_curve_series_scalar_mean_map(
+    series: Iterable["CurveSeries"] | None,
+) -> dict[str, float]:
+    by_serial: dict[str, list[float]] = {}
+    for curve in (series or []):
+        if not isinstance(curve, CurveSeries):
+            continue
+        serial = str(curve.serial or "").strip()
+        if not serial:
+            continue
+        for value in (curve.y or []):
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                by_serial.setdefault(serial, []).append(float(value))
+    out: dict[str, float] = {}
+    for serial, values in by_serial.items():
+        mean_value = _tar_finite_mean(values)
+        if mean_value is not None:
+            out[serial] = float(mean_value)
+    return out
+
+
+def _tar_spec_run_mode_signature(spec: Mapping[str, Any] | None) -> str:
+    modes: list[str] = []
+    seen: set[str] = set()
+    for row in (dict(spec or {}).get("condition_context_rows") or []):
+        if not isinstance(row, Mapping):
+            continue
+        mode = _row_run_type_mode(row)
+        if not mode or mode in seen:
+            continue
+        seen.add(mode)
+        modes.append(mode)
+    if not modes and isinstance((dict(spec or {}).get("selection") or None), Mapping):
+        for mode in _selection_run_type_modes(dict(spec or {}).get("selection") or {}):
+            if not mode or mode in seen:
+                continue
+            seen.add(mode)
+            modes.append(mode)
+    if len(modes) == 1:
+        return modes[0]
+    if set(modes) == {"steady_state", "pulsed_mode"}:
+        return "mixed_mode"
+    if modes:
+        return "+".join(sorted(modes))
+    return "unknown_mode"
+
+
+def _tar_consolidation_mode_label(signature: object) -> str:
+    token = str(signature or "").strip().lower()
+    if token == "steady_state":
+        return "Steady State"
+    if token == "pulsed_mode":
+        return "Pulse Mode"
+    if token == "mixed_mode":
+        return "Mixed-Mode"
+    return "Grouped"
+
+
+def _tar_consolidated_condition_label(
+    run_mode_signature: object,
+) -> str:
+    mode_label = _tar_consolidation_mode_label(run_mode_signature)
+    if mode_label == "Grouped":
+        return "Consolidated Conditions"
+    return f"Consolidated {mode_label} Conditions"
+
+
+def _tar_build_spec_consolidation_profile(
+    spec: Mapping[str, Any] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    metric_values_by_serial: dict[str, float] = {}
+    for raw_serial, raw_value in dict((dict(spec or {}).get("metric_mean_by_serial") or {})).items():
+        serial = str(raw_serial or "").strip()
+        value = _safe_float(raw_value)
+        if not serial or value is None or not math.isfinite(float(value)):
+            continue
+        metric_values_by_serial[serial] = float(value)
+    mean_source = "cached_metric_mean"
+    if metric_values_by_serial:
+        program_means = _tar_program_mean_map(
+            metric_values_by_serial,
+            program_by_serial=program_by_serial,
+        )
+    else:
+        mean_source = "curve_trace_mean"
+        program_means = _tar_program_mean_map(
+            _tar_curve_series_scalar_mean_map(dict(spec or {}).get("series") or []),
+            program_by_serial=program_by_serial,
+        )
+    return {
+        "run_mode_signature": _tar_spec_run_mode_signature(spec),
+        "program_means": dict(program_means),
+        "mean_source": mean_source,
+    }
+
+
+def _tar_prepare_spec_consolidation_profile(
+    spec: dict[str, Any],
+    *,
+    program_by_serial: Mapping[str, str] | None,
+) -> None:
+    profile = _tar_build_spec_consolidation_profile(spec, program_by_serial=program_by_serial)
+    spec["consolidation_profile"] = dict(profile)
+    spec["consolidation_run_mode_signature"] = str(profile.get("run_mode_signature") or "").strip()
+    spec["consolidation_program_means"] = dict(profile.get("program_means") or {})
+    spec["consolidation_mean_source"] = str(profile.get("mean_source") or "").strip()
+
+
+def _tar_specs_can_share_initial_plot_cohort(
+    left: Mapping[str, Any] | None,
+    right: Mapping[str, Any] | None,
+    *,
+    threshold_pct: float,
+) -> bool:
+    left_spec = dict(left or {})
+    right_spec = dict(right or {})
+    if _norm_key(left_spec.get("param") or "") != _norm_key(right_spec.get("param") or ""):
+        return False
+    if _norm_key(left_spec.get("x_name") or "") != _norm_key(right_spec.get("x_name") or ""):
+        return False
+    left_signature = str((left_spec.get("consolidation_profile") or {}).get("run_mode_signature") or "").strip()
+    right_signature = str((right_spec.get("consolidation_profile") or {}).get("run_mode_signature") or "").strip()
+    if left_signature != right_signature:
+        return False
+    left_program_means: dict[str, float] = {}
+    for raw_program, raw_value in dict((left_spec.get("consolidation_profile") or {}).get("program_means") or {}).items():
+        program = str(raw_program or "").strip()
+        value = _safe_float(raw_value)
+        if not program or value is None or not math.isfinite(float(value)):
+            continue
+        left_program_means[program] = float(value)
+    right_program_means: dict[str, float] = {}
+    for raw_program, raw_value in dict((right_spec.get("consolidation_profile") or {}).get("program_means") or {}).items():
+        program = str(raw_program or "").strip()
+        value = _safe_float(raw_value)
+        if not program or value is None or not math.isfinite(float(value)):
+            continue
+        right_program_means[program] = float(value)
+    shared_programs = [program for program in left_program_means if program in right_program_means]
+    if not shared_programs:
+        return False
+    for program in shared_programs:
+        pct_delta = _tar_percent_delta_between_scalars(
+            left_program_means.get(program),
+            right_program_means.get(program),
+        )
+        if pct_delta is None or float(pct_delta) > float(threshold_pct):
+            return False
+    return True
+
+
+def _tar_group_initial_plot_specs(
+    specs: Sequence[dict[str, Any]] | None,
+    *,
+    threshold_pct: float,
+) -> list[list[dict[str, Any]]]:
+    buckets: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for spec in (specs or []):
+        if not isinstance(spec, dict):
+            continue
+        key = (
+            _norm_key(spec.get("param") or ""),
+            _norm_key(spec.get("x_name") or ""),
+            str((spec.get("consolidation_profile") or {}).get("run_mode_signature") or "").strip(),
+        )
+        buckets.setdefault(key, []).append(spec)
+    grouped: list[list[dict[str, Any]]] = []
+    for bucket_specs in buckets.values():
+        bucket_groups: list[list[dict[str, Any]]] = []
+        for spec in bucket_specs:
+            placed = False
+            for group in bucket_groups:
+                if all(
+                    _tar_specs_can_share_initial_plot_cohort(spec, member, threshold_pct=threshold_pct)
+                    for member in group
+                ):
+                    group.append(spec)
+                    placed = True
+                    break
+            if not placed:
+                bucket_groups.append([spec])
+        grouped.extend(bucket_groups)
+    return grouped
+
+
+def _tar_build_initial_plot_cohort_spec(
+    members: Sequence[Mapping[str, Any]] | None,
+    *,
+    group_index: int,
+    program_by_serial: Mapping[str, str] | None,
+    grid_points: int,
+    degree: int,
+    normalize_x: bool,
+) -> dict[str, Any] | None:
+    cohort_members = [dict(member) for member in (members or []) if isinstance(member, Mapping)]
+    if not cohort_members:
+        return None
+    pooled_series: list[CurveSeries] = []
+    for spec in cohort_members:
+        pooled_series.extend([curve for curve in (spec.get("series") or []) if isinstance(curve, CurveSeries)])
+    if not pooled_series:
+        return None
+    initial_scope_model = _tar_build_curve_model_for_series(
+        pooled_series,
+        x_name=str(cohort_members[0].get("x_name") or ""),
+        units=str(cohort_members[0].get("units") or ""),
+        grid_points=grid_points,
+        degree=degree,
+        normalize_x=normalize_x,
+    )
+    if not isinstance(initial_scope_model, dict):
+        return None
+    x_grid = list(initial_scope_model.get("x_grid") or [])
+    full_trace_map_all: dict[str, list[float]] = {}
+    visual_trace_curves: list[dict[str, Any]] = []
+    for spec in cohort_members:
+        pair_id = str(spec.get("pair_id") or "").strip()
+        spec_series = [curve for curve in (spec.get("series") or []) if isinstance(curve, CurveSeries)]
+        _tar_merge_resampled_trace_map(
+            full_trace_map_all,
+            _tar_resampled_trace_map(
+                spec_series,
+                x_grid=x_grid,
+                program_by_serial=program_by_serial,
+            ),
+        )
+        for trace in _tar_resampled_trace_entries(
+            spec_series,
+            x_grid=x_grid,
+            program_by_serial=program_by_serial,
+        ):
+            visual_trace_curves.append(
+                {
+                    "pair_id": pair_id,
+                    "selection_label": str(spec.get("selection_label") or ""),
+                    **dict(trace),
+                }
+            )
+    full_program_traces = _tar_program_trace_map(
+        full_trace_map_all,
+        program_by_serial=program_by_serial,
+    )
+    visual_model = None
+    if full_program_traces:
+        visual_model = _tar_build_curve_model_for_program_traces(
+            x_name=str(cohort_members[0].get("x_name") or ""),
+            units=str(cohort_members[0].get("units") or ""),
+            x_grid=x_grid,
+            traces_by_program=full_program_traces,
+            degree=degree,
+            normalize_x=normalize_x,
+        )
+    cohort_model = visual_model if isinstance(visual_model, dict) else initial_scope_model
+    run_mode_signature = str((cohort_members[0].get("consolidation_profile") or {}).get("run_mode_signature") or "").strip()
+    base_condition_labels = _tar_unique_text_values(
+        [
+            member.get("base_condition_label") or member.get("condition_label") or member.get("selection_label")
+            for member in cohort_members
+        ]
+    )
+    selection_labels = _tar_unique_text_values(
+        [member.get("selection_label") for member in cohort_members]
+    )
+    member_pair_ids = _tar_unique_text_values([member.get("pair_id") for member in cohort_members])
+    if len(base_condition_labels) > 1:
+        summary_label = _tar_consolidated_condition_label(run_mode_signature)
+        condition_label = summary_label
+        base_condition_label = summary_label
+    else:
+        summary_label = base_condition_labels[0] if base_condition_labels else ""
+        condition_label = (
+            str(cohort_members[0].get("condition_label") or "").strip()
+            or summary_label
+        )
+        base_condition_label = (
+            str(cohort_members[0].get("base_condition_label") or "").strip()
+            or summary_label
+        )
+    prepass_reference_program = ""
+    prepass_included_programs: list[str] = []
+    prepass_excluded_programs: list[str] = []
+    prepass_gate_mode_values: list[str] = []
+    prepass_gate_details: list[dict[str, Any]] = []
+    for member in cohort_members:
+        if not prepass_reference_program:
+            prepass_reference_program = str(member.get("prepass_reference_program") or "").strip()
+        prepass_included_programs.extend(member.get("prepass_included_programs") or [])
+        prepass_excluded_programs.extend(member.get("prepass_excluded_programs") or [])
+        gate_mode = str(member.get("prepass_gate_mode") or "").strip()
+        if gate_mode:
+            prepass_gate_mode_values.append(gate_mode)
+        for item in (member.get("prepass_gate_details") or []):
+            if isinstance(item, Mapping):
+                prepass_gate_details.append(dict(item))
+    return {
+        "cohort_id": (
+            f"initial:{group_index}:{_norm_key(base_condition_label)}:"
+            f"{_norm_key(cohort_members[0].get('param') or '')}:{_norm_key(cohort_members[0].get('x_name') or '')}:"
+            f"{_norm_key(run_mode_signature)}"
+        ),
+        "cohort_type": "initial",
+        "param": str(cohort_members[0].get("param") or ""),
+        "param_display": _tar_pair_param_label(cohort_members[0]),
+        "units": str(cohort_members[0].get("units") or ""),
+        "display_units": _tar_pair_units_label(cohort_members[0]),
+        "x_name": str(cohort_model.get("x_name") or ""),
+        "condition_label": condition_label,
+        "base_condition_label": base_condition_label,
+        "suppression_voltage_label": "",
+        "valve_voltage_label": "",
+        "selection_labels": list(selection_labels),
+        "member_pair_ids": list(member_pair_ids),
+        "model": {
+            "x_name": str(cohort_model.get("x_name") or ""),
+            "units": str(cohort_model.get("units") or ""),
+            "domain": list(cohort_model.get("domain") or []),
+            "grid_points": int(cohort_model.get("grid_points") or len(x_grid)),
+            "poly": dict(cohort_model.get("poly") or {}),
+            "equation": str(cohort_model.get("equation") or ""),
+        },
+        "x_grid": list(x_grid),
+        "master_y": list(cohort_model.get("master_y") or []),
+        "std_y": list(cohort_model.get("std_y") or []),
+        "trace_curves": visual_trace_curves,
+        "visual_program_scope": "all_programs",
+        "prepass_reference_program": prepass_reference_program,
+        "prepass_included_programs": _tar_unique_text_values(prepass_included_programs),
+        "prepass_excluded_programs": _tar_unique_text_values(prepass_excluded_programs),
+        "prepass_gate_mode": (
+            prepass_gate_mode_values[0]
+            if len(set(prepass_gate_mode_values)) == 1 and prepass_gate_mode_values
+            else ("mixed" if prepass_gate_mode_values else "")
+        ),
+        "prepass_gate_details": prepass_gate_details,
+        "consolidation_run_mode_signature": run_mode_signature,
+        "consolidation_base_condition_labels": list(base_condition_labels),
+        "consolidation_program_means_by_pair_id": {
+            str(member.get("pair_id") or "").strip(): dict((member.get("consolidation_profile") or {}).get("program_means") or {})
+            for member in cohort_members
+            if str(member.get("pair_id") or "").strip()
+        },
+        "consolidation_mean_sources_by_pair_id": {
+            str(member.get("pair_id") or "").strip(): str((member.get("consolidation_profile") or {}).get("mean_source") or "").strip()
+            for member in cohort_members
+            if str(member.get("pair_id") or "").strip()
+        },
+    }
+
+
+def _tar_build_initial_plot_cohort_specs(
+    specs: Sequence[dict[str, Any]] | None,
+    *,
+    program_by_serial: Mapping[str, str] | None,
+    grid_points: int,
+    degree: int,
+    normalize_x: bool,
+    threshold_pct: float,
+) -> list[dict[str, Any]]:
+    grouped_specs = _tar_group_initial_plot_specs(specs, threshold_pct=threshold_pct)
+    out: list[dict[str, Any]] = []
+    for group_index, members in enumerate(grouped_specs, start=1):
+        cohort_spec = _tar_build_initial_plot_cohort_spec(
+            members,
+            group_index=group_index,
+            program_by_serial=program_by_serial,
+            grid_points=grid_points,
+            degree=degree,
+            normalize_x=normalize_x,
+        )
+        if cohort_spec:
+            out.append(cohort_spec)
+    return out
+
+
 def _tar_program_score_stats(
     entries: Iterable[tuple[str, Mapping[str, object]]],
     *,
@@ -3966,6 +4342,29 @@ def _tar_comparison_block_key(row: Mapping[str, object]) -> str:
             str(row.get("sequence_text") or "").strip(),
         ]
     )
+
+
+def _tar_disambiguate_comparison_row_parameters(rows: list[dict] | None) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get("parameter") or "").strip()
+        if not label:
+            continue
+        grouped.setdefault(label, []).append(row)
+    for label, members in grouped.items():
+        if len(members) <= 1:
+            continue
+        seen_labels: set[str] = set()
+        for row in members:
+            suffix = str(row.get("raw_parameter") or row.get("param") or "").strip()
+            disambiguated = f"{label} [{suffix}]" if suffix else label
+            if disambiguated in seen_labels and suffix:
+                disambiguated = f"{label} [{suffix}:{str(row.get('pair_id') or '').strip()}]"
+            row["parameter"] = disambiguated
+            seen_labels.add(disambiguated)
+    return [dict(row) for row in (rows or []) if isinstance(row, dict)]
 
 
 def _tar_group_comparison_rows_by_serial(
@@ -6522,9 +6921,11 @@ def _tar_plot_condition_header_lines(
                 continue
             seen.add(key)
             lines.append(line)
-            if len(lines) >= max_items:
-                return lines
     if lines:
+        if max_items > 0 and len(lines) > max_items:
+            hidden_count = len(lines) - max_items
+            noun = "condition" if hidden_count == 1 else "conditions"
+            return lines[:max_items] + [f"+{hidden_count} more {noun}"]
         return lines
     fallback = str(fallback_label or "").strip()
     return [fallback] if fallback else []
@@ -8405,7 +8806,7 @@ def _tar_build_per_serial_comparison_rows(
             row_data["grade_basis_text"] = _tar_grade_basis_text(row_data)
             row_data["prepass_cohort_note"] = _tar_prepass_cohort_note(row_data)
             comparison_rows.append(row_data)
-    return comparison_rows
+    return _tar_disambiguate_comparison_row_parameters(comparison_rows)
 
 
 def _tar_group_comparison_rows(rows: list[dict]) -> list[dict[str, Any]]:
@@ -10828,6 +11229,7 @@ def _tar_analyze_curve_groups(
         spec.setdefault("regrade_models", {})
         spec.setdefault("regrade_plot_payloads", {})
         spec.setdefault("final_programs_by_condition", {})
+        _tar_prepare_spec_consolidation_profile(spec, program_by_serial=program_by_serial)
     hi_set = {str(serial).strip() for serial in (hi or []) if str(serial).strip()}
     reference_program = _td_display_program_title(certifying_program)
     if not reference_program:
@@ -11251,6 +11653,15 @@ def _tar_analyze_curve_groups(
                     "prepass_gate_details": [dict(item) for item in prepass_gate_details],
                 }
             )
+
+    initial_cohort_specs = _tar_build_initial_plot_cohort_specs(
+        specs,
+        program_by_serial=program_by_serial,
+        grid_points=grid_points,
+        degree=degree,
+        normalize_x=normalize_x,
+        threshold_pct=50.0,
+    )
 
     family_groups: dict[tuple[str, str, str], list[dict]] = {}
     for spec in specs:
