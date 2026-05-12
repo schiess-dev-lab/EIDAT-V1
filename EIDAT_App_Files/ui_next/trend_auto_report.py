@@ -4344,27 +4344,35 @@ def _tar_comparison_block_key(row: Mapping[str, object]) -> str:
     )
 
 
+def _tar_comparison_parameter_key(row: Mapping[str, Any] | None) -> str:
+    source = dict(row or {})
+    param_key = _norm_key(source.get("param") or "")
+    if param_key:
+        return param_key
+    raw_values = source.get("raw_parameters")
+    raw_parts: list[str] = []
+    if isinstance(raw_values, (list, tuple, set)):
+        raw_parts = [token for token in (_norm_key(value) for value in raw_values) if token]
+    raw_parameter = _norm_key(source.get("raw_parameter") or "")
+    if raw_parameter and raw_parameter not in raw_parts:
+        raw_parts.append(raw_parameter)
+    if raw_parts:
+        return "|".join(raw_parts)
+    parameter_key = _norm_key(source.get("parameter") or "")
+    if parameter_key:
+        return parameter_key
+    return _norm_key(source.get("pair_id") or "")
+
+
 def _tar_disambiguate_comparison_row_parameters(rows: list[dict] | None) -> list[dict]:
-    grouped: dict[str, list[dict]] = {}
-    for row in rows or []:
-        if not isinstance(row, dict):
+    out: list[dict] = []
+    for raw_row in rows or []:
+        if not isinstance(raw_row, dict):
             continue
-        label = str(row.get("parameter") or "").strip()
-        if not label:
-            continue
-        grouped.setdefault(label, []).append(row)
-    for label, members in grouped.items():
-        if len(members) <= 1:
-            continue
-        seen_labels: set[str] = set()
-        for row in members:
-            suffix = str(row.get("raw_parameter") or row.get("param") or "").strip()
-            disambiguated = f"{label} [{suffix}]" if suffix else label
-            if disambiguated in seen_labels and suffix:
-                disambiguated = f"{label} [{suffix}:{str(row.get('pair_id') or '').strip()}]"
-            row["parameter"] = disambiguated
-            seen_labels.add(disambiguated)
-    return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        row = dict(raw_row)
+        row["parameter_key"] = str(row.get("parameter_key") or _tar_comparison_parameter_key(row)).strip()
+        out.append(row)
+    return out
 
 
 def _tar_group_comparison_rows_by_serial(
@@ -4381,6 +4389,7 @@ def _tar_group_comparison_rows_by_serial(
             grouped[serial] = {
                 "serial": serial,
                 "parameter_order": [],
+                "parameter_labels": {},
                 "parameter_units": {},
                 "blocks": [],
                 "blocks_by_id": {},
@@ -4399,12 +4408,15 @@ def _tar_group_comparison_rows_by_serial(
         if not serial:
             continue
         serial_spec = _ensure_serial(serial)
-        parameter = str(row.get("parameter") or "").strip()
+        parameter_key = str(row.get("parameter_key") or _tar_comparison_parameter_key(row)).strip()
+        parameter_label = str(row.get("parameter") or "").strip() or parameter_key
         units = str(row.get("units") or "").strip()
-        if parameter and parameter not in serial_spec["parameter_order"]:
-            serial_spec["parameter_order"].append(parameter)
-        if parameter and units and not str(serial_spec["parameter_units"].get(parameter) or "").strip():
-            serial_spec["parameter_units"][parameter] = units
+        if parameter_key and parameter_key not in serial_spec["parameter_order"]:
+            serial_spec["parameter_order"].append(parameter_key)
+        if parameter_key and parameter_label and not str(serial_spec["parameter_labels"].get(parameter_key) or "").strip():
+            serial_spec["parameter_labels"][parameter_key] = parameter_label
+        if parameter_key and units and not str(serial_spec["parameter_units"].get(parameter_key) or "").strip():
+            serial_spec["parameter_units"][parameter_key] = units
         block_id = _tar_comparison_block_key(row)
         if block_id not in serial_spec["blocks_by_id"]:
             block = {
@@ -4416,7 +4428,7 @@ def _tar_group_comparison_rows_by_serial(
             }
             serial_spec["blocks_by_id"][block_id] = block
             serial_spec["blocks"].append(block)
-        serial_spec["blocks_by_id"][block_id]["rows_by_parameter"][parameter] = row
+        serial_spec["blocks_by_id"][block_id]["rows_by_parameter"][parameter_key] = row
 
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -4433,6 +4445,7 @@ def _tar_group_comparison_rows_by_serial(
             {
                 "serial": serial,
                 "parameter_order": list(serial_spec["parameter_order"]),
+                "parameter_labels": dict(serial_spec["parameter_labels"]),
                 "parameter_units": dict(serial_spec["parameter_units"]),
                 "blocks": list(serial_spec["blocks"]),
             }
@@ -4709,12 +4722,23 @@ def _tar_comparison_page_metric_value(
 def _tar_build_comparison_page_matrix_details(
     page_spec: Mapping[str, object],
 ) -> tuple[list[list[str]], list[tuple], dict[tuple[int, int], dict[str, Any]]]:
-    param_names = [str(name or "").strip() for name in (page_spec.get("param_names") or []) if str(name or "").strip()]
+    param_keys = [str(name or "").strip() for name in (page_spec.get("param_keys") or []) if str(name or "").strip()]
+    if not param_keys:
+        param_keys = [str(name or "").strip() for name in (page_spec.get("param_names") or []) if str(name or "").strip()]
+    page_param_names = [str(name or "").strip() for name in (page_spec.get("param_names") or []) if str(name or "").strip()]
+    parameter_labels = dict(page_spec.get("parameter_labels") or {})
+    columns: list[tuple[str, str]] = []
+    for index, param_key in enumerate(param_keys):
+        display_name = page_param_names[index] if index < len(page_param_names) else ""
+        display_name = display_name or str(parameter_labels.get(param_key) or "").strip() or param_key
+        columns.append((param_key, display_name))
+    if not columns:
+        columns = [(name, name) for name in page_param_names]
     param_units = dict(page_spec.get("param_units") or {})
     chart_destinations = dict(page_spec.get("comparison_chart_destinations") or {})
     rows: list[list[str]] = [
-        ["Run Condition", "Sequence(s)", "Metric", *param_names],
-        ["", "", "", *[str(param_units.get(name) or "") for name in param_names]],
+        ["Run Condition", "Sequence(s)", "Metric", *[name for _, name in columns]],
+        ["", "", "", *[str(param_units.get(key) or "") for key, _ in columns]],
     ]
     style_cmds: list[tuple] = [
         ("SPAN", (0, 0), (0, 1)),
@@ -4735,8 +4759,8 @@ def _tar_build_comparison_page_matrix_details(
                 _tar_sequence_bullet_text(sample_row or block) if metric_index == 0 else "",
                 metric_label,
             ]
-            for param_offset, param_name in enumerate(param_names):
-                data_row = by_parameter.get(param_name)
+            for param_offset, (param_key, param_name) in enumerate(columns):
+                data_row = by_parameter.get(param_key)
                 cell_text = _tar_comparison_page_metric_value(
                     data_row,
                     metric_label,
@@ -4771,8 +4795,8 @@ def _tar_build_comparison_page_matrix_details(
         )
         if block_index % 2 == 1:
             style_cmds.append(("BACKGROUND", (0, start_row), (-1, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), "#f8fafc"))
-        for param_offset, param_name in enumerate(param_names):
-            data_row = by_parameter.get(param_name)
+        for param_offset, (param_key, _param_name) in enumerate(columns):
+            data_row = by_parameter.get(param_key)
             if isinstance(data_row, Mapping) and bool(data_row.get("regrade_applied")):
                 col_index = 3 + param_offset
                 style_cmds.append(("BACKGROUND", (col_index, start_row), (col_index, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), "#fef3c7"))
@@ -4925,6 +4949,7 @@ def _tar_paginate_comparison_serial(
     rl: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     parameter_order = [str(name or "").strip() for name in (serial_spec.get("parameter_order") or []) if str(name or "").strip()]
+    parameter_labels = dict(serial_spec.get("parameter_labels") or {})
     parameter_units = dict(serial_spec.get("parameter_units") or {})
     blocks = [dict(block) for block in (serial_spec.get("blocks") or []) if isinstance(block, Mapping)]
     if not parameter_order or not blocks:
@@ -4947,7 +4972,9 @@ def _tar_paginate_comparison_serial(
                 candidate_page = {
                     "serial": serial_spec.get("serial"),
                     "font_size": int(font_size),
-                    "param_names": list(param_slice),
+                    "param_keys": list(param_slice),
+                    "param_names": [str(parameter_labels.get(name) or name) for name in param_slice],
+                    "parameter_labels": {name: str(parameter_labels.get(name) or name) for name in param_slice},
                     "param_units": {name: str(parameter_units.get(name) or "") for name in param_slice},
                     "col_widths": list(col_widths),
                     "blocks": [dict(block) for block in blocks[block_start:block_end]],
@@ -4967,7 +4994,9 @@ def _tar_paginate_comparison_serial(
                 {
                     "serial": str(serial_spec.get("serial") or "").strip(),
                     "font_size": int(font_size),
-                    "param_names": list(param_slice),
+                    "param_keys": list(param_slice),
+                    "param_names": [str(parameter_labels.get(name) or name) for name in param_slice],
+                    "parameter_labels": {name: str(parameter_labels.get(name) or name) for name in param_slice},
                     "param_units": {name: str(parameter_units.get(name) or "") for name in param_slice},
                     "col_widths": list(col_widths),
                     "blocks": [dict(block) for block in blocks[block_start:best_end]],
@@ -11660,7 +11689,7 @@ def _tar_analyze_curve_groups(
         grid_points=grid_points,
         degree=degree,
         normalize_x=normalize_x,
-        threshold_pct=50.0,
+        threshold_pct=100.0,
     )
 
     family_groups: dict[tuple[str, str, str], list[dict]] = {}

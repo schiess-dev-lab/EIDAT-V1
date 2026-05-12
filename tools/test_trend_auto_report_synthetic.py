@@ -2339,7 +2339,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(sorted(spec["x_name"] for spec in analysis["initial_cohort_specs"]), ["Pulse Number", "Time"])
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
-    def test_initial_plot_cohorts_consolidate_steady_state_conditions_within_50_percent(self):
+    def test_initial_plot_cohorts_consolidate_steady_state_conditions_within_100_percent(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         row_specs = [
@@ -2366,24 +2366,24 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             ),
             self._row_spec(
                 tar,
-                pair_id="pair-ss-225",
-                run="RunSS225",
-                selection_label="225 psia steady",
-                base_condition_label="225 psia steady",
+                pair_id="pair-ss-125",
+                run="RunSS125",
+                selection_label="125 psia steady",
+                base_condition_label="125 psia steady",
                 suppression_value="15",
                 series=[
-                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[188.0, 190.0, 192.0]),
-                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[178.0, 180.0, 182.0]),
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[78.0, 80.0, 82.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[73.0, 75.0, 77.0]),
                 ],
                 condition_context_rows=[
                     {
-                        "condition_label": "225 psia steady",
+                        "condition_label": "125 psia steady",
                         "run_type": "steady",
-                        "feed_pressure": 225.0,
+                        "feed_pressure": 125.0,
                         "feed_pressure_units": "psia",
                     }
                 ],
-                metric_mean_by_serial={"HI": 190.0, "ATP1": 180.0},
+                metric_mean_by_serial={"HI": 80.0, "ATP1": 75.0},
             ),
         ]
         program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
@@ -2413,7 +2413,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         )
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
-    def test_initial_plot_cohorts_split_steady_state_conditions_over_50_percent(self):
+    def test_initial_plot_cohorts_split_steady_state_conditions_over_100_percent(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         row_specs = [
@@ -2440,14 +2440,14 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             ),
             self._row_spec(
                 tar,
-                pair_id="pair-ss-low",
-                run="RunSSLow",
+                pair_id="pair-ss-neg",
+                run="RunSSNeg",
                 selection_label="125 psia steady",
                 base_condition_label="125 psia steady",
                 suppression_value="15",
                 series=[
-                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[78.0, 80.0, 82.0]),
-                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[73.0, 75.0, 77.0]),
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[-42.0, -40.0, -38.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[-37.0, -35.0, -33.0]),
                 ],
                 condition_context_rows=[
                     {
@@ -2457,7 +2457,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                         "feed_pressure_units": "psia",
                     }
                 ],
-                metric_mean_by_serial={"HI": 80.0, "ATP1": 75.0},
+                metric_mean_by_serial={"HI": -40.0, "ATP1": -35.0},
             ),
         ]
         program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
@@ -2480,7 +2480,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
-    def test_initial_plot_cohorts_consolidate_pulsed_conditions_within_50_percent(self):
+    def test_initial_plot_cohorts_consolidate_pulsed_conditions_within_100_percent(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         row_specs = [
@@ -3037,7 +3037,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(rows[0]["units"], "psia")
         self.assertEqual(rows[0]["raw_units"], "psi")
 
-    def test_comparison_rows_disambiguate_duplicate_display_parameters(self):
+    def test_comparison_rows_keep_clean_display_labels_and_distinct_internal_keys(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         pair_specs = [
@@ -3101,12 +3101,41 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             )
 
         self.assertEqual(len(rows), 2)
-        self.assertNotEqual(rows[0]["parameter"], rows[1]["parameter"])
-        self.assertIn("Chamber Feed Pressure [feed_pressure_raw]", {str(row["parameter"]) for row in rows})
-        self.assertIn("Chamber Feed Pressure [feed_pressure_cmd_raw]", {str(row["parameter"]) for row in rows})
+        self.assertEqual({str(row["parameter"]) for row in rows}, {"Chamber Feed Pressure"})
+        self.assertEqual({str(row["parameter_key"]) for row in rows}, {"feedpressureraw", "feedpressurecmdraw"})
         grouped = tar._tar_group_comparison_rows_by_serial(rows, serial_order=["SN1"])
         self.assertEqual(len(grouped), 1)
         self.assertEqual(len(grouped[0]["parameter_order"]), 2)
+        self.assertEqual(
+            grouped[0]["parameter_labels"],
+            {
+                "feedpressureraw": "Chamber Feed Pressure",
+                "feedpressurecmdraw": "Chamber Feed Pressure",
+            },
+        )
+        page_spec = {
+            "serial": "SN1",
+            "param_keys": list(grouped[0]["parameter_order"]),
+            "param_names": [grouped[0]["parameter_labels"][key] for key in grouped[0]["parameter_order"]],
+            "parameter_labels": dict(grouped[0]["parameter_labels"]),
+            "param_units": {key: grouped[0]["parameter_units"][key] for key in grouped[0]["parameter_order"]},
+            "blocks": list(grouped[0]["blocks"]),
+        }
+        matrix_rows, _ = tar._tar_build_comparison_page_matrix(page_spec)
+        self.assertEqual(
+            matrix_rows[0][:5],
+            ["Run Condition", "Sequence(s)", "Metric", "Chamber Feed Pressure", "Chamber Feed Pressure"],
+        )
+        metric_rows = {str(row[2]): [str(value) for value in row[3:5]] for row in matrix_rows[2:8]}
+        for metric_label in (
+            "Initial Status",
+            "Graded Mean",
+            "Certified Serial Mean",
+            "Deviation Score",
+            "Official Grade",
+            "Grade Basis",
+        ):
+            self.assertTrue(all(value.strip() for value in metric_rows[metric_label]), metric_label)
 
     def test_metric_series_prefers_aggregate_before_all_sequences(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

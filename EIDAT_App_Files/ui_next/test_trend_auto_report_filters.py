@@ -1048,6 +1048,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[0]["parameter"], "Thrust nominal")
         self.assertNotIn("[", rows[0]["parameter"])
         self.assertEqual(rows[0]["param"], "td_param:thrust_nominal")
+        self.assertEqual(rows[0]["parameter_key"], "tdparamthrustnominal")
         self.assertEqual(rows[0]["raw_parameters"], ["thrust-end", "thrust-normalized"])
 
     def test_build_per_serial_comparison_rows_falls_back_when_no_regrade_override_exists(self) -> None:
