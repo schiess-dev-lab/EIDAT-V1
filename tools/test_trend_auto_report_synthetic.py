@@ -2339,7 +2339,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(sorted(spec["x_name"] for spec in analysis["initial_cohort_specs"]), ["Pulse Number", "Time"])
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
-    def test_initial_plot_cohorts_consolidate_steady_state_conditions_within_100_percent(self):
+    def test_initial_plot_cohorts_consolidate_steady_state_conditions_within_75_percent(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         row_specs = [
@@ -2413,7 +2413,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         )
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
-    def test_initial_plot_cohorts_split_steady_state_conditions_over_100_percent(self):
+    def test_initial_plot_cohorts_split_steady_state_conditions_over_75_percent(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         row_specs = [
@@ -2440,24 +2440,24 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             ),
             self._row_spec(
                 tar,
-                pair_id="pair-ss-neg",
-                run="RunSSNeg",
-                selection_label="125 psia steady",
-                base_condition_label="125 psia steady",
+                pair_id="pair-ss-low",
+                run="RunSSLow",
+                selection_label="40 psia steady",
+                base_condition_label="40 psia steady",
                 suppression_value="15",
                 series=[
-                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[-42.0, -40.0, -38.0]),
-                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[-37.0, -35.0, -33.0]),
+                    tar.CurveSeries(serial="HI", x=[0.0, 1.0, 2.0], y=[38.0, 40.0, 42.0]),
+                    tar.CurveSeries(serial="ATP1", x=[0.0, 1.0, 2.0], y=[33.0, 35.0, 37.0]),
                 ],
                 condition_context_rows=[
                     {
-                        "condition_label": "125 psia steady",
+                        "condition_label": "40 psia steady",
                         "run_type": "SS",
-                        "feed_pressure": 125.0,
+                        "feed_pressure": 40.0,
                         "feed_pressure_units": "psia",
                     }
                 ],
-                metric_mean_by_serial={"HI": -40.0, "ATP1": -35.0},
+                metric_mean_by_serial={"HI": 40.0, "ATP1": 35.0},
             ),
         ]
         program_by_serial = {"HI": "Program A", "ATP1": "Program B"}
@@ -2480,7 +2480,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(len(analysis["initial_cohort_specs"]), 2)
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
-    def test_initial_plot_cohorts_consolidate_pulsed_conditions_within_100_percent(self):
+    def test_initial_plot_cohorts_consolidate_pulsed_conditions_within_75_percent(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
         row_specs = [
@@ -2803,6 +2803,40 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "+2 more conditions",
             ],
         )
+
+    def test_build_highlight_palette_expands_and_deduplicates(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        palette = tar._tar_build_highlight_palette(["#ef4444", "", "#3b82f6", "#ef4444"])
+
+        self.assertEqual(palette[:2], ["#ef4444", "#3b82f6"])
+        self.assertGreaterEqual(len(palette), 14)
+        self.assertEqual(len({str(color).lower() for color in palette}), len(palette))
+
+    def test_highlight_series_style_uses_dotted_lines_after_palette_wrap(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        palette = tar._tar_build_highlight_palette(["#ef4444", "#3b82f6"])
+        first_cycle = tar._tar_highlight_series_style(0, palette, kind="curve")
+        wrapped_cycle = tar._tar_highlight_series_style(len(palette), palette, kind="curve")
+
+        self.assertEqual(first_cycle["linestyle"], "-")
+        self.assertEqual(wrapped_cycle["linestyle"], ":")
+        self.assertEqual(wrapped_cycle["color"], palette[0])
+
+    def test_highlight_series_style_adds_metric_outline_after_palette_wrap(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        palette = tar._tar_build_highlight_palette(["#ef4444", "#3b82f6"])
+        first_cycle = tar._tar_highlight_series_style(0, palette, kind="metric")
+        second_cycle = tar._tar_highlight_series_style(len(palette), palette, kind="metric")
+        third_cycle = tar._tar_highlight_series_style(len(palette) * 2, palette, kind="metric")
+
+        self.assertEqual(first_cycle["edgecolors"], "none")
+        self.assertEqual(first_cycle["linewidths"], 0.0)
+        self.assertEqual(second_cycle["edgecolors"], "#0f172a")
+        self.assertEqual(second_cycle["linewidths"], 0.9)
+        self.assertEqual(third_cycle["edgecolors"], "#ffffff")
 
     def test_build_per_serial_comparison_rows_uses_plot_payload_metrics(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
@@ -3366,6 +3400,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                         "selection_id": selection_id,
                         "run_condition": f"Condition {block_index:02d}",
                         "sequence_text": f"Seq {block_index:02d}",
+                        "selection_member_programs": ["Unknown Program"],
+                        "selection_member_sequences": [f"Seq {block_index:02d}"],
                         "serial": "SN1",
                         "parameter": param_name,
                         "units": units,
@@ -3397,6 +3433,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "selection_id": "sel-sn2",
                     "run_condition": "Condition Z",
                     "sequence_text": "Seq Z",
+                    "selection_member_programs": ["Program Z"],
+                    "selection_member_sequences": ["Seq Z"],
                     "serial": "SN2",
                     "parameter": "Pressure",
                     "units": "psi",
@@ -3421,6 +3459,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "selection_id": "sel-sn2",
                     "run_condition": "Condition Z",
                     "sequence_text": "Seq Z",
+                    "selection_member_programs": ["Program Z"],
+                    "selection_member_sequences": ["Seq Z"],
                     "serial": "SN2",
                     "parameter": "Flow",
                     "units": "kg/s",
@@ -3462,7 +3502,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(matrix_rows[1][:5], ["", "", "", "psi", "kg/s"])
         self.assertEqual(matrix_rows[2][2:5], ["Initial Status", "PASS", "PASS"])
         self.assertIn("Condition 00", matrix_rows[2][0])
-        self.assertIn("Seq 00", matrix_rows[2][1])
+        self.assertEqual(matrix_rows[2][1], "- Seq 00")
+        self.assertNotIn("Unknown Program", matrix_rows[2][1])
         self.assertEqual(matrix_rows[3][:5], ["", "", "Graded Mean", "12", "20"])
         self.assertEqual(matrix_rows[4][:5], ["", "", "Certified Serial Mean", "11", "19"])
         self.assertEqual(matrix_rows[5][:5], ["", "", "Deviation Score", "-1", "-1"])
@@ -3473,6 +3514,85 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertIn(("SPAN", (0, 2), (0, 9)), style_cmds)
         self.assertIn(("SPAN", (1, 2), (1, 9)), style_cmds)
         self.assertIn(("BACKGROUND", (3, 2), (3, 9), "#fef3c7"), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 6), (3, 6), "#fef3c7"), style_cmds)
+        self.assertIn(("BACKGROUND", (4, 6), (4, 6), "#dcfce7"), style_cmds)
+
+    def test_build_comparison_page_matrix_colors_official_grade_cells(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        page_spec = {
+            "serial": "SN1",
+            "param_names": ["Pressure", "Flow", "Temp"],
+            "param_units": {"p": "psi", "f": "kg/s", "t": "C"},
+            "param_keys": ["p", "f", "t"],
+            "blocks": [
+                {
+                    "run_condition": "Condition A",
+                    "sequence_text": "Seq A",
+                    "rows_by_parameter": {
+                        "p": {"parameter": "Pressure", "official_grade": "FAIL"},
+                        "f": {"parameter": "Flow", "official_grade": "WATCH"},
+                        "t": {"parameter": "Temp", "official_grade": "PASS"},
+                    },
+                }
+            ],
+        }
+
+        _rows, style_cmds = tar._tar_build_comparison_page_matrix(page_spec)
+
+        self.assertIn(("BACKGROUND", (3, 6), (3, 6), "#fee2e2"), style_cmds)
+        self.assertIn(("BACKGROUND", (4, 6), (4, 6), "#fef3c7"), style_cmds)
+        self.assertIn(("BACKGROUND", (5, 6), (5, 6), "#dcfce7"), style_cmds)
+
+    def test_plan_comparison_pages_prefers_12_point_when_page_count_ties(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        comparison_rows = [
+            {
+                "selection_id": "sel-1",
+                "run_condition": "Condition A",
+                "sequence_text": "Seq A",
+                "serial": "SN1",
+                "parameter": f"Param {index:02d}",
+                "units": "psi",
+            }
+            for index in range(12)
+        ]
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value={}), mock.patch.object(
+            tar,
+            "_tar_measure_comparison_table_height",
+            return_value=120.0,
+        ):
+            page_specs = tar._tar_plan_comparison_pages({"hi": ["SN1"], "comparison_rows": comparison_rows})
+
+        self.assertEqual(len(page_specs), 1)
+        self.assertEqual(page_specs[0]["font_size"], 12)
+
+    def test_plan_comparison_pages_can_shrink_to_8_point_to_reduce_pages(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        comparison_rows = [
+            {
+                "selection_id": "sel-1",
+                "run_condition": "Condition A",
+                "sequence_text": "Seq A",
+                "serial": "SN1",
+                "parameter": f"Param {index:02d}",
+                "units": "psi",
+            }
+            for index in range(15)
+        ]
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value={}), mock.patch.object(
+            tar,
+            "_tar_measure_comparison_table_height",
+            return_value=120.0,
+        ):
+            page_specs = tar._tar_plan_comparison_pages({"hi": ["SN1"], "comparison_rows": comparison_rows})
+
+        self.assertEqual(len(page_specs), 1)
+        self.assertEqual(page_specs[0]["font_size"], 8)
 
     def test_build_comparison_chart_links_tracks_repeated_metric_and_curve_labels(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar

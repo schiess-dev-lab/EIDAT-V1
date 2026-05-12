@@ -4297,7 +4297,7 @@ def _render_portrait_story_pdf(
         doc_pdf.close()
 
 
-_TAR_COMPARISON_FONT_CHOICES = (9, 8)
+_TAR_COMPARISON_FONT_CHOICES = (12, 11, 10, 9, 8)
 _TAR_COMPARISON_METRIC_ROWS = (
     "Initial Status",
     "Graded Mean",
@@ -4323,13 +4323,29 @@ def _tar_comparison_table_width_budget() -> float:
 
 
 def _tar_comparison_left_col_widths(font_size: int) -> list[float]:
+    if int(font_size) >= 12:
+        return [1.18 * 72.0, 1.02 * 72.0, 1.04 * 72.0]
+    if int(font_size) >= 11:
+        return [1.12 * 72.0, 0.97 * 72.0, 0.99 * 72.0]
+    if int(font_size) >= 10:
+        return [1.07 * 72.0, 0.92 * 72.0, 0.94 * 72.0]
+    if int(font_size) >= 9:
+        return [1.03 * 72.0, 0.88 * 72.0, 0.90 * 72.0]
     if int(font_size) <= 8:
         return [0.98 * 72.0, 0.80 * 72.0, 0.82 * 72.0]
     return [1.03 * 72.0, 0.88 * 72.0, 0.90 * 72.0]
 
 
 def _tar_comparison_param_min_width(font_size: int) -> float:
-    return float((0.84 if int(font_size) <= 8 else 0.92) * 72.0)
+    if int(font_size) >= 12:
+        return float(1.08 * 72.0)
+    if int(font_size) >= 11:
+        return float(1.02 * 72.0)
+    if int(font_size) >= 10:
+        return float(0.97 * 72.0)
+    if int(font_size) >= 9:
+        return float(0.92 * 72.0)
+    return float(0.84 * 72.0)
 
 
 def _tar_comparison_block_key(row: Mapping[str, object]) -> str:
@@ -4543,13 +4559,7 @@ def _tar_grade_basis_text(row: Mapping[str, object] | None) -> str:
             or row.get("grading_basis_status")
         )
     ):
-        status = str(row.get("grading_basis_status") or "").strip().lower()
-        basis = "Selected program pool"
-        if status == "program_only_pool":
-            basis = "Selected certifying-program pool"
-        elif status == "limited_target_excluded_baseline":
-            basis = "Limited selected-pool baseline"
-        lines = [basis]
+        lines = ["Programs Used in Comparison Series"]
         count_text = _tar_comparison_basis_count_text(row)
         if count_text:
             lines.append(count_text)
@@ -4719,6 +4729,17 @@ def _tar_comparison_page_metric_value(
     return ""
 
 
+def _tar_comparison_grade_fill_color(grade: object) -> str:
+    token = _tar_normalize_grade_token(grade)
+    if token == "PASS":
+        return "#dcfce7"
+    if token == "WATCH":
+        return "#fef3c7"
+    if token == "FAIL":
+        return "#fee2e2"
+    return ""
+
+
 def _tar_build_comparison_page_matrix_details(
     page_spec: Mapping[str, object],
 ) -> tuple[list[list[str]], list[tuple], dict[tuple[int, int], dict[str, Any]]]:
@@ -4752,6 +4773,7 @@ def _tar_build_comparison_page_matrix_details(
         start_row = len(rows)
         by_parameter = dict(block.get("rows_by_parameter") or {})
         sample_row = next((dict(value) for value in by_parameter.values() if isinstance(value, Mapping)), {})
+        official_grade_backgrounds: list[tuple] = []
         for metric_index, metric_label in enumerate(_TAR_COMPARISON_METRIC_ROWS):
             matrix_row_index = len(rows)
             row_values = [
@@ -4785,6 +4807,13 @@ def _tar_build_comparison_page_matrix_details(
                             "parameter": str(data_row.get("parameter") or param_name).strip(),
                             "destination_page_index": int(destination_page_index),
                         }
+                if metric_label == "Official Grade" and isinstance(data_row, Mapping):
+                    fill_color = _tar_comparison_grade_fill_color(
+                        data_row.get("official_grade") or data_row.get("final_grade") or data_row.get("grade") or data_row.get("initial_grade")
+                    )
+                    if fill_color:
+                        col_index = 3 + param_offset
+                        official_grade_backgrounds.append(("BACKGROUND", (col_index, matrix_row_index), (col_index, matrix_row_index), fill_color))
             rows.append(row_values)
         style_cmds.extend(
             [
@@ -4800,6 +4829,7 @@ def _tar_build_comparison_page_matrix_details(
             if isinstance(data_row, Mapping) and bool(data_row.get("regrade_applied")):
                 col_index = 3 + param_offset
                 style_cmds.append(("BACKGROUND", (col_index, start_row), (col_index, start_row + len(_TAR_COMPARISON_METRIC_ROWS) - 1), "#fef3c7"))
+        style_cmds.extend(official_grade_backgrounds)
     return rows, style_cmds, link_cells
 
 
@@ -5421,8 +5451,7 @@ def generate_test_data_auto_report(
         z_pass = float(grade_cfg.get("zscore_pass_max") or 2.0)
         z_watch = float(grade_cfg.get("zscore_watch_max") or 3.0)
 
-        colors = hi_cfg.get("colors") or ["#ef4444", "#3b82f6", "#22c55e", "#a855f7", "#f97316"]
-        colors = [str(c) for c in colors if str(c).strip()] or ["#ef4444"]
+        colors = _tar_build_highlight_palette(hi_cfg.get("colors"))
 
         curves_summary: dict[str, dict[str, dict]] = {}
         watch_items: list[dict] = []
@@ -7276,22 +7305,14 @@ def _tar_run_condition_bullet_text(row: Mapping[str, object] | None) -> str:
 def _tar_sequence_bullet_items(row: Mapping[str, object] | None) -> list[str]:
     if not isinstance(row, Mapping):
         return []
-    programs = _tar_unique_text_values(row.get("selection_member_programs") or [])
     sequences = _tar_unique_text_values(row.get("selection_member_sequences") or [])
     if not sequences:
         sequences = _tar_split_display_values(row.get("sequence_text"), separators=",\n")
     if not sequences:
         sequences = _tar_unique_text_values(row.get("selection_member_runs") or [])
-    if programs and sequences:
-        if len(programs) == 1:
-            return [f"{programs[0]} | {sequence}" for sequence in sequences]
-        if len(programs) == len(sequences):
-            return [f"{program} | {sequence}" for program, sequence in zip(programs, sequences)]
-        program_text = " / ".join(programs)
-        return [f"{program_text} | {sequence}" for sequence in sequences]
     if sequences:
         return list(sequences)
-    return list(programs)
+    return []
 
 
 def _tar_sequence_bullet_text(row: Mapping[str, object] | None) -> str:
@@ -8179,6 +8200,73 @@ def _tar_metric_tick_label(ctx: Mapping[str, Any], serial: str) -> str:
 
 _TAR_METRIC_PROGRAM_SEGMENT_PALETTE = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#334155"]
 _TAR_METRIC_GUIDE_COLOR = "#cbd5e1"
+_TAR_HIGHLIGHT_FALLBACK_PALETTE = [
+    "#ef4444",
+    "#3b82f6",
+    "#22c55e",
+    "#a855f7",
+    "#f97316",
+    "#14b8a6",
+    "#eab308",
+    "#ec4899",
+    "#6366f1",
+    "#84cc16",
+    "#0ea5e9",
+    "#f43f5e",
+    "#8b5cf6",
+    "#10b981",
+]
+_TAR_HIGHLIGHT_WRAP_EDGE_COLORS = ["#0f172a", "#ffffff", "#334155"]
+
+
+def _tar_build_highlight_palette(configured_colors: Sequence[object] | None) -> list[str]:
+    palette: list[str] = []
+    seen: set[str] = set()
+    configured = list(configured_colors or [])
+    for raw_color in configured:
+        color = str(raw_color or "").strip()
+        key = color.casefold()
+        if not color or key in seen:
+            continue
+        palette.append(color)
+        seen.add(key)
+    for raw_color in _TAR_HIGHLIGHT_FALLBACK_PALETTE:
+        if len(palette) >= len(_TAR_HIGHLIGHT_FALLBACK_PALETTE):
+            break
+        color = str(raw_color or "").strip()
+        key = color.casefold()
+        if not color or key in seen:
+            continue
+        palette.append(color)
+        seen.add(key)
+    return palette or list(_TAR_HIGHLIGHT_FALLBACK_PALETTE)
+
+
+def _tar_highlight_series_style(
+    index: int,
+    palette: Sequence[object] | None,
+    *,
+    kind: str,
+) -> dict[str, Any]:
+    colors = _tar_build_highlight_palette(palette)
+    safe_index = max(0, int(index))
+    palette_index = safe_index % len(colors)
+    wrap_count = safe_index // len(colors)
+    style: dict[str, Any] = {
+        "color": str(colors[palette_index] or ""),
+        "wrap_count": wrap_count,
+    }
+    if str(kind or "").strip().lower() == "curve":
+        style["linestyle"] = "-" if wrap_count <= 0 else ":"
+        return style
+    edge_cycle = list(_TAR_HIGHLIGHT_WRAP_EDGE_COLORS)
+    if wrap_count <= 0:
+        style["edgecolors"] = "none"
+        style["linewidths"] = 0.0
+        return style
+    style["edgecolors"] = edge_cycle[(wrap_count - 1) % len(edge_cycle)]
+    style["linewidths"] = 0.9
+    return style
 
 
 def _tar_metric_serial_tick_label(serial: object, *, ctx: Mapping[str, Any] | None = None) -> str:
@@ -11689,7 +11777,7 @@ def _tar_analyze_curve_groups(
         grid_points=grid_points,
         degree=degree,
         normalize_x=normalize_x,
-        threshold_pct=100.0,
+        threshold_pct=75.0,
     )
 
     family_groups: dict[tuple[str, str, str], list[dict]] = {}
@@ -12408,8 +12496,7 @@ def _tar_prepare_base(
     rms_pct_thr = _safe_float(watch_cfg.get("rms_pct"))
     z_pass = float(grade_cfg.get("zscore_pass_max") or 2.0)
     z_watch = float(grade_cfg.get("zscore_watch_max") or 3.0)
-    colors = hi_cfg.get("colors") or ["#ef4444", "#3b82f6", "#22c55e", "#a855f7", "#f97316"]
-    colors = [str(color) for color in colors if str(color).strip()] or ["#ef4444"]
+    colors = _tar_build_highlight_palette(hi_cfg.get("colors"))
     try:
         filter_rows = be.td_read_observation_filter_rows_from_cache(db_path)
     except Exception:
@@ -13054,7 +13141,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(
         _portrait_box_table(
             _tar_exec_exception_table_rows(ctx, exception_rows),
-            col_widths=[0.52 * inch, 1.10 * inch, 1.00 * inch, 0.62 * inch, 1.08 * inch, 0.54 * inch, 0.50 * inch, 0.48 * inch, 0.60 * inch],
+            col_widths=[0.56 * inch, 1.18 * inch, 1.07 * inch, 0.66 * inch, 1.16 * inch, 0.58 * inch, 0.54 * inch, 0.51 * inch, 0.64 * inch],
             styles=styles,
             rl=rl,
             repeat_rows=1,
@@ -13212,11 +13299,12 @@ def _tar_render_metric_cohort_page(
     serials = list(ctx.get("all_serials") or [])
     serial_index = {serial: idx for idx, serial in enumerate(serials)}
     x_idx = list(range(len(serials)))
-    colors = list(ctx.get("colors") or ["#ef4444"])
+    palette = _tar_build_highlight_palette(ctx.get("colors"))
     pair_by_id = ctx.get("pair_by_id") or {}
+    hi_set = {str(serial or "").strip() for serial in (ctx.get("hi") or []) if str(serial or "").strip()}
 
     family_values: list[float] = []
-    plotted: list[tuple[dict, list[tuple[float, float, str]], str]] = []
+    plotted: list[tuple[dict, list[tuple[float, float, str]], dict[str, Any]]] = []
     for member_index, pair_id in enumerate(cohort_spec.get("member_pair_ids") or []):
         pair_spec = pair_by_id.get(str(pair_id or "").strip()) or {}
         if not pair_spec:
@@ -13264,9 +13352,9 @@ def _tar_render_metric_cohort_page(
         finite_vals = [float(value) for _x, value, _serial in points]
         if not finite_vals:
             continue
-        color = colors[member_index % len(colors)]
+        style = _tar_highlight_series_style(member_index, palette, kind="metric")
         family_values.extend(finite_vals)
-        plotted.append((pair_spec, points, color))
+        plotted.append((pair_spec, points, style))
 
     if not plotted:
         plt.close(fig)
@@ -13274,7 +13362,7 @@ def _tar_render_metric_cohort_page(
 
     _tar_set_plot_parameter_title(ax, f"{param_name} ({metric_stat})")
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
-    for pair_spec, points, color in plotted:
+    for pair_spec, points, style in plotted:
         label = _tar_metric_pair_legend_label(
             pair_spec,
             param_name=param_name,
@@ -13283,15 +13371,24 @@ def _tar_render_metric_cohort_page(
         if points:
             xs = [point[0] for point in points]
             ys = [point[1] for point in points]
-            ax.scatter(xs, ys, s=22, alpha=0.62, color=color, label=label, zorder=2.0)
-        hi_set = {str(serial or "").strip() for serial in (ctx.get("hi") or []) if str(serial or "").strip()}
+            ax.scatter(
+                xs,
+                ys,
+                s=22,
+                alpha=0.62,
+                color=str(style.get("color") or "#2563eb"),
+                edgecolors=str(style.get("edgecolors") or "none"),
+                linewidths=float(style.get("linewidths") or 0.0),
+                label=label,
+                zorder=2.0,
+            )
         hi_points = [(x_val, y_val) for x_val, y_val, serial in points if serial in hi_set]
         if hi_points:
             ax.scatter(
                 [point[0] for point in hi_points],
                 [point[1] for point in hi_points],
                 s=62,
-                color=color,
+                color=str(style.get("color") or "#2563eb"),
                 marker="x",
                 linewidths=1.8,
                 zorder=5.0,
@@ -13405,7 +13502,7 @@ def _tar_render_curve_cohort_page(
         note_lines.append(f"RMSE: {_fmt_num(((cohort_spec.get('model') or {}).get('poly') or {}).get('rmse'), sig=5)}")
         note_lines.append("")
 
-    colors = list(ctx.get("colors") or ["#ef4444"])
+    palette = _tar_build_highlight_palette(ctx.get("colors"))
     finding_by_pair_serial = ctx.get("finding_by_pair_serial") or {}
     highlighted_trace_index = 0
     for trace in trace_curves:
@@ -13418,12 +13515,19 @@ def _tar_render_curve_cohort_page(
         pair_id = str(trace.get("pair_id") or "").strip()
         selection_label = str(trace.get("selection_label") or "").strip()
         grade = str(grade_map_by_pair_serial.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-        default_color = colors[highlighted_trace_index % len(colors)]
+        style = _tar_highlight_series_style(highlighted_trace_index, palette, kind="curve")
         highlighted_trace_index += 1
-        color = default_color if grade not in {"WATCH", "FAIL"} else _tar_grade_color(grade, default=default_color)
+        color = str(style.get("color") or "#2563eb")
         serial_label = _tar_display_serial(ctx, serial) or serial
         label = f"{serial_label} | {selection_label} ({grade})" if selection_label else f"{serial_label} ({grade})"
-        ax.plot(x_grid, y_curve, linewidth=1.8, color=color, label=label)
+        ax.plot(
+            x_grid,
+            y_curve,
+            linewidth=1.8,
+            linestyle=str(style.get("linestyle") or "-"),
+            color=color,
+            label=label,
+        )
         finding = finding_by_pair_serial.get((pair_id, serial)) or {}
         note_lines.append(
             f"{serial_label} | {selection_label or param_name} | {grade} | "
@@ -13526,16 +13630,24 @@ def _tar_render_watch_curve_page(
         ax.fill_between(x_grid, band_lo, band_hi, color="#fed7aa", alpha=0.18, label="Family +/-1 sigma")
     except Exception:
         pass
-    colors = list(ctx.get("colors") or ["#ef4444"])
+    palette = _tar_build_highlight_palette(ctx.get("colors"))
     note_lines: list[str] = []
     for idx, serial in enumerate(focus_serials):
         y_curve = y_resampled_by_sn.get(serial)
         if not y_curve:
             continue
         grade = str(final_grade_map.get((pair_id, serial), "NO_DATA") or "NO_DATA").strip().upper() or "NO_DATA"
-        color = _tar_grade_color(grade, default=colors[idx % len(colors)])
+        style = _tar_highlight_series_style(idx, palette, kind="curve")
+        color = str(style.get("color") or "#2563eb")
         serial_label = _tar_display_serial(ctx, serial) or serial
-        ax.plot(x_grid, y_curve, linewidth=1.9, color=color, label=f"{serial_label} ({grade})")
+        ax.plot(
+            x_grid,
+            y_curve,
+            linewidth=1.9,
+            linestyle=str(style.get("linestyle") or "-"),
+            color=color,
+            label=f"{serial_label} ({grade})",
+        )
         finding = finding_by_pair_serial.get((pair_id, serial)) or {}
         note_lines.append(f"{serial_label} ({grade})")
         note_lines.append(f"Max %: {_fmt_num(finding.get('final_max_pct'))}")

@@ -617,9 +617,23 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             }
         )
 
-        self.assertEqual(text, "Selected program pool\nPrograms used: 1 | Comparison series: 2")
+        self.assertEqual(text, "Programs Used in Comparison Series\nPrograms used: 1 | Comparison series: 2")
         self.assertNotIn("Program A", text)
         self.assertNotIn("Program B", text)
+
+    def test_sequence_bullet_text_uses_only_sequence_nomenclature(self) -> None:
+        text = tar._tar_sequence_bullet_text(
+            {
+                "selection_member_programs": ["Unknown Program", "Program A"],
+                "selection_member_sequences": ["Seq 1", "Seq 2"],
+                "selection_member_runs": ["Run 1", "Run 2"],
+                "sequence_text": "Fallback Seq",
+            }
+        )
+
+        self.assertEqual(text, "- Seq 1\n- Seq 2")
+        self.assertNotIn("Unknown Program", text)
+        self.assertNotIn("Program A", text)
 
     def test_prepare_row_specs_resolves_singleton_suppression_for_blank_rows(self) -> None:
         specs = self._prepare_row_specs_for_condition_rows(
@@ -2344,6 +2358,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for idx, item in enumerate(story)
             if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Run Condition"
         )
+        exception_table = story[exception_table_idx]
         self.assertFalse(any(isinstance(item, _FakePageBreak) for item in story))
         self.assertFalse(
             any(
@@ -2355,6 +2370,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertLess(grading_idx, serial_table_idx)
         self.assertLess(serial_table_idx, exception_table_idx)
         self.assertLess(exec_idx, scope_idx)
+        self.assertIsInstance(exception_table, _FakeTable)
+        self.assertAlmostEqual(sum(exception_table.colWidths or []), 6.9 * 72.0)
 
         self.assertFalse(
             any(
