@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 from pathlib import Path
 from typing import Any, Callable
@@ -62,7 +63,106 @@ def read_files(node_root: str | Path | None = None) -> list[dict[str, Any]]:
 
 def list_projects(node_root: str | Path | None = None) -> list[dict[str, Any]]:
     be = _be(node_root)
-    return list(be.list_eidat_projects(global_repo(node_root)) or [])
+    repo = global_repo(node_root)
+    out: list[dict[str, Any]] = []
+    for raw in list(be.list_eidat_projects(repo) or []):
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        project_dir = _resolve_node_project_dir(repo, item.get("project_dir"))
+        workbook = _resolve_node_project_workbook(repo, item.get("workbook"), project_dir=project_dir)
+        item["project_dir"] = str(project_dir)
+        item["workbook"] = str(workbook)
+        out.append(item)
+    return out
+
+
+def _node_projects_root(node_root: str | Path | None) -> Path:
+    be = _be(node_root)
+    return Path(be.eidat_projects_root(global_repo(node_root))).expanduser()
+
+
+def _try_relative_to(path: Path, root: Path) -> Path | None:
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except Exception:
+        return None
+
+
+def _project_suffix_under_projects(path: Path) -> Path | None:
+    parts = list(path.parts)
+    for idx, part in enumerate(parts):
+        if str(part).strip().casefold() == "projects" and idx + 1 < len(parts):
+            return Path(*parts[idx + 1 :])
+    return None
+
+
+def _resolve_node_project_dir(node_root: str | Path | None, project_dir: object) -> Path:
+    repo = global_repo(node_root)
+    projects_root = _node_projects_root(repo)
+    text = str(project_dir or "").strip()
+    if not text:
+        return projects_root
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        return (repo / candidate).expanduser()
+    if _try_relative_to(candidate, repo) is not None:
+        return candidate
+    suffix = _project_suffix_under_projects(candidate)
+    if suffix is not None:
+        return projects_root / suffix
+    return projects_root / candidate.name
+
+
+def _resolve_node_project_workbook(
+    node_root: str | Path | None,
+    workbook_path: object,
+    *,
+    project_dir: Path | None = None,
+) -> Path:
+    repo = global_repo(node_root)
+    projects_root = _node_projects_root(repo)
+    proj_dir = Path(project_dir).expanduser() if project_dir is not None else projects_root
+    text = str(workbook_path or "").strip()
+    if not text:
+        return proj_dir
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        return (repo / candidate).expanduser()
+    if _try_relative_to(candidate, repo) is not None:
+        return candidate
+    suffix = _project_suffix_under_projects(candidate)
+    if suffix is not None:
+        return projects_root / suffix
+    return proj_dir / candidate.name
+
+
+def _rewrite_project_meta_for_node(project_dir: Path, *, node_root: Path, workbook_path: Path) -> None:
+    meta_path = Path(project_dir).expanduser() / "project.json"
+    if not meta_path.exists():
+        return
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    payload = dict(raw)
+    changed = False
+    desired_repo = str(Path(node_root).expanduser())
+    desired_project_dir = str(Path(project_dir).expanduser())
+    desired_workbook = str(Path(workbook_path).expanduser())
+    if str(payload.get("global_repo") or "").strip() != desired_repo:
+        payload["global_repo"] = desired_repo
+        changed = True
+    if str(payload.get("project_dir") or "").strip() != desired_project_dir:
+        payload["project_dir"] = desired_project_dir
+        changed = True
+    if str(payload.get("workbook") or "").strip() != desired_workbook:
+        payload["workbook"] = desired_workbook
+        changed = True
+    if changed:
+        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def update_project(
@@ -76,7 +176,9 @@ def update_project(
 ) -> dict[str, Any]:
     be = _be(node_root)
     repo = global_repo(node_root)
-    wb = Path(workbook_path).expanduser()
+    project_dir = _resolve_node_project_dir(repo, Path(workbook_path).expanduser().parent)
+    wb = _resolve_node_project_workbook(repo, workbook_path, project_dir=project_dir)
+    _rewrite_project_meta_for_node(project_dir, node_root=repo, workbook_path=wb)
     if project_type == getattr(be, "EIDAT_PROJECT_TYPE_TRENDING", "EIDP Trending"):
         return dict(be.update_eidp_trending_project_workbook(repo, wb, overwrite=overwrite) or {})
     if project_type == getattr(be, "EIDAT_PROJECT_TYPE_RAW_TRENDING", "EIDP Raw File Trending"):

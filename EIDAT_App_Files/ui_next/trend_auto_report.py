@@ -1206,6 +1206,23 @@ def _tar_metric_source_candidates(be: Any, selection: Mapping[str, object] | Non
     return out or [aggregate_source]
 
 
+def _tar_rows_explicitly_match_run_type_mode(
+    rows: Sequence[Mapping[str, object]] | None,
+    run_type_mode: str,
+) -> bool:
+    normalized = str(run_type_mode or "").strip().lower()
+    if normalized not in {"steady_state", "pulsed_mode"}:
+        return True
+    explicit_modes = [
+        mode
+        for mode in (_row_run_type_mode(row) for row in (rows or []))
+        if mode
+    ]
+    if not explicit_modes:
+        return False
+    return all(_row_matches_selection_run_type_mode(normalized, mode) for mode in explicit_modes)
+
+
 def _tar_call_metric_series(
     be: Any,
     db_path: Path,
@@ -1261,6 +1278,7 @@ def _load_metric_series_for_selection(
     raw_names: Sequence[object] | None = None,
 ) -> list[dict]:
     program_title, source_run_name = _selection_observation_filters(selection)
+    selection_run_type_mode = _selection_single_run_type_mode(selection)
     run_names = _selection_member_runs(selection, fallback_run=run_name)
     if not run_names and str(run_name or "").strip():
         run_names = [str(run_name or "").strip()]
@@ -1286,6 +1304,7 @@ def _load_metric_series_for_selection(
         if control_period_filter not in (None, "")
         else _tar_single_control_period_filter_value(filter_state)
     )
+    aggregate_source_key = str(_tar_metric_source_aggregate(be) or "").strip().casefold()
 
     for metric_source in _tar_metric_source_candidates(be, selection):
         rows: list[dict] = []
@@ -1302,7 +1321,7 @@ def _load_metric_series_for_selection(
                         program_title=program_title,
                         source_run_name=source_run_name,
                         control_period_filter=loader_control_period_filter,
-                        run_type_filter="",
+                        run_type_filter=selection_run_type_mode,
                         metric_source=metric_source,
                     ),
                     selection=selection,
@@ -1333,7 +1352,12 @@ def _load_metric_series_for_selection(
                         continue
                     seen_keys.add(row_key)
                     rows.append(tagged)
-        if rows:
+        metric_source_key = str(metric_source or "").strip().casefold()
+        if rows and (
+            not selection_run_type_mode
+            or metric_source_key != aggregate_source_key
+            or _tar_rows_explicitly_match_run_type_mode(rows, selection_run_type_mode)
+        ):
             return rows
     return []
 
@@ -1496,6 +1520,7 @@ def _load_curves_for_selection(
     raw_names: Sequence[object] | None = None,
 ) -> list[CurveSeries]:
     program_title, source_run_name = _selection_observation_filters(selection)
+    selection_run_type_mode = _selection_single_run_type_mode(selection)
     run_names = _selection_member_runs(selection, fallback_run=run_name)
     if not run_names and str(run_name or "").strip():
         run_names = [str(run_name or "").strip()]
@@ -1531,6 +1556,7 @@ def _load_curves_for_selection(
                     program_title=(program_title or None),
                     source_run_name=(source_run_name or None),
                     control_period_filter=loader_control_period_filter,
+                    run_type_filter=(selection_run_type_mode or None),
                 )
             except Exception:
                 loaded = []
@@ -6823,7 +6849,8 @@ def _tar_condition_label_is_pulse(label: object) -> bool:
 def _tar_plot_condition_mode_label(row: Mapping[str, object] | None) -> str:
     if not isinstance(row, Mapping):
         return ""
-    raw = _norm_key(str(row.get("run_type") or ""))
+    raw_value = str(row.get("run_type") or row.get("run_type_mode") or "")
+    raw = _norm_key(raw_value)
     on_time = _safe_float(row.get("pulse_width_on", row.get("pulse_width")))
     off_time = _safe_float(row.get("off_time"))
     control_period = _safe_float(row.get("control_period"))
@@ -6838,7 +6865,7 @@ def _tar_plot_condition_mode_label(row: Mapping[str, object] | None) -> str:
     if raw in {"ss", "steadystate", "steady"}:
         return "Steady State Condition"
     if raw:
-        return str(row.get("run_type") or "").strip()
+        return raw_value.strip()
     return ""
 
 
@@ -10932,6 +10959,12 @@ def _tar_prepare_row_specs(
         y_cols = _tar_curve_y_columns_for_run(be, db_path, conn, run_name, x_name)
         y_by_norm = {_norm_key(str(col.get("name") or "")): dict(col) for col in y_cols if str(col.get("name") or "").strip()}
         selection_fields = _selection_display_fields(selection, run_by_name)
+        selection_run_type_mode = _selection_single_run_type_mode(selection)
+        selection_run_type_text = str(selection.get("run_type") or "").strip()
+        if not selection_run_type_text and selection_run_type_mode == "steady_state":
+            selection_run_type_text = "steady state"
+        elif not selection_run_type_text and selection_run_type_mode == "pulsed_mode":
+            selection_run_type_text = "pulsed mode"
         selection_filter_rows = _tar_selection_matching_rows(selection, filter_rows, filter_state=filter_state)
         voltage_defaults = _tar_condition_voltage_defaults_from_rows(selection_filter_rows)
         suppression_default = str(voltage_defaults.get("suppression_voltage_label") or "").strip()
@@ -11024,7 +11057,12 @@ def _tar_prepare_row_specs(
                     "source_run_name": str(row.get("source_run_name") or "").strip(),
                     "condition_label": condition_label,
                     "condition_display": str(row.get("condition_display") or run_meta.get("condition_display") or base_condition_label).strip(),
-                    "run_type": str(row.get("run_type") or run_meta.get("run_type") or "").strip(),
+                    "run_type": str(row.get("run_type") or run_meta.get("run_type") or selection_run_type_text).strip(),
+                    "run_type_mode": (
+                        _row_run_type_mode(row)
+                        or _td_normalize_run_type_mode(run_meta.get("run_type_mode") or run_meta.get("run_type"))
+                        or selection_run_type_mode
+                    ),
                     "feed_pressure": row.get("feed_pressure", run_meta.get("feed_pressure")),
                     "feed_pressure_units": str(row.get("feed_pressure_units") or run_meta.get("feed_pressure_units") or "").strip(),
                     "pulse_width": row.get("pulse_width_on", row.get("pulse_width", run_meta.get("pulse_width_on", run_meta.get("pulse_width")))),
@@ -11037,7 +11075,7 @@ def _tar_prepare_row_specs(
                     "valve_voltage": resolved_valve or row.get("valve_voltage"),
                 }
                 context_key = (
-                    _norm_key(context_row.get("run_type") or ""),
+                    _row_run_type_mode(context_row) or _norm_key(context_row.get("run_type") or ""),
                     _td_feed_pressure_filter_value(context_row),
                     str(context_row.get("feed_pressure_units") or "").strip().casefold(),
                     _td_compact_filter_value(context_row.get("pulse_width_on")),
@@ -11133,7 +11171,11 @@ def _tar_prepare_row_specs(
                     "source_run_name": run_name,
                     "condition_label": condition_label,
                     "condition_display": str(run_meta.get("condition_display") or base_condition_label).strip(),
-                    "run_type": str(run_meta.get("run_type") or "").strip(),
+                    "run_type": str(run_meta.get("run_type") or selection_run_type_text).strip(),
+                    "run_type_mode": (
+                        _td_normalize_run_type_mode(run_meta.get("run_type_mode") or run_meta.get("run_type"))
+                        or selection_run_type_mode
+                    ),
                     "feed_pressure": run_meta.get("feed_pressure"),
                     "feed_pressure_units": str(run_meta.get("feed_pressure_units") or "").strip(),
                     "pulse_width": run_meta.get("pulse_width_on", run_meta.get("pulse_width")),
@@ -11147,7 +11189,7 @@ def _tar_prepare_row_specs(
                 }
                 if any(
                     [
-                        str(fallback_context_row.get("run_type") or "").strip(),
+                        str(fallback_context_row.get("run_type") or fallback_context_row.get("run_type_mode") or "").strip(),
                         _td_feed_pressure_filter_value(fallback_context_row),
                         _td_compact_filter_value(fallback_context_row.get("pulse_width_on")),
                         _td_compact_filter_value(fallback_context_row.get("off_time")),

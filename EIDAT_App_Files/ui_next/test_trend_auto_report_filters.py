@@ -314,6 +314,223 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         finally:
             conn.close()
 
+    def _prepare_specs_for_run_type_mode_regression(
+        self,
+        selections: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        run_by_name = {"Run A": {"display_name": "Run A", "default_x": "Time"}}
+        filter_rows = [
+            {
+                "observation_id": "obs-ss",
+                "serial": "SN-SS",
+                "run_name": "Run A",
+                "program_title": "Program A",
+                "source_run_name": "Seq SS",
+                "run_type": "steady state",
+                "feed_pressure": 275.0,
+                "feed_pressure_units": "psia",
+                "suppression_voltage": 5.0,
+                "valve_voltage": 28.0,
+            },
+            {
+                "observation_id": "obs-pm",
+                "serial": "SN-PM",
+                "run_name": "Run A",
+                "program_title": "Program A",
+                "source_run_name": "Seq PM",
+                "run_type": "pulsed mode",
+                "control_period": 10.0,
+                "pulse_width_on": 2.0,
+                "off_time": 8.0,
+                "pulse_width_units": "ms",
+                "off_time_units": "ms",
+                "feed_pressure": 320.0,
+                "feed_pressure_units": "psia",
+                "suppression_voltage": 5.0,
+                "valve_voltage": 28.0,
+            },
+        ]
+        steady_selection = {
+            "id": "condition:ss",
+            "mode": "condition",
+            "run_name": "Run A",
+            "member_runs": ["Run A"],
+            "member_sequences": ["Seq SS"],
+            "member_programs": ["Program A"],
+            "display_text": "Steady State Condition",
+            "run_condition": "Steady State Condition",
+            "member_run_type_modes": ["steady_state"],
+            "run_type_mode": "steady_state",
+        }
+        pulsed_selection = {
+            "id": "condition:pm",
+            "mode": "condition",
+            "run_name": "Run A",
+            "member_runs": ["Run A"],
+            "member_sequences": ["Seq PM"],
+            "member_programs": ["Program A"],
+            "display_text": "Pulse Mode Condition",
+            "run_condition": "Pulse Mode Condition",
+            "member_run_type_modes": ["pulsed_mode"],
+            "run_type_mode": "pulsed_mode",
+            "member_control_periods": ["10"],
+        }
+        selected = [dict(item) for item in (selections or [steady_selection, pulsed_selection])]
+        metric_calls: list[dict[str, object]] = []
+        curve_calls: list[dict[str, object]] = []
+
+        def _metric_rows_for_mode(mode: str) -> list[dict[str, object]]:
+            rows: list[dict[str, object]] = []
+            if mode in {"", "steady_state"}:
+                rows.append(
+                    {
+                        "observation_id": "obs-ss",
+                        "serial": "SN-SS",
+                        "value_num": 11.0,
+                        "program_title": "Program A",
+                        "source_run_name": "Seq SS",
+                        "run_type": "steady state",
+                    }
+                )
+            if mode in {"", "pulsed_mode"}:
+                rows.append(
+                    {
+                        "observation_id": "obs-pm",
+                        "serial": "SN-PM",
+                        "value_num": 29.5,
+                        "program_title": "Program A",
+                        "source_run_name": "Seq PM",
+                        "run_type": "pulsed mode",
+                        "control_period": 10.0,
+                    }
+                )
+            return rows
+
+        def _curve_rows_for_mode(mode: str) -> list[dict[str, object]]:
+            rows: list[dict[str, object]] = []
+            if mode in {"", "steady_state"}:
+                rows.append(
+                    {
+                        "observation_id": "obs-ss",
+                        "serial": "SN-SS",
+                        "x": [0.0, 1.0, 2.0],
+                        "y": [10.0, 11.0, 12.0],
+                        "program_title": "Program A",
+                        "source_run_name": "Seq SS",
+                        "run_type": "steady state",
+                    }
+                )
+            if mode in {"", "pulsed_mode"}:
+                rows.append(
+                    {
+                        "observation_id": "obs-pm",
+                        "serial": "SN-PM",
+                        "x": [0.0, 1.0, 2.0],
+                        "y": [20.0, 21.0, 22.0],
+                        "program_title": "Program A",
+                        "source_run_name": "Seq PM",
+                        "run_type": "pulsed mode",
+                    }
+                )
+            return rows
+
+        def _td_load_metric_series(
+            _db_path: Path,
+            _run_name: str,
+            _column_name: str,
+            _stat: str,
+            **kwargs: object,
+        ) -> list[dict[str, object]]:
+            metric_source = str(kwargs.get("metric_source") or "")
+            run_type_filter = str(kwargs.get("run_type_filter") or "")
+            metric_calls.append(
+                {
+                    "metric_source": metric_source,
+                    "run_type_filter": run_type_filter,
+                    "source_run_name": str(kwargs.get("source_run_name") or ""),
+                }
+            )
+            if metric_source == "aggregate":
+                if run_type_filter == "pulsed_mode":
+                    return []
+                return [
+                    {
+                        "observation_id": "agg-ss",
+                        "serial": "SN-SS",
+                        "value_num": 11.5,
+                        "program_title": "Program A",
+                        "source_run_name": "",
+                        "run_type": "",
+                    }
+                ]
+            return _metric_rows_for_mode(run_type_filter)
+
+        def _td_load_curves(
+            _db_path: Path,
+            _run_name: str,
+            _column_name: str,
+            _x_name: str,
+            **kwargs: object,
+        ) -> list[dict[str, object]]:
+            run_type_filter = str(kwargs.get("run_type_filter") or "")
+            curve_calls.append(
+                {
+                    "run_type_filter": run_type_filter,
+                    "source_run_name": str(kwargs.get("source_run_name") or ""),
+                }
+            )
+            if run_type_filter:
+                return _curve_rows_for_mode(run_type_filter)
+            return [
+                {
+                    "observation_id": "agg-curve-ss",
+                    "serial": "SN-SS",
+                    "x": [0.0, 1.0, 2.0],
+                    "y": [10.0, 11.0, 12.0],
+                    "program_title": "Program A",
+                    "source_run_name": "",
+                    "run_type": "",
+                }
+            ]
+
+        fake_be = SimpleNamespace(
+            TD_METRIC_PLOT_SOURCE_AGGREGATE="aggregate",
+            TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES="all_sequences",
+            td_load_metric_series=_td_load_metric_series,
+            td_load_curves=_td_load_curves,
+        )
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            with mock.patch.object(tar, "_resolve_curve_x_key", return_value="Time"), mock.patch.object(
+                tar,
+                "_tar_curve_y_columns_for_run",
+                return_value=[{"name": "Pressure", "units": "psi"}],
+            ):
+                specs = tar._tar_prepare_row_specs(
+                    be=fake_be,
+                    db_path=Path("fake.sqlite3"),
+                    conn=conn,
+                    run_by_name=run_by_name,
+                    selections=selected,
+                    params=["Pressure"],
+                    filter_rows=[dict(row) for row in filter_rows],
+                    filter_state={},
+                    parameter_context={},
+                )
+        finally:
+            conn.close()
+
+        return {
+            "specs": specs,
+            "selections": selected,
+            "filter_rows": filter_rows,
+            "run_by_name": run_by_name,
+            "fake_be": fake_be,
+            "metric_calls": metric_calls,
+            "curve_calls": curve_calls,
+        }
+
     def test_filter_rows_respects_explicit_empty_filter_lists(self) -> None:
         rows = [
             {
@@ -806,6 +1023,44 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(metric_map, {"SN-CERT": 10.0, "SN-COMP": 12.5})
 
+    def test_load_metric_map_for_selection_falls_back_to_sequence_rows_for_pulsed_mode(self) -> None:
+        fixture = self._prepare_specs_for_run_type_mode_regression(
+            selections=[
+                {
+                    "id": "condition:pm",
+                    "mode": "condition",
+                    "run_name": "Run A",
+                    "member_runs": ["Run A"],
+                    "member_sequences": ["Seq PM"],
+                    "member_programs": ["Program A"],
+                    "display_text": "Pulse Mode Condition",
+                    "run_condition": "Pulse Mode Condition",
+                    "member_run_type_modes": ["pulsed_mode"],
+                    "run_type_mode": "pulsed_mode",
+                }
+            ]
+        )
+        fake_be = fixture["fake_be"]
+        metric_calls = fixture["metric_calls"]
+        metric_calls.clear()
+
+        metric_map = tar._load_metric_map_for_selection(
+            fake_be,
+            Path("fake.sqlite3"),
+            "Run A",
+            "Pressure",
+            "mean",
+            selection=dict((fixture["selections"] or [])[0]),
+            filter_state={},
+            parameter_context={},
+        )
+
+        self.assertEqual(metric_map, {"SN-PM": 29.5})
+        self.assertEqual(
+            [(call["metric_source"], call["run_type_filter"]) for call in metric_calls],
+            [("aggregate", "pulsed_mode"), ("all_sequences", "pulsed_mode")],
+        )
+
     def test_load_curves_for_selection_unions_mapped_raw_names(self) -> None:
         fake_be = SimpleNamespace(
             td_parameter_selection_raw_names=lambda _ctx, _value, **_kwargs: ["thrust-end", "thrust-normalized"],
@@ -851,6 +1106,112 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         )
 
         self.assertEqual([curve.serial for curve in series], ["SN-CERT", "SN-COMP"])
+
+    def test_loaders_do_not_force_run_type_filter_for_mixed_mode_selection(self) -> None:
+        metric_calls: list[str] = []
+        curve_calls: list[str] = []
+
+        def _td_load_metric_series(
+            _db_path: Path,
+            _run_name: str,
+            _column_name: str,
+            _stat: str,
+            **kwargs: object,
+        ) -> list[dict[str, object]]:
+            metric_calls.append(str(kwargs.get("run_type_filter") or ""))
+            return [
+                {
+                    "observation_id": "obs-ss",
+                    "serial": "SN-SS",
+                    "value_num": 11.0,
+                    "program_title": "Program A",
+                    "source_run_name": "Seq SS",
+                    "run_type": "steady state",
+                },
+                {
+                    "observation_id": "obs-pm",
+                    "serial": "SN-PM",
+                    "value_num": 29.5,
+                    "program_title": "Program A",
+                    "source_run_name": "Seq PM",
+                    "run_type": "pulsed mode",
+                },
+            ]
+
+        def _td_load_curves(
+            _db_path: Path,
+            _run_name: str,
+            _column_name: str,
+            _x_name: str,
+            **kwargs: object,
+        ) -> list[dict[str, object]]:
+            curve_calls.append(str(kwargs.get("run_type_filter") or ""))
+            return [
+                {
+                    "observation_id": "obs-ss",
+                    "serial": "SN-SS",
+                    "x": [0.0, 1.0],
+                    "y": [10.0, 11.0],
+                    "program_title": "Program A",
+                    "source_run_name": "Seq SS",
+                    "run_type": "steady state",
+                },
+                {
+                    "observation_id": "obs-pm",
+                    "serial": "SN-PM",
+                    "x": [0.0, 1.0],
+                    "y": [20.0, 21.0],
+                    "program_title": "Program A",
+                    "source_run_name": "Seq PM",
+                    "run_type": "pulsed mode",
+                },
+            ]
+
+        selection = {
+            "id": "condition:mixed",
+            "mode": "condition",
+            "run_name": "Run A",
+            "member_runs": ["Run A"],
+            "member_sequences": ["Seq SS", "Seq PM"],
+            "member_programs": ["Program A"],
+            "display_text": "Combined Conditions",
+            "run_condition": "Combined Conditions",
+            "member_run_type_modes": ["steady_state", "pulsed_mode"],
+        }
+        fake_be = SimpleNamespace(
+            TD_METRIC_PLOT_SOURCE_AGGREGATE="aggregate",
+            TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES="all_sequences",
+            td_load_metric_series=_td_load_metric_series,
+            td_load_curves=_td_load_curves,
+        )
+
+        metric_map = tar._load_metric_map_for_selection(
+            fake_be,
+            Path("fake.sqlite3"),
+            "Run A",
+            "Pressure",
+            "mean",
+            selection=selection,
+            filter_state={},
+            parameter_context={},
+        )
+        series = tar._load_curves_for_selection(
+            fake_be,
+            Path("fake.sqlite3"),
+            "Run A",
+            "Pressure",
+            "Time",
+            selection=selection,
+            filter_state={},
+            parameter_context={},
+        )
+
+        self.assertEqual(metric_map, {"SN-SS": 11.0, "SN-PM": 29.5})
+        self.assertEqual([curve.serial for curve in series], ["SN-SS", "SN-PM"])
+        self.assertTrue(metric_calls)
+        self.assertTrue(curve_calls)
+        self.assertTrue(all(not value for value in metric_calls))
+        self.assertTrue(all(not value for value in curve_calls))
 
     def test_prepare_row_specs_builds_single_normalized_parameter_spec(self) -> None:
         selection = {
@@ -909,6 +1270,163 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(specs[0]["param"], "td_param:thrust_nominal")
         self.assertEqual(specs[0]["param_display"], "Thrust nominal")
         self.assertEqual(specs[0]["raw_params"], ["thrust-end", "thrust-normalized"])
+
+    def test_pulsed_selection_survives_into_comparison_rows_and_plot_specs(self) -> None:
+        fixture = self._prepare_specs_for_run_type_mode_regression(
+            selections=[
+                {
+                    "id": "condition:pm",
+                    "mode": "condition",
+                    "run_name": "Run A",
+                    "member_runs": ["Run A"],
+                    "member_sequences": ["Seq PM"],
+                    "member_programs": ["Program A"],
+                    "display_text": "Pulse Mode Condition",
+                    "run_condition": "Pulse Mode Condition",
+                    "member_run_type_modes": ["pulsed_mode"],
+                    "run_type_mode": "pulsed_mode",
+                    "member_control_periods": ["10"],
+                }
+            ]
+        )
+        specs = fixture["specs"] or []
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["selection_id"], "condition:pm")
+        self.assertEqual([curve.serial for curve in specs[0]["series"]], ["SN-PM"])
+        self.assertEqual(specs[0]["metric_mean_by_serial"], {"SN-PM": 29.5})
+        self.assertEqual([str(row.get("run_type") or "") for row in specs[0]["condition_context_rows"]], ["pulsed mode"])
+
+        analysis = tar._tar_analyze_curve_groups(
+            specs,
+            hi=["SN-PM"],
+            program_by_serial={"SN-PM": "Program A"},
+            certifying_program="Program A",
+            prepass_cfg={"enabled": False},
+            grid_points=5,
+            degree=2,
+            normalize_x=True,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+        ctx = {
+            "filter_state": {},
+            "be": fixture["fake_be"],
+            "db_path": Path("fake.sqlite3"),
+            "options": {"run_selections": list(fixture["selections"] or [])},
+            "parameter_context": {},
+        }
+        comparison_rows = tar._tar_build_per_serial_comparison_rows(
+            ctx,
+            pair_specs=list(analysis.get("pair_specs") or []),
+            all_serials=["SN-PM"],
+            hi=["SN-PM"],
+            initial_grade_map_by_pair_serial=dict(analysis.get("initial_grade_map_by_pair_serial") or {}),
+            final_grade_map_by_pair_serial=dict(analysis.get("final_grade_map_by_pair_serial") or {}),
+            finding_by_pair_serial=dict(analysis.get("finding_by_pair_serial") or {}),
+        )
+        self.assertEqual([row["selection_id"] for row in comparison_rows], ["condition:pm"])
+
+        pair_specs = [dict(spec) for spec in (analysis.get("pair_specs") or []) if isinstance(spec, dict)]
+        plot_ctx = {
+            **ctx,
+            "pair_by_id": {str(spec.get("pair_id") or ""): dict(spec) for spec in pair_specs},
+            "all_serials": ["SN-PM"],
+            "initial_cohort_specs": list(analysis.get("initial_cohort_specs") or []),
+            "regrade_cohort_specs": list(analysis.get("regrade_cohort_specs") or []),
+            "performance_plot_specs": [],
+            "watch_pair_ids": [],
+            "metric_stats": ["mean"],
+            "include_metrics": True,
+            "run_by_name": dict(fixture["run_by_name"] or {}),
+            "final_grade_map_by_pair_serial": dict(analysis.get("final_grade_map_by_pair_serial") or {}),
+        }
+        plot_specs = tar._tar_plan_plot_specs(plot_ctx, intro_pages=0)
+        self.assertEqual(
+            [spec["base_condition_label"] for spec in plot_specs if spec.get("section") == "run_condition_plot_metrics"],
+            ["Pulse Mode Condition"],
+        )
+        self.assertEqual(
+            [spec["base_condition_label"] for spec in plot_specs if spec.get("section") == "run_condition_curve_overlays"],
+            ["Pulse Mode Condition"],
+        )
+
+    def test_prepare_row_specs_and_outputs_preserve_steady_and_pulsed_selections(self) -> None:
+        fixture = self._prepare_specs_for_run_type_mode_regression()
+        specs = [dict(spec) for spec in (fixture["specs"] or []) if isinstance(spec, dict)]
+        self.assertEqual({spec["selection_id"] for spec in specs}, {"condition:ss", "condition:pm"})
+        spec_by_id = {str(spec.get("selection_id") or ""): spec for spec in specs}
+        self.assertEqual([curve.serial for curve in spec_by_id["condition:ss"]["series"]], ["SN-SS"])
+        self.assertEqual([curve.serial for curve in spec_by_id["condition:pm"]["series"]], ["SN-PM"])
+        self.assertEqual(spec_by_id["condition:pm"]["metric_mean_by_serial"], {"SN-PM": 29.5})
+        self.assertEqual(
+            [(call["metric_source"], call["run_type_filter"]) for call in fixture["metric_calls"]],
+            [
+                ("aggregate", "steady_state"),
+                ("all_sequences", "steady_state"),
+                ("aggregate", "pulsed_mode"),
+                ("all_sequences", "pulsed_mode"),
+            ],
+        )
+
+        analysis = tar._tar_analyze_curve_groups(
+            specs,
+            hi=["SN-SS", "SN-PM"],
+            program_by_serial={"SN-SS": "Program A", "SN-PM": "Program A"},
+            certifying_program="Program A",
+            prepass_cfg={"enabled": False},
+            grid_points=5,
+            degree=2,
+            normalize_x=True,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+        ctx = {
+            "filter_state": {},
+            "be": fixture["fake_be"],
+            "db_path": Path("fake.sqlite3"),
+            "options": {"run_selections": list(fixture["selections"] or [])},
+            "parameter_context": {},
+        }
+        comparison_rows = tar._tar_build_per_serial_comparison_rows(
+            ctx,
+            pair_specs=list(analysis.get("pair_specs") or []),
+            all_serials=["SN-SS", "SN-PM"],
+            hi=["SN-SS", "SN-PM"],
+            initial_grade_map_by_pair_serial=dict(analysis.get("initial_grade_map_by_pair_serial") or {}),
+            final_grade_map_by_pair_serial=dict(analysis.get("final_grade_map_by_pair_serial") or {}),
+            finding_by_pair_serial=dict(analysis.get("finding_by_pair_serial") or {}),
+        )
+        self.assertEqual({row["selection_id"] for row in comparison_rows}, {"condition:ss", "condition:pm"})
+
+        pair_specs = [dict(spec) for spec in (analysis.get("pair_specs") or []) if isinstance(spec, dict)]
+        plot_ctx = {
+            **ctx,
+            "pair_by_id": {str(spec.get("pair_id") or ""): dict(spec) for spec in pair_specs},
+            "all_serials": ["SN-SS", "SN-PM"],
+            "initial_cohort_specs": list(analysis.get("initial_cohort_specs") or []),
+            "regrade_cohort_specs": list(analysis.get("regrade_cohort_specs") or []),
+            "performance_plot_specs": [],
+            "watch_pair_ids": [],
+            "metric_stats": ["mean"],
+            "include_metrics": True,
+            "run_by_name": dict(fixture["run_by_name"] or {}),
+            "final_grade_map_by_pair_serial": dict(analysis.get("final_grade_map_by_pair_serial") or {}),
+        }
+        plot_specs = tar._tar_plan_plot_specs(plot_ctx, intro_pages=0)
+        self.assertEqual(
+            {spec["base_condition_label"] for spec in plot_specs if spec.get("section") == "run_condition_plot_metrics"},
+            {"Steady State Condition", "Pulse Mode Condition"},
+        )
+        self.assertEqual(
+            {spec["base_condition_label"] for spec in plot_specs if spec.get("section") == "run_condition_curve_overlays"},
+            {"Steady State Condition", "Pulse Mode Condition"},
+        )
 
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
