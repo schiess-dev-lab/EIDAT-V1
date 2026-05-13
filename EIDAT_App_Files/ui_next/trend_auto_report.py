@@ -8200,6 +8200,16 @@ def _tar_metric_tick_label(ctx: Mapping[str, Any], serial: str) -> str:
 
 _TAR_METRIC_PROGRAM_SEGMENT_PALETTE = ["#1d4ed8", "#0f766e", "#b45309", "#7c3aed", "#be123c", "#334155"]
 _TAR_METRIC_GUIDE_COLOR = "#cbd5e1"
+_TAR_CURVE_HIGHLIGHT_PALETTE = [
+    "#2563eb",
+    "#dc2626",
+    "#16a34a",
+    "#ea580c",
+    "#7c3aed",
+    "#0f766e",
+    "#ca8a04",
+    "#db2777",
+]
 _TAR_HIGHLIGHT_FALLBACK_PALETTE = [
     "#ef4444",
     "#3b82f6",
@@ -8242,13 +8252,43 @@ def _tar_build_highlight_palette(configured_colors: Sequence[object] | None) -> 
     return palette or list(_TAR_HIGHLIGHT_FALLBACK_PALETTE)
 
 
+def _tar_build_curve_highlight_palette(configured_colors: Sequence[object] | None) -> list[str]:
+    palette: list[str] = []
+    seen: set[str] = set()
+    configured = list(configured_colors or [])
+    for raw_color in configured:
+        color = str(raw_color or "").strip()
+        key = color.casefold()
+        if not color or key in seen:
+            continue
+        palette.append(color)
+        seen.add(key)
+        if len(palette) >= len(_TAR_CURVE_HIGHLIGHT_PALETTE):
+            break
+    for raw_color in _TAR_CURVE_HIGHLIGHT_PALETTE:
+        if len(palette) >= len(_TAR_CURVE_HIGHLIGHT_PALETTE):
+            break
+        color = str(raw_color or "").strip()
+        key = color.casefold()
+        if not color or key in seen:
+            continue
+        palette.append(color)
+        seen.add(key)
+    return palette or list(_TAR_CURVE_HIGHLIGHT_PALETTE)
+
+
 def _tar_highlight_series_style(
     index: int,
     palette: Sequence[object] | None,
     *,
     kind: str,
 ) -> dict[str, Any]:
-    colors = _tar_build_highlight_palette(palette)
+    style_kind = str(kind or "").strip().lower()
+    colors = (
+        _tar_build_curve_highlight_palette(palette)
+        if style_kind == "curve"
+        else _tar_build_highlight_palette(palette)
+    )
     safe_index = max(0, int(index))
     palette_index = safe_index % len(colors)
     wrap_count = safe_index // len(colors)
@@ -8256,7 +8296,7 @@ def _tar_highlight_series_style(
         "color": str(colors[palette_index] or ""),
         "wrap_count": wrap_count,
     }
-    if str(kind or "").strip().lower() == "curve":
+    if style_kind == "curve":
         style["linestyle"] = "-" if wrap_count <= 0 else ":"
         return style
     edge_cycle = list(_TAR_HIGHLIGHT_WRAP_EDGE_COLORS)
@@ -13299,7 +13339,7 @@ def _tar_render_metric_cohort_page(
     serials = list(ctx.get("all_serials") or [])
     serial_index = {serial: idx for idx, serial in enumerate(serials)}
     x_idx = list(range(len(serials)))
-    palette = _tar_build_highlight_palette(ctx.get("colors"))
+    palette = _tar_build_curve_highlight_palette(ctx.get("colors"))
     pair_by_id = ctx.get("pair_by_id") or {}
     hi_set = {str(serial or "").strip() for serial in (ctx.get("hi") or []) if str(serial or "").strip()}
 
@@ -13502,7 +13542,7 @@ def _tar_render_curve_cohort_page(
         note_lines.append(f"RMSE: {_fmt_num(((cohort_spec.get('model') or {}).get('poly') or {}).get('rmse'), sig=5)}")
         note_lines.append("")
 
-    palette = _tar_build_highlight_palette(ctx.get("colors"))
+    palette = _tar_build_curve_highlight_palette(ctx.get("colors"))
     finding_by_pair_serial = ctx.get("finding_by_pair_serial") or {}
     highlighted_trace_index = 0
     for trace in trace_curves:

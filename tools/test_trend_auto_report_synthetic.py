@@ -2813,10 +2813,19 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertGreaterEqual(len(palette), 14)
         self.assertEqual(len({str(color).lower() for color in palette}), len(palette))
 
-    def test_highlight_series_style_uses_dotted_lines_after_palette_wrap(self):
+    def test_build_curve_highlight_palette_caps_at_eight_colors(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
 
-        palette = tar._tar_build_highlight_palette(["#ef4444", "#3b82f6"])
+        palette = tar._tar_build_curve_highlight_palette(["#ef4444", "", "#3b82f6", "#22c55e", "#a855f7"])
+
+        self.assertEqual(palette[:4], ["#ef4444", "#3b82f6", "#22c55e", "#a855f7"])
+        self.assertEqual(len(palette), 8)
+        self.assertEqual(len({str(color).lower() for color in palette}), len(palette))
+
+    def test_highlight_series_style_uses_dotted_lines_after_eight_curve_colors(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        palette = tar._tar_build_curve_highlight_palette(["#ef4444", "#3b82f6"])
         first_cycle = tar._tar_highlight_series_style(0, palette, kind="curve")
         wrapped_cycle = tar._tar_highlight_series_style(len(palette), palette, kind="curve")
 

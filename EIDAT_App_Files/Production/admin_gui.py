@@ -40,7 +40,7 @@ class _Worker(QtCore.QThread):
     log = QtCore.Signal(str)
     status = QtCore.Signal(str)
     # Use `object` for timestamps to avoid PySide6/shiboken coercing to 32-bit C++ int.
-    finished_one = QtCore.Signal(str, str, object, object, bool, str)  # node_id, action, started_ns, finished_ns, ok, error
+    finished_one = QtCore.Signal(str, str, object, object, bool, str, object)  # node_id, action, started_ns, finished_ns, ok, error, summary
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -106,6 +106,25 @@ class _Worker(QtCore.QThread):
                     node_env_enabled=node_env_enabled,
                     on_log=_emit,
                 )
+            elif action == "update_projects":
+                from .admin_runner import run_update_projects
+
+                projects_raw = options.get("projects") or []
+                projects = [dict(item or {}) for item in projects_raw if isinstance(item, dict)] if isinstance(projects_raw, list) else []
+                overwrite = bool(options.get("overwrite"))
+                force_project_rebuild = bool(options.get("force_project_rebuild"))
+                _emit(
+                    "[ACTION] update projects via backend processor "
+                    f"(selected={len(projects)} overwrite={overwrite} force_rebuild={force_project_rebuild})"
+                )
+                res = run_update_projects(
+                    node_root=node_root,
+                    runtime_root=runtime_root,
+                    projects=projects,
+                    overwrite=overwrite,
+                    force_project_rebuild=force_project_rebuild,
+                    on_log=_emit,
+                )
             else:
                 from .admin_runner import run_pipeline
 
@@ -117,9 +136,18 @@ class _Worker(QtCore.QThread):
                     on_log=_emit,
                 )
             finished = now_ns()
+            summary = dict(res.outputs.get(action) or {}) if isinstance(res.outputs.get(action), dict) else {}
             if res.ok:
                 if action == "update_processor":
                     _emit("[OK] update_processor")
+                elif action == "update_projects":
+                    try:
+                        selected = int((summary or {}).get("selected_count", 0))
+                        succeeded = int((summary or {}).get("succeeded_count", 0))
+                        failed = int((summary or {}).get("failed_count", 0))
+                    except Exception:
+                        selected = succeeded = failed = 0
+                    _emit(f"[OK] update_projects selected={selected} succeeded={succeeded} failed={failed}")
                 elif action == "force_single_file":
                     proc = res.outputs.get("process") or {}
                     source = res.outputs.get("source_file") or {}
@@ -146,10 +174,10 @@ class _Worker(QtCore.QThread):
                     except Exception:
                         cand = ok = bad = groups = 0
                     _emit(f"[OK] candidates={cand} processed_ok={ok} processed_failed={bad} groups={groups}")
-                self.finished_one.emit(node_id, action, started, finished, True, "")
+                self.finished_one.emit(node_id, action, started, finished, True, "", summary)
             else:
                 _emit(f"[FAIL] {res.error}")
-                self.finished_one.emit(node_id, action, started, finished, False, res.error or "Unknown error")
+                self.finished_one.emit(node_id, action, started, finished, False, res.error or "Unknown error", summary)
 
 
 class _RunStatusDialog(QtWidgets.QDialog):
@@ -211,6 +239,94 @@ class _RunStatusDialog(QtWidgets.QDialog):
         if summary:
             self.lbl_status.setText(summary)
         self.btn_close.setEnabled(True)
+
+
+class _ProjectUpdatePickerDialog(QtWidgets.QDialog):
+    def __init__(self, *, node_name: str, projects: list[dict[str, object]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Update Projects")
+        self.resize(860, 540)
+        self._projects = [dict(item or {}) for item in (projects or []) if isinstance(item, dict)]
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        heading = QtWidgets.QLabel(f"Select projects to update for {node_name}")
+        heading.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a;")
+        layout.addWidget(heading)
+
+        hint = QtWidgets.QLabel(
+            "Run project updates from the backend processor path. "
+            "Force full rebuild applies only to Test Data Trending projects."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 12px; color: #475569;")
+        layout.addWidget(hint)
+
+        self.tbl = QtWidgets.QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["Name", "Type", "Workbook"])
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.MultiSelection)
+        self.tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        self.tbl.setWordWrap(False)
+        self.tbl.setTextElideMode(QtCore.Qt.TextElideMode.ElideMiddle)
+        self.tbl.setColumnWidth(0, 220)
+        self.tbl.setColumnWidth(1, 220)
+        self.tbl.setColumnWidth(2, 380)
+        layout.addWidget(self.tbl, 1)
+
+        opts = QtWidgets.QHBoxLayout()
+        self.cb_overwrite = QtWidgets.QCheckBox("Overwrite existing cells")
+        self.cb_force_rebuild = QtWidgets.QCheckBox("Force full rebuild")
+        self.cb_force_rebuild.setToolTip("Applies only to Test Data Trending projects.")
+        opts.addWidget(self.cb_overwrite)
+        opts.addWidget(self.cb_force_rebuild)
+        opts.addStretch(1)
+        layout.addLayout(opts)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.btn_ok = buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        if self.btn_ok is not None:
+            self.btn_ok.setText("Run Update")
+            self.btn_ok.setEnabled(False)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.tbl.itemSelectionChanged.connect(self._refresh_buttons)
+        self._load_projects()
+
+    def _load_projects(self) -> None:
+        self.tbl.setRowCount(0)
+        for row, project in enumerate(self._projects):
+            self.tbl.insertRow(row)
+            for col, key in enumerate(("name", "type", "workbook")):
+                value = str(project.get(key) or "").strip()
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setToolTip(value)
+                if col == 0:
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(project))
+                self.tbl.setItem(row, col, item)
+        self._refresh_buttons()
+
+    def _refresh_buttons(self) -> None:
+        if self.btn_ok is not None:
+            self.btn_ok.setEnabled(bool(self.selected_projects()))
+
+    def selected_projects(self) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        seen_rows: set[int] = set()
+        for item in self.tbl.selectedItems():
+            row = int(item.row())
+            if row in seen_rows:
+                continue
+            seen_rows.add(row)
+            first = self.tbl.item(row, 0)
+            payload = dict(first.data(QtCore.Qt.ItemDataRole.UserRole) or {}) if first is not None else {}
+            if payload:
+                out.append(payload)
+        return out
 
 
 class AdminWindow(QtWidgets.QMainWindow):
@@ -459,7 +575,8 @@ class AdminWindow(QtWidgets.QMainWindow):
                 outer.setSpacing(4)
                 row1 = QtWidgets.QHBoxLayout()
                 row2 = QtWidgets.QHBoxLayout()
-                for rl in (row1, row2):
+                row3 = QtWidgets.QHBoxLayout()
+                for rl in (row1, row2, row3):
                     rl.setContentsMargins(0, 0, 0, 0)
                     rl.setSpacing(6)
                 b_open = QtWidgets.QPushButton("Open")
@@ -467,22 +584,27 @@ class AdminWindow(QtWidgets.QMainWindow):
                 b_reset = QtWidgets.QPushButton("Reset")
                 b_proc = QtWidgets.QPushButton("Process")
                 b_update = QtWidgets.QPushButton("Update Proc")
+                b_update_projects = QtWidgets.QPushButton("Update Projects")
                 b_force_file = QtWidgets.QPushButton("Force File")
                 b_update.setToolTip(
                     "Refresh node runtime and node UI venv packages against the current runtime code "
                     "without deleting node caches/artifacts."
                 )
+                b_update_projects.setToolTip(
+                    "Select one or more registered node projects and update them from the backend processor path."
+                )
                 b_force_file.setToolTip(
                     "Select one PDF, Excel, or MAT source file in this node and rebuild only that file's "
                     "EIDAT Support artifacts, metadata, source pointer when applicable, and index entries."
                 )
-                for b in (b_open, b_deploy, b_reset, b_proc, b_update, b_force_file):
+                for b in (b_open, b_deploy, b_reset, b_proc, b_update, b_update_projects, b_force_file):
                     b.setMaximumWidth(120)
                 b_open.clicked.connect(lambda _=False, root=n.node_root: self._open_folder(root))
                 b_deploy.clicked.connect(lambda _=False, root=n.node_root: self._deploy_node(root))
                 b_reset.clicked.connect(lambda _=False, root=n.node_root: self._reset_node(root))
                 b_proc.clicked.connect(lambda _=False, nid=n.node_id: self._process_one(nid))
                 b_update.clicked.connect(lambda _=False, nid=n.node_id: self._update_processor(nid))
+                b_update_projects.clicked.connect(lambda _=False, nid=n.node_id: self._act_update_projects(nid))
                 b_force_file.clicked.connect(lambda _=False, nid=n.node_id: self._act_force_single_file(nid))
                 row1.addWidget(b_open)
                 row1.addWidget(b_deploy)
@@ -490,10 +612,13 @@ class AdminWindow(QtWidgets.QMainWindow):
                 row2.addWidget(b_proc)
                 row2.addWidget(b_update)
                 row2.addWidget(b_force_file)
+                row3.addWidget(b_update_projects)
                 row1.addStretch(1)
                 row2.addStretch(1)
+                row3.addStretch(1)
                 outer.addLayout(row1)
                 outer.addLayout(row2)
+                outer.addLayout(row3)
                 self.tbl.setCellWidget(r, 5, btns)
         finally:
             self.tbl.blockSignals(False)
@@ -642,6 +767,56 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._run_status.begin(f"Update Processor Envs/Runtime: {Path(n.node_root).name}")
         self.worker.start()
 
+    def _choose_projects_for_update(self, node_root: str | Path) -> tuple[list[dict[str, object]], bool, bool] | None:
+        from . import node_backend
+
+        projects = list(node_backend.list_projects(node_root) or [])
+        dlg = _ProjectUpdatePickerDialog(node_name=Path(str(node_root)).name, projects=projects, parent=self)
+        try:
+            if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return None
+            return (dlg.selected_projects(), bool(dlg.cb_overwrite.isChecked()), bool(dlg.cb_force_rebuild.isChecked()))
+        finally:
+            dlg.deleteLater()
+
+    def _act_update_projects(self, node_id: str) -> None:
+        nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}
+        n = nodes.get(node_id)
+        if not n:
+            return
+        if self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
+            return
+        try:
+            picked = self._choose_projects_for_update(n.node_root)
+            if not picked:
+                return
+            projects, overwrite, force_project_rebuild = picked
+            if not projects:
+                QtWidgets.QMessageBox.information(self, "Update Projects", "Select at least one project to update.")
+                return
+            self._ensure_node_env_file(n.node_root)
+            self.worker.set_tasks(
+                [
+                    (
+                        n.node_id,
+                        n.node_root,
+                        n.runtime_root,
+                        True,
+                        "update_projects",
+                        {
+                            "projects": projects,
+                            "overwrite": bool(overwrite),
+                            "force_project_rebuild": bool(force_project_rebuild),
+                        },
+                    )
+                ]
+            )
+            self._run_status.begin(f"Update Projects: {Path(n.node_root).name} ({len(projects)} selected)")
+            self.worker.start()
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Update Projects", str(exc))
+
     def _act_scan_force_candidates(self, node_id: str) -> None:
         nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}
         n = nodes.get(node_id)
@@ -692,19 +867,32 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._run_status.begin(f"Force File Update: {source.name}")
         self.worker.start()
 
-    def _on_finished_one(self, node_id: str, action: str, started_ns: int, finished_ns: int, ok: bool, error: str) -> None:
+    def _on_finished_one(
+        self,
+        node_id: str,
+        action: str,
+        started_ns: int,
+        finished_ns: int,
+        ok: bool,
+        error: str,
+        summary: object,
+    ) -> None:
         try:
-            # Only record actual processing runs in the run registry.
-            if action in {"pipeline", "scan_force_candidates", "force_single_file"}:
+            # Record processing and project update runs in the run registry.
+            if action in {"pipeline", "scan_force_candidates", "force_single_file", "update_projects"}:
                 status = "ok" if ok else "failed"
-                summary = {"ok": ok, "action": action, "error": error} if error else {"ok": ok, "action": action}
+                payload = dict(summary or {}) if isinstance(summary, dict) else {}
+                payload["ok"] = bool(ok)
+                payload["action"] = str(action)
+                if error:
+                    payload["error"] = str(error)
                 admin_db.insert_run(
                     self._conn,
                     node_id=node_id,
                     started_epoch_ns=int(started_ns or 0),
                     finished_epoch_ns=int(finished_ns or 0),
                     status=status,
-                    summary_json=json.dumps(summary),
+                    summary_json=json.dumps(payload, default=str),
                     error=error or None,
                 )
         except Exception as exc:

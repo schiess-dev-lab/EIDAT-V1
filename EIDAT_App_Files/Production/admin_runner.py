@@ -82,6 +82,25 @@ def _source_rel_path(node_root: Path, file_path: str | Path) -> str:
     return rel.as_posix()
 
 
+def _project_workbook_path(node_root: Path, workbook_path: str | Path) -> Path:
+    node = _as_abs(node_root)
+    raw = Path(str(workbook_path or "").strip()).expanduser()
+    if not str(raw).strip():
+        raise RuntimeError("Project workbook path is required.")
+    wb = _as_abs(raw)
+    if not wb.exists():
+        raise FileNotFoundError(f"Project workbook not found: {wb}")
+    if not wb.is_file():
+        raise RuntimeError(f"Project workbook path is not a file: {wb}")
+    try:
+        wb.resolve().relative_to(node.resolve())
+    except Exception as exc:
+        raise RuntimeError(f"Project workbook must be inside the node root: {node}") from exc
+    if wb.suffix.lower() not in {".xlsx", ".xls", ".xlsm"}:
+        raise RuntimeError(f"Unsupported project workbook type: {wb.suffix or wb.name}")
+    return wb
+
+
 def _env_truthy(val: object) -> bool:
     if val is None:
         return False
@@ -460,6 +479,137 @@ def run_update_processor(
             if ui_log_path.exists():
                 on_log(f"[LOG ui] {ui_log_path}")
 
+        return PipelineResult(ok=True, node_root=node, outputs=outputs)
+    except Exception as exc:
+        return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
+
+
+def run_update_projects(
+    *,
+    node_root: str | Path,
+    runtime_root: str | Path,
+    projects: list[dict[str, object]] | tuple[dict[str, object], ...],
+    overwrite: bool = False,
+    force_project_rebuild: bool = False,
+    on_log: Callable[[str], None] | None = None,
+) -> PipelineResult:
+    node = _as_abs(node_root)
+    runtime = _as_abs(runtime_root)
+    selected = [dict(item or {}) for item in (projects or []) if isinstance(item, dict)]
+    outputs: dict[str, object] = {}
+    try:
+        if not node.exists():
+            raise RuntimeError(f"Node root does not exist: {node}")
+        if not node.is_dir():
+            raise RuntimeError(f"Node root is not a directory: {node}")
+        if not (runtime / "EIDAT_App_Files").exists():
+            raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
+        if not selected:
+            raise RuntimeError("Select at least one project to update.")
+
+        from . import node_backend
+
+        if on_log is not None:
+            on_log(f"[NODE] {node}")
+            on_log(
+                "[ACTION] update_projects "
+                f"selected={len(selected)} overwrite={bool(overwrite)} force_rebuild={bool(force_project_rebuild)}"
+            )
+
+        results: list[dict[str, object]] = []
+        succeeded = 0
+        failed = 0
+
+        for index, project in enumerate(selected, start=1):
+            raw_name = str(project.get("name") or "").strip()
+            raw_type = str(project.get("type") or "").strip()
+            raw_workbook = project.get("workbook")
+            name = raw_name or f"Project {index}"
+            try:
+                wb = _project_workbook_path(node, raw_workbook or "")
+                if on_log is not None:
+                    on_log(f"[PROJECT {index}/{len(selected)}] start name={name} type={raw_type or 'unknown'}")
+                    on_log(f"[WORKBOOK] {wb}")
+
+                def _progress(line: str) -> None:
+                    s = str(line or "").strip()
+                    if on_log is not None and s:
+                        on_log(f"[PROJECT {name}] {s}")
+
+                payload = dict(
+                    node_backend.update_project(
+                        node,
+                        workbook_path=wb,
+                        project_type=raw_type,
+                        overwrite=bool(overwrite),
+                        force_project_rebuild=bool(force_project_rebuild),
+                        progress_cb=_progress,
+                    )
+                    or {}
+                )
+                results.append(
+                    {
+                        "name": name,
+                        "type": raw_type,
+                        "workbook": str(wb),
+                        "ok": True,
+                        "payload": payload,
+                    }
+                )
+                succeeded += 1
+                if on_log is not None:
+                    updated_cells = int(payload.get("updated_cells", 0) or 0)
+                    on_log(f"[PROJECT OK] name={name} updated_cells={updated_cells}")
+            except Exception as exc:
+                failed += 1
+                results.append(
+                    {
+                        "name": name,
+                        "type": raw_type,
+                        "workbook": str(raw_workbook or ""),
+                        "ok": False,
+                        "error": str(exc),
+                    }
+                )
+                if on_log is not None:
+                    on_log(f"[PROJECT FAIL] name={name} error={exc}")
+
+        sample: list[dict[str, object]] = []
+        for item in results[:20]:
+            sample.append(
+                {
+                    "name": str(item.get("name") or "").strip(),
+                    "type": str(item.get("type") or "").strip(),
+                    "workbook": str(item.get("workbook") or "").strip(),
+                    "ok": bool(item.get("ok")),
+                    "error": str(item.get("error") or "").strip(),
+                }
+            )
+
+        summary = {
+            "selected_count": len(selected),
+            "succeeded_count": succeeded,
+            "failed_count": failed,
+            "overwrite": bool(overwrite),
+            "force_project_rebuild": bool(force_project_rebuild),
+            "projects": results,
+            "projects_sample": sample,
+        }
+        outputs["update_projects"] = summary
+
+        if on_log is not None:
+            on_log(
+                "[SUMMARY] update_projects "
+                f"selected={len(selected)} succeeded={succeeded} failed={failed}"
+            )
+
+        if failed:
+            return PipelineResult(
+                ok=False,
+                node_root=node,
+                outputs=outputs,
+                error=f"{failed} project update(s) failed out of {len(selected)}.",
+            )
         return PipelineResult(ok=True, node_root=node, outputs=outputs)
     except Exception as exc:
         return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
