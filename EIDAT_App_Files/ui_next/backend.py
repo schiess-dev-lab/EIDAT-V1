@@ -21188,10 +21188,26 @@ def rebuild_test_data_project_cache(
     raw_conn = sqlite3.connect(str(raw_db_path))
     _ensure_test_data_impl_tables(impl_conn)
     _ensure_test_data_raw_cache_tables(raw_conn)
+    existing_cached_source_keys: set[str] = set()
+    if not full_reset:
+        try:
+            existing_cached_source_keys = {
+                str(row[0] or "").strip()
+                for row in impl_conn.execute("SELECT serial FROM td_sources").fetchall()
+                if str(row[0] or "").strip()
+            }
+        except Exception:
+            existing_cached_source_keys = set()
     if not full_reset and (removed_serials or entries):
         entry_source_keys: list[str] = []
         for entry in entries:
             if not isinstance(entry, Mapping):
+                continue
+            try:
+                source_resolution = _resolve_td_source_sqlite_for_workbook(wb_path, entry)
+                if str(source_resolution.get("status") or "").strip().lower() != "ok":
+                    continue
+            except Exception:
                 continue
             try:
                 entry_meta = _load_td_source_metadata(wb_path, entry)
@@ -21297,6 +21313,9 @@ def rebuild_test_data_project_cache(
                 ),
             ),
         )
+        if not full_reset and status != "ok" and sn in existing_cached_source_keys:
+            debug_sources[source_debug_source_idx]["preserved_existing_cache"] = True
+            continue
         impl_conn.execute(
             """
             INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns, raw_fingerprint)

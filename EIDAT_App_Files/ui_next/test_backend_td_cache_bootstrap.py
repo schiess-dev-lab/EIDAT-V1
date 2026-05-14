@@ -2325,6 +2325,108 @@ class TestBackendTdCacheBootstrap(unittest.TestCase):
             self.assertEqual(events, ["load", "catalog", "runtime"])
             self.assertEqual(str((payload.get("parameter_runtime") or {}).get("mode") or ""), "rebuilt")
 
+    def test_incremental_rebuild_skips_missing_source_without_deleting_existing_cache_rows(self) -> None:
+        if Workbook is None:
+            self.skipTest("openpyxl is required for TD cache rebuild tests")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            backend._write_test_data_trending_workbook(
+                workbook_path,
+                global_repo=project_dir,
+                serials=["SN1"],
+                docs=[{"serial_number": "SN1", "excel_sqlite_rel": "missing.sqlite3"}],
+                config={"columns": [{"name": "thrust", "units": "lbf"}], "statistics": ["mean"]},
+            )
+            support_path = backend.td_support_workbook_path_for(workbook_path, project_dir=project_dir)
+            backend._write_td_support_workbook(
+                support_path,
+                sequence_names=["RunA"],
+                param_defs=[{"name": "thrust", "units": "lbf"}],
+            )
+
+            impl_db = project_dir / backend.EIDAT_PROJECT_IMPLEMENTATION_DB
+            raw_db = project_dir / backend.EIDAT_PROJECT_TD_RAW_CACHE_DB
+            with closing(sqlite3.connect(str(impl_db))) as conn:
+                backend._ensure_test_data_impl_tables(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_sources(serial, sqlite_path, mtime_ns, size_bytes, status, last_ingested_epoch_ns, raw_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    ("SN1", "", 0, 0, "ok", 1, "seed"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_runs(run_name, default_x, display_name) VALUES (?, ?, ?)",
+                    ("RunA", "Time", "Run A"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_calc(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_metrics_calc(observation_id, serial, run_name, column_name, stat, value_num, computed_epoch_ns, source_mtime_ns)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("obs_a", "SN1", "RunA", "thrust", "mean", 10.0, 1, 1),
+                )
+                conn.commit()
+            with closing(sqlite3.connect(str(raw_db))) as conn:
+                backend._ensure_test_data_raw_cache_tables(conn)
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_raw_sequences(run_name, display_name, x_axis_kind, source_run_name, computed_epoch_ns)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "Run A", "Time", "RunA", 1),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "Time", "", "x"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "Time", "", "x"),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO td_columns_raw(run_name, name, units, kind) VALUES (?, ?, ?, ?)",
+                    ("RunA", "thrust", "lbf", "y"),
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO td_curves_raw
+                    (run_name, y_name, x_name, observation_id, serial, x_json, y_json, n_points, source_mtime_ns, computed_epoch_ns, program_title, source_run_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("RunA", "thrust", "Time", "SN1__RunA", "SN1", "[0,1,2]", "[10,20,30]", 3, 1, 1, "", "RunA"),
+                )
+                conn.commit()
+
+            payload = backend.rebuild_test_data_project_cache(
+                impl_db,
+                workbook_path,
+                _entries_override=[
+                    {
+                        "serial": "SN1",
+                        "serial_number": "SN1",
+                        "program_title": "",
+                        "document_type": "TD",
+                        "metadata_rel": "",
+                        "artifacts_rel": "",
+                        "excel_sqlite_rel": "missing.sqlite3",
+                    }
+                ],
+                _full_reset=False,
+            )
+
+            self.assertEqual(str(payload.get("db_path") or ""), str(impl_db))
+            with closing(sqlite3.connect(str(raw_db))) as conn:
+                curves = conn.execute("SELECT COUNT(*) FROM td_curves_raw WHERE serial='SN1'").fetchone()
+            self.assertEqual(int(curves[0] or 0), 1)
+
     def test_ready_validator_allows_workbook_output_mismatch_as_warning(self) -> None:
         if Workbook is None:
             self.skipTest("openpyxl is required for TD readiness tests")
