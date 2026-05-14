@@ -529,6 +529,63 @@ class TestTDExcelHeaderMapping(unittest.TestCase):
             self.assertNotEqual(mapped_headers[1], "Time")
             self.assertEqual(source_sheet_name, "Seq1")
 
+    def test_importer_does_not_map_pulse_like_headers_to_pulse_number(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_pulse_like_headers.xlsx"
+            sqlite_path = root / "td_pulse_like_headers.sqlite3"
+            headers = [
+                (1, 1, "Pulse Width"),
+                (1, 2, "Pulse Pressure"),
+                (1, 3, "Impulse"),
+                (1, 4, "Time to 1/2 Impulse"),
+            ]
+            data_rows = [
+                [0.1 + float(i), 250.0 + float(i), 10.0 + float(i), 0.5 + (float(i) * 0.1)]
+                for i in range(20)
+            ]
+            self._build_workbook(workbook_path, headers=headers, data_rows=data_rows)
+
+            self._import_workbook(workbook_path, sqlite_path)
+            raw_headers, mapped_headers, _sqlite_cols, source_sheet_name = self._sheet_info_row(
+                sqlite_path,
+                sheet_name="Seq1",
+            )
+
+            self.assertEqual(
+                raw_headers[:4],
+                ["Pulse Width", "Pulse Pressure", "Impulse", "Time to 1/2 Impulse"],
+            )
+            self.assertEqual(mapped_headers[:4], raw_headers[:4])
+            self.assertNotIn("Pulse Number", mapped_headers[:4])
+            self.assertEqual(source_sheet_name, "Seq1")
+
+    def test_importer_preserves_exact_pulse_number_and_time_alias_mappings(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            root = Path(td)
+            workbook_path = root / "td_exact_x_aliases.xlsx"
+            sqlite_path = root / "td_exact_x_aliases.sqlite3"
+            headers = [
+                (1, 1, "Pulse Number"),
+                (1, 2, "cycle"),
+                (1, 3, "Seq Time (sec)"),
+            ]
+            data_rows = [
+                [float(i + 1), float(i + 101), float(i) * 0.25]
+                for i in range(20)
+            ]
+            self._build_workbook(workbook_path, headers=headers, data_rows=data_rows)
+
+            self._import_workbook(workbook_path, sqlite_path)
+            raw_headers, mapped_headers, _sqlite_cols, source_sheet_name = self._sheet_info_row(
+                sqlite_path,
+                sheet_name="Seq1",
+            )
+
+            self.assertEqual(raw_headers[:3], ["Pulse Number", "cycle", "Seq Time (sec)"])
+            self.assertEqual(mapped_headers[:3], ["Pulse Number", "Pulse Number", "Time"])
+            self.assertEqual(source_sheet_name, "Seq1")
+
     def test_importer_synthesizes_seq_name_for_single_non_seq_td_sheet(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             root = Path(td)

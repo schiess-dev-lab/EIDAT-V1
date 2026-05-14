@@ -4131,6 +4131,16 @@ def _build_portrait_styles(rl: Mapping[str, Any]) -> dict[str, Any]:
             textColor="#334155",
             spaceAfter=2,
         ),
+        "small_link": ParagraphStyle(
+            "EdatSmallLink",
+            parent=styles["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            alignment=TA_LEFT,
+            textColor="#1d4ed8",
+            spaceAfter=2,
+        ),
         "section": ParagraphStyle(
             "EdatSection",
             parent=styles["Heading2"],
@@ -4210,12 +4220,20 @@ def _portrait_box_table(
     boxed: bool = True,
     header_rows: int = 1,
     extra_style_commands: list[tuple] | None = None,
+    cell_style_overrides: Mapping[tuple[int, int], Any] | None = None,
 ) -> Any:
     colors = rl["colors"]
     Table = rl["Table"]
     TableStyle = rl["TableStyle"]
     style_body = styles["small"] if compact else styles["body"]
-    cell_text = [[_portrait_paragraph(value, style_body, rl) for value in row] for row in rows]
+    style_overrides = dict(cell_style_overrides or {})
+    cell_text = [
+        [
+            _portrait_paragraph(value, style_overrides.get((row_index, col_index), style_body), rl)
+            for col_index, value in enumerate(row)
+        ]
+        for row_index, row in enumerate(rows)
+    ]
     table = Table(cell_text, colWidths=col_widths, repeatRows=repeat_rows, hAlign="LEFT")
     header_count = max(0, int(header_rows))
     style_cmds: list[tuple] = [
@@ -9093,7 +9111,8 @@ def _tar_outcome_mix_text(rows: list[Mapping[str, Any]] | None) -> str:
 
 
 _TAR_EXEC_SERIAL_MAX_ROWS = 10
-_TAR_EXEC_DETAIL_MAX_ROWS = 8
+_TAR_EXEC_EXCEPTION_GRADE_TEXT_COLOR = "#1d4ed8"
+_TAR_EXEC_EXCEPTION_HEADER = ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade"]
 
 
 def _tar_exec_scope_table_rows(
@@ -9200,7 +9219,7 @@ def _tar_exec_grading_table_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
         [
             "Final grade",
             "If an exact-condition regrade exists, the final grade replaces the initial pre-pass grade for the official result.",
-            "Chart links jump to the supporting curve page for each WATCH / FAIL item.",
+            "The WATCH / FAIL grade links jump to the supporting curve page for each item.",
         ],
     ]
 
@@ -9234,42 +9253,70 @@ def _tar_exec_exception_table_rows(
     ctx: Mapping[str, Any],
     exception_rows: list[Mapping[str, Any]] | None,
 ) -> list[list[str]]:
+    table_rows, _, _ = _tar_exec_exception_table_spec(ctx, exception_rows)
+    return table_rows
+
+
+def _tar_exec_exception_table_spec(
+    ctx: Mapping[str, Any],
+    exception_rows: list[Mapping[str, Any]] | None,
+) -> tuple[list[list[str]], list[tuple], list[dict[str, Any]]]:
     rows = [dict(row) for row in (exception_rows or []) if isinstance(row, Mapping)]
     if not rows:
-        return [
-            ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade", "Chart"],
-            ["-", "No WATCH or FAIL items were produced for the selected certification scope.", "", "", "", "", "", "", ""],
-        ]
-    limited_rows = rows[:_TAR_EXEC_DETAIL_MAX_ROWS]
-    table_rows = [
-        [
-            _tar_display_serial(ctx, row.get("serial")) or str(row.get("serial") or "").strip(),
-            _tar_run_condition_bullet_text(row),
-            _tar_sequence_bullet_text(row) or str(row.get("sequence_text") or ""),
-            str(row.get("parameter") or ""),
-            _tar_exec_mean_pair_text(row),
-            _fmt_num(_tar_exec_difference_pct(row), sig=4),
-            _fmt_num(_tar_exec_deviation_score(row), sig=4),
-            str(row.get("final_status") or row.get("official_grade") or "").strip().upper(),
-            str(row.get("chart_label") or ""),
-        ]
-        for row in limited_rows
-    ]
-    if len(rows) > len(limited_rows):
+        return (
+            [
+                _TAR_EXEC_EXCEPTION_HEADER,
+                ["-", "No WATCH or FAIL items were produced for the selected certification scope.", "", "", "", "", "", ""],
+            ],
+            [],
+            [],
+        )
+    table_rows: list[list[str]] = [_TAR_EXEC_EXCEPTION_HEADER]
+    style_cmds: list[tuple] = []
+    grade_links: list[dict[str, Any]] = []
+    grade_col_index = len(_TAR_EXEC_EXCEPTION_HEADER) - 1
+    for row_index, row in enumerate(rows, start=1):
+        serial_text = _tar_display_serial(ctx, row.get("serial")) or str(row.get("serial") or "").strip()
+        run_condition_text = _tar_run_condition_bullet_text(row)
+        sequence_text = _tar_sequence_bullet_text(row) or str(row.get("sequence_text") or "")
+        parameter_text = str(row.get("parameter") or "")
+        grade_text = str(row.get("final_status") or row.get("official_grade") or "").strip().upper()
         table_rows.append(
             [
-                "Additional items",
-                f"+{len(rows) - len(limited_rows)} more WATCH / FAIL row(s) are summarized in the body charts.",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
+                serial_text,
+                run_condition_text,
+                sequence_text,
+                parameter_text,
+                _tar_exec_mean_pair_text(row),
+                _fmt_num(_tar_exec_difference_pct(row), sig=4),
+                _fmt_num(_tar_exec_deviation_score(row), sig=4),
+                grade_text,
             ]
         )
-    return [["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade", "Chart"], *table_rows]
+        fill_color = _tar_comparison_grade_fill_color(grade_text)
+        if fill_color:
+            style_cmds.append(("BACKGROUND", (grade_col_index, row_index), (grade_col_index, row_index), fill_color))
+        if row.get("chart_target_page_index") is not None:
+            style_cmds.append(
+                ("TEXTCOLOR", (grade_col_index, row_index), (grade_col_index, row_index), _TAR_EXEC_EXCEPTION_GRADE_TEXT_COLOR)
+            )
+            grade_links.append(
+                {
+                    "serial_text": serial_text,
+                    "run_condition_text": run_condition_text,
+                    "sequence_text": sequence_text,
+                    "parameter_text": parameter_text,
+                    "grade_text": grade_text,
+                    "destination_page_index": int(row.get("chart_target_page_index")),
+                    "target_section": str(row.get("chart_target_section") or "").strip(),
+                    "pair_id": str(row.get("pair_id") or "").strip(),
+                    "serial": str(row.get("serial") or "").strip(),
+                    "run_condition": str(row.get("run_condition") or "").strip(),
+                    "parameter": parameter_text,
+                    "regrade_cohort_id": str(row.get("regrade_cohort_id") or "").strip(),
+                }
+            )
+    return table_rows, style_cmds, grade_links
 
 
 def _tar_pass_fail_synopsis_lines(
@@ -10352,6 +10399,129 @@ def _tar_resolve_plot_toc_page_numbers(doc: Any, toc_layout: list[dict] | None) 
     return resolved_pages
 
 
+def _tar_rect_mid_y(rect: Any) -> float:
+    return (float(getattr(rect, "y0", 0.0) or 0.0) + float(getattr(rect, "y1", 0.0) or 0.0)) / 2.0
+
+
+def _tar_rect_mid_x(rect: Any) -> float:
+    return (float(getattr(rect, "x0", 0.0) or 0.0) + float(getattr(rect, "x1", 0.0) or 0.0)) / 2.0
+
+
+def _tar_exception_link_search_anchor(text: object) -> str:
+    for line in str(text or "").splitlines():
+        candidate = str(line or "").strip()
+        if candidate:
+            return candidate
+    return str(text or "").strip()
+
+
+def _tar_find_intro_exception_grade_rect(
+    page: Any,
+    link: Mapping[str, Any] | None,
+    *,
+    search_cache: dict[str, list[Any]],
+    excluded_rect_keys: set[tuple[float, float, float, float]] | None = None,
+) -> Any | None:
+    if not isinstance(link, Mapping):
+        return None
+    grade_text = str(link.get("grade_text") or "").strip().upper()
+    if grade_text not in {"WATCH", "FAIL"}:
+        return None
+
+    def _cached_search(query: object) -> list[Any]:
+        text = str(query or "").strip()
+        if not text:
+            return []
+        if text not in search_cache:
+            try:
+                search_cache[text] = list(page.search_for(text))
+            except Exception:
+                search_cache[text] = []
+        return list(search_cache.get(text) or [])
+
+    page_rect = getattr(page, "rect", None)
+    page_width = float(getattr(page_rect, "width", 0.0) or 0.0)
+    candidate_rects = [
+        rect
+        for rect in _cached_search(grade_text)
+        if (
+            excluded_rect_keys is None
+            or (
+                float(getattr(rect, "x0", 0.0) or 0.0),
+                float(getattr(rect, "y0", 0.0) or 0.0),
+                float(getattr(rect, "x1", 0.0) or 0.0),
+                float(getattr(rect, "y1", 0.0) or 0.0),
+            ) not in excluded_rect_keys
+        )
+        if (not page_width or _tar_rect_mid_x(rect) >= page_width * 0.55)
+    ]
+    if not candidate_rects:
+        candidate_rects = [
+            rect
+            for rect in _cached_search(grade_text)
+            if (
+                excluded_rect_keys is None
+                or (
+                    float(getattr(rect, "x0", 0.0) or 0.0),
+                    float(getattr(rect, "y0", 0.0) or 0.0),
+                    float(getattr(rect, "x1", 0.0) or 0.0),
+                    float(getattr(rect, "y1", 0.0) or 0.0),
+                ) not in excluded_rect_keys
+            )
+        ]
+    if not candidate_rects:
+        return None
+
+    anchors: list[tuple[str, bool, float]] = [
+        (_tar_exception_link_search_anchor(link.get("serial_text")), True, 18.0),
+        (_tar_exception_link_search_anchor(link.get("parameter_text")), True, 18.0),
+        (_tar_exception_link_search_anchor(link.get("sequence_text")), False, 22.0),
+        (_tar_exception_link_search_anchor(link.get("run_condition_text")), False, 22.0),
+    ]
+    best_rect = None
+    best_score = None
+    for rect in candidate_rects:
+        rect_y = _tar_rect_mid_y(rect)
+        rect_x = float(getattr(rect, "x0", 0.0) or 0.0)
+        missing_required = 0
+        missing_optional = 0
+        gaps: list[float] = []
+        for anchor_text, required, max_gap in anchors:
+            if not anchor_text:
+                continue
+            anchor_rects = [
+                candidate
+                for candidate in _cached_search(anchor_text)
+                if float(getattr(candidate, "x0", 0.0) or 0.0) <= rect_x + 8.0
+            ]
+            if not anchor_rects:
+                if required:
+                    missing_required += 1
+                else:
+                    missing_optional += 1
+                continue
+            gap = min(abs(_tar_rect_mid_y(candidate) - rect_y) for candidate in anchor_rects)
+            if required and gap > max_gap:
+                missing_required += 1
+                continue
+            if not required and gap > max_gap:
+                missing_optional += 1
+                continue
+            gaps.append(gap)
+        if missing_required:
+            continue
+        score = (
+            missing_optional,
+            max(gaps or [999.0]),
+            sum(gaps or [999.0]),
+            -rect_x,
+        )
+        if best_score is None or score < best_score:
+            best_rect = rect
+            best_score = score
+    return best_rect
+
+
 def _tar_apply_pdf_navigation(
     output_pdf: Path,
     *,
@@ -10359,6 +10529,8 @@ def _tar_apply_pdf_navigation(
     comparison_chart_links: list[dict] | None = None,
     comparison_section_start_page_index: int | None = None,
     exception_chart_links: list[dict] | None = None,
+    exception_grade_links: list[dict] | None = None,
+    intro_page_count: int | None = None,
 ) -> None:
     try:
         import fitz  # type: ignore
@@ -10368,7 +10540,8 @@ def _tar_apply_pdf_navigation(
     nav_entries = [dict(entry) for entry in (plot_navigation or []) if isinstance(entry, Mapping)]
     comparison_links = [dict(entry) for entry in (comparison_chart_links or []) if isinstance(entry, Mapping)]
     chart_links = [dict(entry) for entry in (exception_chart_links or []) if isinstance(entry, Mapping)]
-    if not (nav_entries or comparison_links or chart_links):
+    intro_exception_links = [dict(entry) for entry in (exception_grade_links or []) if isinstance(entry, Mapping)]
+    if not (nav_entries or comparison_links or chart_links or intro_exception_links):
         return
 
     doc = fitz.open(str(Path(output_pdf).expanduser()))
@@ -10508,6 +10681,46 @@ def _tar_apply_pdf_navigation(
                     continue
                 for rect in rects:
                     _tar_insert_page_link(page, rect, target_page_index)
+
+        unresolved_intro_links = [dict(link) for link in intro_exception_links]
+        intro_page_limit = min(max(0, int(intro_page_count or 0)), int(doc.page_count or 0))
+        for page_index in range(intro_page_limit):
+            if not unresolved_intro_links:
+                break
+            page = doc.load_page(page_index)
+            search_cache: dict[str, list[Any]] = {}
+            used_rect_keys: set[tuple[float, float, float, float]] = set()
+            matched_indexes: list[int] = []
+            for link_index, link in enumerate(unresolved_intro_links):
+                destination = link.get("destination_page_index")
+                if destination is None:
+                    continue
+                try:
+                    target_page_index = int(destination)
+                except Exception:
+                    continue
+                if target_page_index < 0 or target_page_index >= int(doc.page_count or 0):
+                    continue
+                rect = _tar_find_intro_exception_grade_rect(
+                    page,
+                    link,
+                    search_cache=search_cache,
+                    excluded_rect_keys=used_rect_keys,
+                )
+                if rect is None:
+                    continue
+                _tar_insert_page_link(page, rect, target_page_index)
+                used_rect_keys.add(
+                    (
+                        float(getattr(rect, "x0", 0.0) or 0.0),
+                        float(getattr(rect, "y0", 0.0) or 0.0),
+                        float(getattr(rect, "x1", 0.0) or 0.0),
+                        float(getattr(rect, "y1", 0.0) or 0.0),
+                    )
+                )
+                matched_indexes.append(link_index)
+            for link_index in reversed(matched_indexes):
+                unresolved_intro_links.pop(link_index)
 
         doc.saveIncr()
     finally:
@@ -13220,14 +13433,30 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     )
     story.append(Spacer(1, 0.08 * inch))
     story.append(_portrait_paragraph("WATCH / FAIL Detail", styles["card_title"], rl))
+    exception_table_rows, exception_table_style_cmds, exception_grade_links = _tar_exec_exception_table_spec(ctx, exception_rows)
+    ctx["exception_grade_links"] = list(exception_grade_links)
     story.append(
         _portrait_box_table(
-            _tar_exec_exception_table_rows(ctx, exception_rows),
-            col_widths=[0.56 * inch, 1.18 * inch, 1.07 * inch, 0.66 * inch, 1.16 * inch, 0.58 * inch, 0.54 * inch, 0.51 * inch, 0.64 * inch],
+            exception_table_rows,
+            col_widths=[0.78 * inch, 1.18 * inch, 1.07 * inch, 0.66 * inch, 1.16 * inch, 0.58 * inch, 0.54 * inch, 0.93 * inch],
             styles=styles,
             rl=rl,
             repeat_rows=1,
             compact=True,
+            extra_style_commands=exception_table_style_cmds,
+            cell_style_overrides={
+                (row_index, len(_TAR_EXEC_EXCEPTION_HEADER) - 1): styles.get("small_link") or styles["small"]
+                for row_index, row in enumerate(exception_table_rows[1:], start=1)
+                if str(row[-1] or "").strip().upper() in {"WATCH", "FAIL"}
+                and any(
+                    str(link.get("serial_text") or "") == str(row[0] or "")
+                    and str(link.get("run_condition_text") or "") == str(row[1] or "")
+                    and str(link.get("sequence_text") or "") == str(row[2] or "")
+                    and str(link.get("parameter_text") or "") == str(row[3] or "")
+                    and str(link.get("grade_text") or "") == str(row[-1] or "")
+                    for link in exception_grade_links
+                )
+            },
         )
     )
 
@@ -14874,6 +15103,8 @@ def generate_test_data_auto_report(
                 comparison_chart_links=list(ctx.get("comparison_chart_links") or []),
                 comparison_section_start_page_index=(int(intro_pages) if comparison_pages else None),
                 exception_chart_links=list(ctx.get("exception_chart_links") or []),
+                exception_grade_links=list(ctx.get("exception_grade_links") or []),
+                intro_page_count=int(intro_pages),
             )
             timings["apply_pdf_navigation_seconds"] = round(time.perf_counter() - navigation_start, 3)
             total_pages = intro_pages + comparison_pages + plot_counts["plot_page_count"] + equation_pages + closing_pages

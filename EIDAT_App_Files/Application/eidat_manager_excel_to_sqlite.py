@@ -2011,8 +2011,6 @@ def _header_fuzzy_score(target: str, candidate: str) -> float:
         return 1.0
     if t in _TD_SHORT_EXACT_KEYS or c in _TD_SHORT_EXACT_KEYS:
         return 0.0
-    if t in c or c in t:
-        return 0.92
     return float(difflib.SequenceMatcher(a=t, b=c).ratio())
 
 
@@ -2038,6 +2036,7 @@ def _canonicalize_header(header: str, defs: list[dict[str, Any]], *, min_ratio: 
     raw_norm = _normalize_header(raw)
     if not raw_norm:
         return raw
+    raw_token_count = len(_normalize_header_tokens(raw))
 
     # Exact self-match before alias expansion.
     for item in defs:
@@ -2056,7 +2055,15 @@ def _canonicalize_header(header: str, defs: list[dict[str, Any]], *, min_ratio: 
     for item in defs:
         canon = str(item.get("name") or "").strip()
         aliases = [canon] + [str(v or "").strip() for v in (item.get("aliases") or []) if str(v or "").strip()]
-        score = max((_header_fuzzy_score(alias, raw) for alias in aliases), default=0.0)
+        eligible_aliases: list[str] = []
+        for alias in aliases:
+            alias_token_count = len(_normalize_header_tokens(alias))
+            if alias_token_count <= 1:
+                continue
+            if raw_token_count <= 1:
+                continue
+            eligible_aliases.append(alias)
+        score = max((_header_fuzzy_score(alias, raw) for alias in eligible_aliases), default=0.0)
         if score > best_score:
             best_score = float(score)
             best_name = canon

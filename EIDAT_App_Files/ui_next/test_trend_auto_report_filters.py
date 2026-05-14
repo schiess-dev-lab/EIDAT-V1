@@ -2605,6 +2605,61 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             finally:
                 result.close()
 
+    def test_apply_pdf_navigation_links_repeated_watch_grades_by_row_context(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "intro_exception_grade_links.pdf"
+            doc = fitz.open()
+            intro_page = doc.new_page()
+            intro_page.insert_text((72, 72), "WATCH")
+            intro_page.insert_text((72, 90), "FAIL")
+            intro_page.insert_text((72, 120), "SN-001")
+            intro_page.insert_text((140, 120), "Condition A")
+            intro_page.insert_text((300, 120), "Seq A")
+            intro_page.insert_text((390, 120), "Pressure")
+            intro_page.insert_text((520, 120), "WATCH")
+            intro_page.insert_text((72, 150), "SN-001")
+            intro_page.insert_text((140, 150), "Condition B")
+            intro_page.insert_text((300, 150), "Seq B")
+            intro_page.insert_text((390, 150), "Pressure")
+            intro_page.insert_text((520, 150), "WATCH")
+            doc.new_page()
+            doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[],
+                exception_grade_links=[
+                    {
+                        "serial_text": "SN-001",
+                        "run_condition_text": "Condition A",
+                        "sequence_text": "Seq A",
+                        "parameter_text": "Pressure",
+                        "grade_text": "WATCH",
+                        "destination_page_index": 1,
+                    },
+                    {
+                        "serial_text": "SN-001",
+                        "run_condition_text": "Condition B",
+                        "sequence_text": "Seq B",
+                        "parameter_text": "Pressure",
+                        "grade_text": "WATCH",
+                        "destination_page_index": 2,
+                    },
+                ],
+                intro_page_count=1,
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                links = result.load_page(0).get_links()
+                self.assertEqual(sorted(link.get("page") for link in links), [1, 2])
+                self.assertTrue(all(link.get("from").x0 > 500 for link in links))
+            finally:
+                result.close()
+
     def test_apply_pdf_navigation_adds_backlink_to_first_comparison_page(self) -> None:
         fitz = __import__("fitz")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2871,6 +2926,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for idx, item in enumerate(story)
             if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Initial / Final"
         )
+        serial_table = story[serial_table_idx]
         exception_table_idx = next(
             idx
             for idx, item in enumerate(story)
@@ -2888,8 +2944,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertLess(grading_idx, serial_table_idx)
         self.assertLess(serial_table_idx, exception_table_idx)
         self.assertLess(exec_idx, scope_idx)
+        self.assertIsInstance(serial_table, _FakeTable)
         self.assertIsInstance(exception_table, _FakeTable)
         self.assertAlmostEqual(sum(exception_table.colWidths or []), 6.9 * 72.0)
+        self.assertAlmostEqual((exception_table.colWidths or [])[0], (serial_table.colWidths or [])[0])
+        self.assertEqual(_table_text(exception_table)[0][-1], "Grade")
+        self.assertEqual(len(_table_text(exception_table)[0]), 8)
+        exception_style_cmds = [
+            command
+            for style in exception_table.table_styles
+            for command in getattr(style, "commands", [])
+        ]
+        self.assertIn(("BACKGROUND", (7, 1), (7, 1), "#fef3c7"), exception_style_cmds)
 
         self.assertFalse(
             any(
@@ -2913,6 +2979,98 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 for table in all_tables
             )
         )
+
+    def test_build_intro_story_exception_table_colors_and_links_grade_cells(self) -> None:
+        plot_navigation = tar._tar_build_plot_navigation(
+            [
+                {
+                    "section": "watch_nonpass_curves",
+                    "pair_id": "pair-1",
+                    "param": "Pressure",
+                    "page_number": 3,
+                }
+            ]
+        )
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            story = tar._tar_build_intro_story(
+                {
+                    "print_ctx": tar.PrintContext(
+                        printed_at="2026-04-12 09:00 MDT",
+                        printed_timezone="MDT",
+                        report_title="EIDAT Test Trend Data Analyze Auto Report",
+                        report_subtitle="Certification",
+                    ),
+                    "pair_specs": [{"pair_id": "pair-1", "param": "Pressure", "selection_fields": {"mode": "condition", "display_text": "Condition A"}}],
+                    "options": {},
+                    "overall_by_sn": {"SN-001": "WATCH"},
+                    "nonpass_findings": [],
+                    "pair_by_id": {},
+                    "hi": ["SN-001"],
+                    "params": ["Pressure"],
+                    "metric_stats": ["mean"],
+                    "include_metrics": False,
+                    "meta_note": "",
+                    "change_summary": "",
+                    "performance_plot_specs": [],
+                    "initial_overall_by_sn": {"SN-001": "PASS"},
+                    "final_overall_by_sn": {"SN-001": "WATCH"},
+                    "comparison_rows": [
+                        {
+                            "pair_id": "pair-1",
+                            "run_condition": "Condition A",
+                            "serial": "SN-001",
+                            "sequence_text": "Sequence A",
+                            "parameter": "Pressure",
+                            "units": "psi",
+                            "initial_atp_mean": 10.0,
+                            "final_atp_mean": 12.0,
+                            "initial_actual_mean": 9.0,
+                            "final_actual_mean": 11.0,
+                            "initial_delta": -1.0,
+                            "final_delta": -1.0,
+                            "initial_grade": "PASS",
+                            "final_grade": "FAIL",
+                            "initial_suppression_voltage_label": "All",
+                            "final_suppression_voltage_label": "5",
+                            "initial_valve_voltage_label": "All",
+                            "final_valve_voltage_label": "28",
+                            "regrade_applied": False,
+                        }
+                    ],
+                    "meta_by_sn": {"SN-001": {}},
+                    "watch_pair_ids": ["pair-1"],
+                    "runs": ["Run A"],
+                    "all_serials": ["SN-001"],
+                    "plot_navigation": plot_navigation,
+                    "quick_summary": {
+                        "lines": [],
+                        "initial_suppression_voltage": "All",
+                        "final_suppression_voltage": "5",
+                        "initial_valve_voltage": "All",
+                        "final_valve_voltage": "28",
+                        "p8_suppression_voltage": "5",
+                        "p8_valve_voltage": "28",
+                    },
+                }
+            )
+
+        exception_table = next(
+            item
+            for item in story
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Run Condition"
+        )
+        exception_style_cmds = [
+            command
+            for style in exception_table.table_styles
+            for command in getattr(style, "commands", [])
+        ]
+        self.assertIn(("BACKGROUND", (7, 1), (7, 1), "#fee2e2"), exception_style_cmds)
+        self.assertIn(("TEXTCOLOR", (7, 1), (7, 1), tar._TAR_EXEC_EXCEPTION_GRADE_TEXT_COLOR), exception_style_cmds)
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(

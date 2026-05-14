@@ -3384,11 +3384,44 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(serial_table[1][1], "Initial: FAILED\nFinal: WATCH")
         self.assertEqual(serial_table[0], ["SN", "Initial / Final", "Program", "Part #", "Rev", "P/W/F items"])
         self.assertEqual(serial_table[1][5], "PASS 1/2 (50%)\nWATCH 1/2 (50%)\nFAIL 0/2 (0%)")
+        self.assertEqual(
+            exception_table[0],
+            ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade"],
+        )
         self.assertEqual(exception_table[1][7], "WATCH")
-        self.assertTrue(str(exception_table[1][8]).startswith("Chart "))
         self.assertIn("Suppression Voltage: 100", str(exception_table[1][1]))
         self.assertIn("Seq 2", str(exception_table[1][2]))
+        self.assertEqual(len(exception_table[1]), 8)
         self.assertFalse(any(rows and str(rows[0][0]).startswith("Run Condition:") for rows in tables))
+
+    def test_exec_exception_table_spec_keeps_all_rows_without_additional_items(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        exception_rows = [
+            {
+                "serial": f"SN{index:03d}",
+                "run_condition": f"Condition {index}",
+                "sequence_text": f"Seq {index}",
+                "parameter": f"Pressure {index}",
+                "final_status": "WATCH" if index % 2 else "FAIL",
+                "official_grade": "WATCH" if index % 2 else "FAIL",
+                "official_baseline_mean": 10.0 + index,
+                "official_serial_mean": 9.5 + index,
+                "official_deviation_score": 1.0 + index,
+                "difference_pct": 2.0 + index,
+                "chart_target_page_index": None,
+            }
+            for index in range(1, 11)
+        ]
+
+        table_rows, style_cmds, grade_links = tar._tar_exec_exception_table_spec({}, exception_rows)
+
+        self.assertEqual(table_rows[0], tar._TAR_EXEC_EXCEPTION_HEADER)
+        self.assertEqual(len(table_rows), 11)
+        self.assertFalse(any(str(row[0]).startswith("Additional items") for row in table_rows[1:]))
+        self.assertEqual(style_cmds.count(("BACKGROUND", (7, 1), (7, 1), "#fef3c7")), 1)
+        self.assertEqual(style_cmds.count(("BACKGROUND", (7, 2), (7, 2), "#fee2e2")), 1)
+        self.assertEqual(grade_links, [])
 
     def test_plan_comparison_pages_pivots_by_serial_and_splits_by_run_blocks(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
