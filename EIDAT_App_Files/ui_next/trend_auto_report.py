@@ -2413,6 +2413,18 @@ def _tar_build_initial_plot_cohort_spec(
         full_trace_map_all,
         program_by_serial=program_by_serial,
     )
+    admitted_programs = _tar_unique_text_values(
+        [
+            program
+            for member in cohort_members
+            for program in (member.get("prepass_included_programs") or [])
+        ]
+    )
+    admitted_program_traces = _tar_program_trace_map(
+        full_trace_map_all,
+        program_by_serial=program_by_serial,
+        allowed_programs=admitted_programs,
+    ) if admitted_programs else dict(full_program_traces)
     visual_model = None
     if full_program_traces:
         visual_model = _tar_build_curve_model_for_program_traces(
@@ -2423,7 +2435,17 @@ def _tar_build_initial_plot_cohort_spec(
             degree=degree,
             normalize_x=normalize_x,
         )
-    cohort_model = visual_model if isinstance(visual_model, dict) else initial_scope_model
+    admitted_model = None
+    if admitted_program_traces:
+        admitted_model = _tar_build_curve_model_for_program_traces(
+            x_name=str(cohort_members[0].get("x_name") or ""),
+            units=str(cohort_members[0].get("units") or ""),
+            x_grid=x_grid,
+            traces_by_program=admitted_program_traces,
+            degree=degree,
+            normalize_x=normalize_x,
+        )
+    cohort_model = admitted_model if isinstance(admitted_model, dict) else (visual_model if isinstance(visual_model, dict) else initial_scope_model)
     run_mode_signature = str((cohort_members[0].get("consolidation_profile") or {}).get("run_mode_signature") or "").strip()
     base_condition_labels = _tar_unique_text_values(
         [
@@ -2479,8 +2501,12 @@ def _tar_build_initial_plot_cohort_spec(
         "x_name": str(cohort_model.get("x_name") or ""),
         "condition_label": condition_label,
         "base_condition_label": base_condition_label,
-        "suppression_voltage_label": "",
-        "valve_voltage_label": "",
+        "suppression_voltage_label": _tar_singleton_condition_value(
+            [str(member.get("suppression_voltage_label") or "").strip() for member in cohort_members]
+        ),
+        "valve_voltage_label": _tar_singleton_condition_value(
+            [str(member.get("valve_voltage_label") or "").strip() for member in cohort_members]
+        ),
         "selection_labels": list(selection_labels),
         "member_pair_ids": list(member_pair_ids),
         "model": {
@@ -2495,7 +2521,7 @@ def _tar_build_initial_plot_cohort_spec(
         "master_y": list(cohort_model.get("master_y") or []),
         "std_y": list(cohort_model.get("std_y") or []),
         "trace_curves": visual_trace_curves,
-        "visual_program_scope": "all_programs",
+        "visual_program_scope": "admitted_programs" if isinstance(admitted_model, dict) else "all_programs",
         "prepass_reference_program": prepass_reference_program,
         "prepass_included_programs": _tar_unique_text_values(prepass_included_programs),
         "prepass_excluded_programs": _tar_unique_text_values(prepass_excluded_programs),
@@ -2942,6 +2968,17 @@ def _tar_normalize_grade_token(grade: object) -> str:
     if normalized == "CERTIFIED":
         return "PASS"
     return normalized
+
+
+def _tar_grade_display_text(grade: object) -> str:
+    token = _tar_normalize_grade_token(grade)
+    if token == "FAIL":
+        return "REQUIRES EVAL"
+    if token == "NO_DATA":
+        return "NO_DATA"
+    if token:
+        return token
+    return str(grade or "").strip().upper()
 
 
 def _overall_cert_status(grades: list[str], *, ignore_no_data: bool = False, empty_status: str = "NO_DATA") -> str:
@@ -7262,6 +7299,79 @@ def _tar_metric_pair_legend_label(
     return str(spec.get("selection_label") or spec.get("run_title") or spec.get("run") or param_name).strip() or param_name
 
 
+def _tar_curve_legend_condition_text(value: object) -> str:
+    items: list[str] = []
+    for token in _tar_split_display_values(value, separators="|\n"):
+        text = _tar_condition_token_text(token)
+        if not text:
+            continue
+        normalized = _norm_key(text)
+        if normalized.startswith("suppressionvoltage") or normalized.startswith("valvevoltage"):
+            continue
+        items.append(text)
+    return " | ".join(_tar_unique_text_values(items))
+
+
+def _tar_curve_serial_legend_label(
+    ctx: Mapping[str, Any],
+    *,
+    serial: object,
+    grade: object,
+    selection_label: object = "",
+    fallback_label: object = "",
+) -> str:
+    serial_text = str(serial or "").strip()
+    serial_label = _tar_display_serial(ctx, serial_text) or serial_text
+    grade_label = str(grade or "NO_DATA").strip().upper() or "NO_DATA"
+    condition_text = _tar_curve_legend_condition_text(selection_label) or _tar_curve_legend_condition_text(fallback_label)
+    if condition_text:
+        return f"{serial_label} | {condition_text} ({grade_label})"
+    return f"{serial_label} ({grade_label})"
+
+
+def _tar_curve_family_legend_labels(
+    spec: Mapping[str, object] | None,
+    *,
+    mean_label: str,
+    band_label: str,
+    filter_state_override: Mapping[str, object] | None = None,
+) -> tuple[str, str]:
+    suppression_text, valve_text = _tar_plot_condition_filter_labels(spec, filter_state_override=filter_state_override)
+    suffix_parts: list[str] = []
+    if suppression_text:
+        suffix_parts.append(f"Suppression Voltage: {suppression_text}")
+    if valve_text:
+        suffix_parts.append(f"Valve Voltage: {valve_text}")
+    suffix = f" | {' | '.join(suffix_parts)}" if suffix_parts else ""
+    return f"{mean_label}{suffix}", f"{band_label}{suffix}"
+
+
+def _tar_curve_sigma_band_bounds(
+    master_y: Sequence[object] | None,
+    std_y: Sequence[object] | None,
+    *,
+    sigma_multiplier: float,
+) -> tuple[list[float], list[float]]:
+    lower: list[float] = []
+    upper: list[float] = []
+    multiplier = float(sigma_multiplier)
+    for mean_value, std_value in zip(master_y or [], std_y or []):
+        if (
+            isinstance(mean_value, (int, float))
+            and not math.isnan(float(mean_value))
+            and isinstance(std_value, (int, float))
+            and not math.isnan(float(std_value))
+        ):
+            mean_num = float(mean_value)
+            std_num = float(std_value)
+            lower.append(mean_num - (multiplier * std_num))
+            upper.append(mean_num + (multiplier * std_num))
+        else:
+            lower.append(float("nan"))
+            upper.append(float("nan"))
+    return lower, upper
+
+
 def _tar_context_run_condition_label(ctx: Mapping[str, Any], *, max_items: int = 3) -> str:
     options = ctx.get("options") or {}
     labels: list[object] = []
@@ -7370,8 +7480,8 @@ def _tar_pick_worst_grade(grades: list[object]) -> str:
 
 
 def _tar_stacked_grade_text(initial_grade: object, final_grade: object) -> str:
-    initial = str(initial_grade or "NO_DATA").strip().upper() or "NO_DATA"
-    final = str(final_grade or initial).strip().upper() or initial
+    initial = _tar_grade_display_text(initial_grade) or "NO_DATA"
+    final = _tar_grade_display_text(final_grade or initial) or initial
     return f"Initial: {initial}\nFinal: {final}"
 
 
@@ -7584,7 +7694,7 @@ def _tar_final_overall_status_from_rows(rows: list[Mapping[str, Any]] | None) ->
 def _tar_comparison_grade_text(initial_grade: object, final_grade: object, *, regrade_applied: bool) -> str:
     if regrade_applied:
         return _tar_stacked_grade_text(initial_grade, final_grade)
-    return str(initial_grade or "NO_DATA").strip().upper() or "NO_DATA"
+    return _tar_grade_display_text(initial_grade) or "NO_DATA"
 
 
 def _tar_selection_suppression_values_from_rows(
@@ -8575,10 +8685,71 @@ def _tar_metric_program_segments(
     return segments
 
 
+def _tar_metric_program_voltage_summary(
+    serials: list[str],
+    metric_rows: Sequence[Mapping[str, object]] | None,
+    meta_by_sn: Mapping[str, Mapping[str, object]] | None,
+) -> dict[str, dict[str, str]]:
+    serial_set = {str(serial or "").strip() for serial in (serials or []) if str(serial or "").strip()}
+    if not serial_set:
+        return {}
+    meta_lookup = meta_by_sn if isinstance(meta_by_sn, Mapping) else {}
+    voltage_by_program: dict[str, dict[str, list[str]]] = {}
+    for raw_row in metric_rows or []:
+        if not isinstance(raw_row, Mapping):
+            continue
+        serial = str(raw_row.get("serial") or "").strip()
+        if not serial or serial not in serial_set:
+            continue
+        row_meta = meta_lookup.get(serial) if isinstance(meta_lookup, Mapping) else {}
+        program = _td_display_program_title(raw_row.get("program_title")) or _td_display_program_title((row_meta or {}).get("program_title"))
+        if not program:
+            continue
+        suppression = _td_compact_filter_value(raw_row.get("suppression_voltage"))
+        valve = _td_compact_filter_value(raw_row.get("valve_voltage"))
+        program_entry = voltage_by_program.setdefault(program, {"suppression": [], "valve": []})
+        if suppression:
+            program_entry["suppression"].append(suppression)
+        if valve:
+            program_entry["valve"].append(valve)
+    summary: dict[str, dict[str, str]] = {}
+    for program, values in voltage_by_program.items():
+        suppression_values = _tar_unique_text_values(values.get("suppression") or [])
+        valve_values = _tar_unique_text_values(values.get("valve") or [])
+        if not suppression_values and not valve_values:
+            continue
+        summary[program] = {
+            "suppression": ", ".join(suppression_values),
+            "valve": ", ".join(valve_values),
+        }
+    return summary
+
+
+def _tar_metric_program_segment_label(
+    program: object,
+    *,
+    program_voltage_summary: Mapping[str, Mapping[str, object]] | None = None,
+) -> str:
+    label = str(program or "").strip() or "Unknown Program"
+    summary = dict((program_voltage_summary or {}).get(label) or {})
+    parts: list[str] = []
+    suppression = str(summary.get("suppression") or "").strip()
+    valve = str(summary.get("valve") or "").strip()
+    if suppression:
+        parts.append(f"Supp: {suppression}")
+    if valve:
+        parts.append(f"Valve: {valve}")
+    if not parts:
+        return label
+    return f"{label}\n{' | '.join(parts)}"
+
+
 def _tar_apply_metric_program_segments(
     axes: Any,
     serials: list[str],
     meta_by_sn: Mapping[str, Mapping[str, object]] | None,
+    *,
+    program_voltage_summary: Mapping[str, Mapping[str, object]] | None = None,
 ) -> None:
     if axes is None or not serials:
         return
@@ -8617,7 +8788,10 @@ def _tar_apply_metric_program_segments(
             )
         except Exception:
             continue
-        label = str(segment.get("program") or "Unknown Program")
+        label = _tar_metric_program_segment_label(
+            segment.get("program"),
+            program_voltage_summary=program_voltage_summary,
+        )
         span = end - start + 1
         try:
             axes.text(
@@ -8651,6 +8825,7 @@ def _tar_apply_metric_axis_format(
     *,
     serials: list[str],
     meta_by_sn: Mapping[str, Mapping[str, object]] | None,
+    metric_rows: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     if axes is None:
         return
@@ -8686,7 +8861,12 @@ def _tar_apply_metric_axis_format(
         axes.grid(True, axis="y", alpha=0.25)
     except Exception:
         pass
-    _tar_apply_metric_program_segments(axes, list(serials or []), meta_by_sn)
+    _tar_apply_metric_program_segments(
+        axes,
+        list(serials or []),
+        meta_by_sn,
+        program_voltage_summary=_tar_metric_program_voltage_summary(serials, metric_rows, meta_by_sn),
+    )
 
 
 def _tar_filter_summary_line(ctx: Mapping[str, Any], key: str, label: str) -> str:
@@ -9318,7 +9498,7 @@ def _tar_outcome_mix_text(rows: list[Mapping[str, Any]] | None) -> str:
         [
             f"PASS {counts['PASS']}/{evaluable_total} ({_tar_percent_text(counts['PASS'], evaluable_total)})",
             f"WATCH {counts['WATCH']}/{evaluable_total} ({_tar_percent_text(counts['WATCH'], evaluable_total)})",
-            f"FAIL {counts['FAIL']}/{evaluable_total} ({_tar_percent_text(counts['FAIL'], evaluable_total)})",
+            f"REQUIRES EVAL {counts['FAIL']}/{evaluable_total} ({_tar_percent_text(counts['FAIL'], evaluable_total)})",
         ]
     )
 
@@ -9391,11 +9571,11 @@ def _tar_exec_scope_table_rows(
             "Graded items",
             (
                 f"PASS {grade_counts['PASS']} | WATCH {grade_counts['WATCH']} | "
-                f"FAIL {grade_counts['FAIL']} | LIMITED {grade_counts['LIMITED']}"
+                f"REQUIRES EVAL {grade_counts['FAIL']} | LIMITED {grade_counts['LIMITED']}"
             ),
         ],
         [
-            "Linked watch/fail charts",
+            "Linked watch/requires-eval charts",
             f"{len(linked_rows)} item link(s) across {len(linked_pages)} chart page(s)",
         ],
     ]
@@ -9421,7 +9601,7 @@ def _tar_exec_grading_table_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             (
                 f"PASS if score <= {_fmt_num(z_pass, sig=4)} | "
                 f"WATCH if {_fmt_num(z_pass, sig=4)} < score <= {_fmt_num(z_watch, sig=4)} | "
-                f"FAIL if score > {_fmt_num(z_watch, sig=4)}"
+                f"Requires Eval if score > {_fmt_num(z_watch, sig=4)}"
             ),
         ],
         [
@@ -9435,7 +9615,7 @@ def _tar_exec_grading_table_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             (
                 "PASS only if Deviation Score is PASS and Max Band is one sigma | "
                 "WATCH if Deviation Score is WATCH or Max Band is 2 sigma or 3 sigma | "
-                "FAIL if Deviation Score is FAIL or Max Band exceeds 3 sigma"
+                "Requires Eval if Deviation Score is Requires Eval or Max Band exceeds 3 sigma"
             ),
         ],
     ]
@@ -9483,7 +9663,7 @@ def _tar_exec_exception_table_spec(
         return (
             [
                 _TAR_EXEC_EXCEPTION_HEADER,
-                ["-", "No WATCH or FAIL items were produced for the selected certification scope.", "", "", "", "", "", ""],
+                ["-", "No WATCH or REQUIRES EVAL items were produced for the selected certification scope.", "", "", "", "", "", ""],
             ],
             [],
             [],
@@ -9497,7 +9677,8 @@ def _tar_exec_exception_table_spec(
         run_condition_text = _tar_run_condition_bullet_text(row)
         sequence_text = _tar_sequence_bullet_text(row) or str(row.get("sequence_text") or "")
         parameter_text = str(row.get("parameter") or "")
-        grade_text = str(row.get("final_status") or row.get("official_grade") or "").strip().upper()
+        grade_token = _tar_normalize_grade_token(row.get("final_status") or row.get("official_grade") or "")
+        grade_text = _tar_grade_display_text(grade_token)
         table_rows.append(
             [
                 serial_text,
@@ -9510,7 +9691,7 @@ def _tar_exec_exception_table_spec(
                 grade_text,
             ]
         )
-        fill_color = _tar_comparison_grade_fill_color(grade_text)
+        fill_color = _tar_comparison_grade_fill_color(grade_token)
         if fill_color:
             style_cmds.append(("BACKGROUND", (grade_col_index, row_index), (grade_col_index, row_index), fill_color))
         if row.get("chart_target_page_index") is not None:
@@ -9523,6 +9704,7 @@ def _tar_exec_exception_table_spec(
                     "run_condition_text": run_condition_text,
                     "sequence_text": sequence_text,
                     "parameter_text": parameter_text,
+                    "grade_token": grade_token,
                     "grade_text": grade_text,
                     "destination_page_index": int(row.get("chart_target_page_index")),
                     "target_section": str(row.get("chart_target_section") or "").strip(),
@@ -9578,19 +9760,19 @@ def _tar_pass_fail_synopsis_lines(
         ),
         (
             "Final graded items: "
-            f"PASS {counts['PASS']} | WATCH {counts['WATCH']} | FAIL {counts['FAIL']} | "
+            f"PASS {counts['PASS']} | WATCH {counts['WATCH']} | REQUIRES EVAL {counts['FAIL']} | "
             f"Evaluable {evaluable_total}"
         ),
         (
-            "Watch/fail detail items: "
-            f"WATCH {counts['WATCH']} | FAIL {counts['FAIL']} | TOTAL {watch_fail_total}"
+            "Watch/requires-eval detail items: "
+            f"WATCH {counts['WATCH']} | REQUIRES EVAL {counts['FAIL']} | TOTAL {watch_fail_total}"
         ),
         (
             "Affected scope: "
             f"{len(affected_serials)} serial(s) | {len(affected_runs)} run condition(s) | "
             f"{len(affected_params)} parameter(s)"
         ),
-        f"Linked watch/fail charts: {len(linked_rows)} item link(s) across {len(linked_pages)} plot page(s)",
+        f"Linked watch/requires-eval charts: {len(linked_rows)} item link(s) across {len(linked_pages)} plot page(s)",
     ]
     if counts["LIMITED"] or counts["NO_DATA"]:
         lines.append(f"Non-evaluable items: LIMITED {counts['LIMITED']} | NO DATA {counts['NO_DATA']}")
@@ -10671,9 +10853,10 @@ def _tar_find_intro_exception_grade_rect(
 ) -> Any | None:
     if not isinstance(link, Mapping):
         return None
-    grade_text = str(link.get("grade_text") or "").strip().upper()
-    if grade_text not in {"WATCH", "FAIL"}:
+    grade_token = _tar_normalize_grade_token(link.get("grade_token") or link.get("grade_text"))
+    if grade_token not in {"WATCH", "FAIL"}:
         return None
+    grade_text = _tar_grade_display_text(grade_token)
 
     def _cached_search(query: object) -> list[Any]:
         text = str(query or "").strip()
@@ -10688,34 +10871,44 @@ def _tar_find_intro_exception_grade_rect(
 
     page_rect = getattr(page, "rect", None)
     page_width = float(getattr(page_rect, "width", 0.0) or 0.0)
-    candidate_rects = [
-        rect
-        for rect in _cached_search(grade_text)
-        if (
-            excluded_rect_keys is None
-            or (
+    grade_queries = [grade_text]
+    if " " in grade_text:
+        grade_queries.extend([part for part in grade_text.split() if part])
+    seen_rects: set[tuple[float, float, float, float]] = set()
+    candidate_rects = []
+    for query in grade_queries:
+        for rect in _cached_search(query):
+            rect_key = (
                 float(getattr(rect, "x0", 0.0) or 0.0),
                 float(getattr(rect, "y0", 0.0) or 0.0),
                 float(getattr(rect, "x1", 0.0) or 0.0),
                 float(getattr(rect, "y1", 0.0) or 0.0),
-            ) not in excluded_rect_keys
-        )
-        if (not page_width or _tar_rect_mid_x(rect) >= page_width * 0.55)
-    ]
+            )
+            if rect_key in seen_rects:
+                continue
+            if excluded_rect_keys is not None and rect_key in excluded_rect_keys:
+                continue
+            if page_width and _tar_rect_mid_x(rect) < page_width * 0.55:
+                continue
+            seen_rects.add(rect_key)
+            candidate_rects.append(rect)
     if not candidate_rects:
-        candidate_rects = [
-            rect
-            for rect in _cached_search(grade_text)
-            if (
-                excluded_rect_keys is None
-                or (
+        candidate_rects = []
+        seen_rects.clear()
+        for query in grade_queries:
+            for rect in _cached_search(query):
+                rect_key = (
                     float(getattr(rect, "x0", 0.0) or 0.0),
                     float(getattr(rect, "y0", 0.0) or 0.0),
                     float(getattr(rect, "x1", 0.0) or 0.0),
                     float(getattr(rect, "y1", 0.0) or 0.0),
-                ) not in excluded_rect_keys
-            )
-        ]
+                )
+                if rect_key in seen_rects:
+                    continue
+                if excluded_rect_keys is not None and rect_key in excluded_rect_keys:
+                    continue
+                seen_rects.add(rect_key)
+                candidate_rects.append(rect)
     if not candidate_rects:
         return None
 
@@ -12299,7 +12492,7 @@ def _tar_analyze_curve_groups(
                             watch = True
                     if watch:
                         initial_watch_items.append({**row, "grade": grade, "z": deviation_score, "max_pct": (dev or {}).get("max_pct")})
-        cohort_model = visual_initial_model if isinstance(visual_initial_model, dict) else initial_model
+        cohort_model = initial_model if isinstance(initial_model, dict) else visual_initial_model
         cohort_trace_curves = visual_trace_curves if visual_trace_curves else trace_curves
         if isinstance(cohort_model, dict):
             initial_cohort_specs.append(
@@ -12313,8 +12506,12 @@ def _tar_analyze_curve_groups(
                     "x_name": str(cohort_model.get("x_name") or ""),
                     "condition_label": str(members[0].get("condition_label") or ""),
                     "base_condition_label": str(members[0].get("base_condition_label") or ""),
-                    "suppression_voltage_label": "",
-                    "valve_voltage_label": "",
+                    "suppression_voltage_label": _tar_singleton_condition_value(
+                        [str(spec.get("suppression_voltage_label") or "").strip() for spec in members]
+                    ),
+                    "valve_voltage_label": _tar_singleton_condition_value(
+                        [str(spec.get("valve_voltage_label") or "").strip() for spec in members]
+                    ),
                     "selection_labels": [str(spec.get("selection_label") or "") for spec in members if str(spec.get("selection_label") or "").strip()],
                     "member_pair_ids": [str(spec.get("pair_id") or "") for spec in members if str(spec.get("pair_id") or "").strip()],
                     "model": {
@@ -12329,7 +12526,7 @@ def _tar_analyze_curve_groups(
                     "master_y": list(cohort_model.get("master_y") or []),
                     "std_y": list(cohort_model.get("std_y") or []),
                     "trace_curves": cohort_trace_curves,
-                    "visual_program_scope": "all_programs",
+                    "visual_program_scope": "admitted_programs" if isinstance(initial_model, dict) else "all_programs",
                     "prepass_reference_program": reference_program,
                     "prepass_included_programs": list(included_programs),
                     "prepass_excluded_programs": list(excluded_programs),
@@ -13755,7 +13952,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         _portrait_paragraph(
             f"A row passes only when the Deviation Score is PASS at or below {_fmt_num(z_pass, sig=4)} and Max Band stays within one sigma. "
             f"It becomes WATCH when the Deviation Score lands between {_fmt_num(z_pass, sig=4)} and {_fmt_num(z_watch, sig=4)} or when Max Band reaches 2 sigma or 3 sigma. "
-            f"It fails when the Deviation Score exceeds {_fmt_num(z_watch, sig=4)} or when Max Band exceeds 3 sigma. "
+            f"It requires eval when the Deviation Score exceeds {_fmt_num(z_watch, sig=4)} or when Max Band exceeds 3 sigma. "
             "If an exact-condition regrade exists, that regrade replaces the initial selected-pool result as the official score, Max Band, and grade shown here.",
             styles["body"],
             rl,
@@ -13799,7 +13996,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
     story.append(Spacer(1, 0.08 * inch))
-    story.append(_portrait_paragraph("WATCH / FAIL Detail", styles["card_title"], rl))
+    story.append(_portrait_paragraph("Watch Items Table", styles["card_title"], rl))
     exception_table_rows, exception_table_style_cmds, exception_grade_links = _tar_exec_exception_table_spec(ctx, exception_rows)
     ctx["exception_grade_links"] = list(exception_grade_links)
     story.append(
@@ -13814,13 +14011,13 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             cell_style_overrides={
                 (row_index, len(_TAR_EXEC_EXCEPTION_HEADER) - 1): styles.get("small_link") or styles["small"]
                 for row_index, row in enumerate(exception_table_rows[1:], start=1)
-                if str(row[-1] or "").strip().upper() in {"WATCH", "FAIL"}
+                if _tar_normalize_grade_token(row[-1]) in {"WATCH", "FAIL"}
                 and any(
                     str(link.get("serial_text") or "") == str(row[0] or "")
                     and str(link.get("run_condition_text") or "") == str(row[1] or "")
                     and str(link.get("sequence_text") or "") == str(row[2] or "")
                     and str(link.get("parameter_text") or "") == str(row[3] or "")
-                    and str(link.get("grade_text") or "") == str(row[-1] or "")
+                    and _tar_normalize_grade_token(link.get("grade_token") or link.get("grade_text")) == _tar_normalize_grade_token(row[-1])
                     for link in exception_grade_links
                 )
             },
@@ -13983,6 +14180,7 @@ def _tar_render_metric_cohort_page(
 
     family_values: list[float] = []
     plotted: list[tuple[dict, list[tuple[float, float, str]], dict[str, Any]]] = []
+    metric_rows_for_labels: list[dict[str, object]] = []
     for member_index, pair_id in enumerate(cohort_spec.get("member_pair_ids") or []):
         pair_spec = pair_by_id.get(str(pair_id or "").strip()) or {}
         if not pair_spec:
@@ -14001,6 +14199,7 @@ def _tar_render_metric_cohort_page(
             value = _safe_float(row.get("value_num"))
             if not serial or serial not in serial_index or value is None or not math.isfinite(float(value)):
                 continue
+            metric_rows_for_labels.append(dict(row))
             raw_points.append((serial, float(value)))
         if not raw_points:
             vmap = _tar_metric_map_for_pair(
@@ -14073,7 +14272,13 @@ def _tar_render_metric_cohort_page(
             )
     if show_family_overlay and family_values:
         ax.axhline(float(statistics.mean(family_values)), color="#0f172a", linestyle="--", linewidth=1.2, alpha=0.70, label=family_mean_label)
-    _tar_apply_metric_axis_format(fig, ax, serials=serials, meta_by_sn=(ctx.get("meta_by_sn") or {}))
+    _tar_apply_metric_axis_format(
+        fig,
+        ax,
+        serials=serials,
+        meta_by_sn=(ctx.get("meta_by_sn") or {}),
+        metric_rows=metric_rows_for_labels,
+    )
     try:
         handles, labels = ax.get_legend_handles_labels()
         uniq: dict[str, Any] = {}
@@ -14138,7 +14343,12 @@ def _tar_render_curve_cohort_page(
     )
     plot_context_lines = _tar_plot_condition_header_lines(ctx, cohort_spec)
     full_width_layout = str(section_key or "").strip() == "run_condition_curve_overlays"
-    show_family_overlay = _tar_show_pooled_family_overlay(cohort_spec)
+    show_family_overlay = True
+    resolved_family_label, resolved_band_label = _tar_curve_family_legend_labels(
+        cohort_spec,
+        mean_label=str(family_label or "").strip() or "In-family, graded mean",
+        band_label=str(band_label or "").strip() or "In-family, graded +/-2 sigma",
+    )
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
@@ -14164,11 +14374,38 @@ def _tar_render_curve_cohort_page(
         if y_curve:
             ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.09, color="#94a3b8")
     if show_family_overlay:
-        ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label=family_label)
+        ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label=resolved_family_label)
         try:
-            band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-            band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-            ax.fill_between(x_grid, band_lo, band_hi, color="#93c5fd", alpha=0.22 if metric_prefix == "initial" else 0.18, label=band_label)
+            band_lo = [
+                a - (2.0 * b)
+                if (
+                    isinstance(a, (int, float))
+                    and not math.isnan(float(a))
+                    and isinstance(b, (int, float))
+                    and not math.isnan(float(b))
+                )
+                else float("nan")
+                for a, b in zip(master_y, std_y)
+            ]
+            band_hi = [
+                a + (2.0 * b)
+                if (
+                    isinstance(a, (int, float))
+                    and not math.isnan(float(a))
+                    and isinstance(b, (int, float))
+                    and not math.isnan(float(b))
+                )
+                else float("nan")
+                for a, b in zip(master_y, std_y)
+            ]
+            ax.fill_between(
+                x_grid,
+                band_lo,
+                band_hi,
+                color="#93c5fd",
+                alpha=0.22 if metric_prefix == "initial" else 0.18,
+                label=resolved_band_label,
+            )
         except Exception:
             pass
 
@@ -14197,7 +14434,13 @@ def _tar_render_curve_cohort_page(
         highlighted_trace_index += 1
         color = str(style.get("color") or "#2563eb")
         serial_label = _tar_display_serial(ctx, serial) or serial
-        label = f"{serial_label} | {selection_label} ({grade})" if selection_label else f"{serial_label} ({grade})"
+        label = _tar_curve_serial_legend_label(
+            ctx,
+            serial=serial,
+            grade=grade,
+            selection_label=selection_label,
+            fallback_label=run_condition_label,
+        )
         ax.plot(
             x_grid,
             y_curve,
@@ -14281,6 +14524,36 @@ def _tar_render_watch_curve_page(
         run_by_name=(ctx.get("run_by_name") or {}),
     )
     plot_context_lines = _tar_plot_condition_header_lines(ctx, pair_spec)
+    resolved_family_label, resolved_band_1sigma_label = _tar_curve_family_legend_labels(
+        pair_spec,
+        mean_label="In-family, graded mean",
+        band_label="In-family, graded +/-1 sigma",
+        filter_state_override=(
+            pair_spec.get("filter_state_override")
+            if isinstance(pair_spec.get("filter_state_override"), Mapping)
+            else None
+        ),
+    )
+    _, resolved_band_2sigma_label = _tar_curve_family_legend_labels(
+        pair_spec,
+        mean_label="In-family, graded mean",
+        band_label="In-family, graded +/-2 sigma",
+        filter_state_override=(
+            pair_spec.get("filter_state_override")
+            if isinstance(pair_spec.get("filter_state_override"), Mapping)
+            else None
+        ),
+    )
+    _, resolved_band_3sigma_label = _tar_curve_family_legend_labels(
+        pair_spec,
+        mean_label="In-family, graded mean",
+        band_label="In-family, graded +/-3 sigma",
+        filter_state_override=(
+            pair_spec.get("filter_state_override")
+            if isinstance(pair_spec.get("filter_state_override"), Mapping)
+            else None
+        ),
+    )
     fig, ax = _create_landscape_plot_page(
         print_ctx=ctx["print_ctx"],
         page_number=page_number,
@@ -14288,11 +14561,8 @@ def _tar_render_watch_curve_page(
         section_subtitle="",
         plot_context_lines=plot_context_lines,
     )
-    ax.set_position([0.06, 0.09, 0.66, 0.70])
-    ax_side = fig.add_axes([0.76, 0.11, 0.20, 0.66])
-    ax_side.axis("off")
+    ax.set_position([0.06, 0.09, 0.88, 0.70])
     units = _tar_pair_units_label(pair_spec)
-    run_title = str(pair_spec.get("run_title") or run_name).strip() or run_name
     _tar_set_plot_parameter_title(ax, param_name)
     ax.set_xlabel(x_name)
     ax.set_ylabel(f"{param_name} ({units})" if units else param_name)
@@ -14301,15 +14571,17 @@ def _tar_render_watch_curve_page(
             continue
         if y_curve:
             ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.08, color="#94a3b8")
-    ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label="Family mean")
+    ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label=resolved_family_label)
     try:
-        band_lo = [a - b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-        band_hi = [a + b if (isinstance(a, (int, float)) and not math.isnan(float(a)) and isinstance(b, (int, float)) and not math.isnan(float(b))) else float("nan") for a, b in zip(master_y, std_y)]
-        ax.fill_between(x_grid, band_lo, band_hi, color="#fed7aa", alpha=0.18, label="Family +/-1 sigma")
+        band_3sigma_lo, band_3sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=3.0)
+        band_2sigma_lo, band_2sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=2.0)
+        band_1sigma_lo, band_1sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=1.0)
+        ax.fill_between(x_grid, band_3sigma_lo, band_3sigma_hi, color="#fca5a5", alpha=0.10, label=resolved_band_3sigma_label)
+        ax.fill_between(x_grid, band_2sigma_lo, band_2sigma_hi, color="#fdba74", alpha=0.14, label=resolved_band_2sigma_label)
+        ax.fill_between(x_grid, band_1sigma_lo, band_1sigma_hi, color="#fed7aa", alpha=0.18, label=resolved_band_1sigma_label)
     except Exception:
         pass
     palette = _tar_build_highlight_palette(ctx.get("colors"))
-    note_lines: list[str] = []
     for idx, serial in enumerate(focus_serials):
         y_curve = y_resampled_by_sn.get(serial)
         if not y_curve:
@@ -14324,20 +14596,14 @@ def _tar_render_watch_curve_page(
             linewidth=1.9,
             linestyle=str(style.get("linestyle") or "-"),
             color=color,
-            label=f"{serial_label} ({grade})",
+            label=_tar_curve_serial_legend_label(
+                ctx,
+                serial=serial,
+                grade=grade,
+                selection_label=pair_spec.get("selection_label"),
+                fallback_label=run_condition_label,
+            ),
         )
-        finding = finding_by_pair_serial.get((pair_id, serial)) or {}
-        note_lines.append(f"{serial_label} ({grade})")
-        note_lines.append(f"Max %: {_fmt_num(finding.get('final_max_pct'))}")
-        note_lines.append(f"RMS %: {_fmt_num(finding.get('final_rms_pct'))}")
-        note_lines.append(f"score: {_fmt_num(finding.get('final_z'), sig=4)}")
-        if bool(finding.get("regrade_applied")):
-            note_lines.append(
-                "Final pass: "
-                f"Supp {str(finding.get('regrade_suppression_voltage_label') or '').strip() or '(unknown)'} | "
-                f"Valve {str(finding.get('regrade_valve_voltage_label') or '').strip() or '(unknown)'}"
-            )
-        note_lines.append("")
     ax.grid(True, alpha=0.25)
     try:
         handles, labels = ax.get_legend_handles_labels()
@@ -14349,7 +14615,6 @@ def _tar_render_watch_curve_page(
             ax.legend(list(uniq.values()), list(uniq.keys()), fontsize=8, loc="best")
     except Exception:
         pass
-    ax_side.text(0.0, 1.0, "\n".join(note_lines[:24]), va="top", ha="left", fontsize=8, color="#0f172a")
     pdf.savefig(fig)
     plt.close(fig)
     return {
@@ -14846,9 +15111,9 @@ def _tar_render_plot_sections(
                 ),
                 grade_map_by_pair_serial=(ctx.get("initial_grade_map_by_pair_serial") or {}),
                 metric_prefix="initial",
-                family_label="All-program visual mean",
-                band_label="All-program visual +/-1 sigma",
-                equation_label="All-program visual equation",
+                family_label="In-family, graded mean",
+                band_label="In-family, graded +/-2 sigma",
+                equation_label="In-family, graded equation",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -14912,9 +15177,9 @@ def _tar_render_plot_sections(
                 ),
                 grade_map_by_pair_serial=(ctx.get("final_grade_map_by_pair_serial") or {}),
                 metric_prefix="final",
-                family_label="Official exact-condition graded mean",
-                band_label="Official exact-condition +/-1 sigma",
-                equation_label="Official exact-condition equation",
+                family_label="In-family, graded mean",
+                band_label="In-family, graded +/-2 sigma",
+                equation_label="In-family, graded equation",
             )
             if plot_spec:
                 plot_specs.append(plot_spec)
@@ -15075,12 +15340,6 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
     inch = rl["inch"]
 
     overall_by_sn = ctx.get("overall_by_sn") or {}
-    nonpass_by_sn: dict[str, list[dict]] = {}
-    for row in (ctx.get("nonpass_findings") or []):
-        serial = str(row.get("serial") or "").strip()
-        if serial:
-            nonpass_by_sn.setdefault(serial, []).append(row)
-
     status_counts = {
         "CERTIFIED": sum(1 for status in overall_by_sn.values() if status == "CERTIFIED"),
         "WATCH": sum(1 for status in overall_by_sn.values() if status == "WATCH"),
@@ -15136,71 +15395,6 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
             rl=rl,
         )
     )
-    story.append(Spacer(1, 0.10 * inch))
-    outcome_rows = [
-        [
-            _tar_display_serial(ctx, serial) or serial,
-            str(overall_by_sn.get(serial) or "").strip(),
-            str(len(nonpass_by_sn.get(serial) or [])),
-            _tar_meta(ctx, serial, "program_title"),
-            _tar_meta(ctx, serial, "acceptance_test_plan_number"),
-        ]
-        for serial in (ctx.get("hi") or [])
-    ]
-    story.append(
-        _portrait_box_table(
-            [["Serial", "Overall", "Watch/Fail Findings", "Program", "ATP"], *outcome_rows],
-            col_widths=[1.00 * inch, 1.00 * inch, 1.35 * inch, 2.20 * inch, 1.45 * inch],
-            styles=styles,
-            rl=rl,
-            repeat_rows=1,
-            compact=True,
-        )
-    )
-    nonpass_findings = list(ctx.get("nonpass_findings") or [])
-    if nonpass_findings:
-        exception_rows = [
-            dict(row)
-            for row in (ctx.get("comparison_exception_rows") or _tar_build_exec_exception_rows(ctx))
-            if isinstance(row, Mapping)
-        ]
-        chart_by_pair_serial, chart_by_detail = _tar_exception_chart_label_maps(exception_rows)
-        story.append(Spacer(1, 0.12 * inch))
-        review_rows = [
-            [
-                _tar_display_serial(ctx, row.get("serial")) or str(row.get("serial") or "").strip(),
-                str(row.get("run") or ""),
-                str(row.get("param") or ""),
-                str(row.get("grade") or ""),
-                _fmt_num(row.get("max_pct")),
-                _fmt_num(row.get("z"), sig=4),
-                _tar_chart_label_for_nonpass_row(
-                    row,
-                    by_pair_serial=chart_by_pair_serial,
-                    by_detail=chart_by_detail,
-                ),
-            ]
-            for row in nonpass_findings[:18]
-        ]
-        story.append(
-            _portrait_box_table(
-                [["Serial", "Run", "Parameter", "Grade", "Max %", "Score", "Chart"], *review_rows],
-                col_widths=[0.84 * inch, 1.20 * inch, 1.30 * inch, 0.66 * inch, 0.72 * inch, 0.68 * inch, 0.80 * inch],
-                styles=styles,
-                rl=rl,
-                repeat_rows=1,
-                compact=True,
-            )
-        )
-        if len(nonpass_findings) > len(review_rows):
-            story.append(Spacer(1, 0.08 * inch))
-            story.append(
-                _portrait_paragraph(
-                    f"Additional WATCH / FAIL findings not shown in the closing table: {len(nonpass_findings) - len(review_rows)}",
-                    styles["small"],
-                    rl,
-                )
-            )
     return story
 
 

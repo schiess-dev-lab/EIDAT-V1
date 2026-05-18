@@ -122,6 +122,7 @@ class _FakePlotAxes:
         self.title: tuple[tuple[object, ...], dict[str, object]] | None = None
         self.scatter_calls: list[tuple[list[float], list[float], dict[str, object]]] = []
         self.plot_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.fill_between_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
         self.axhline_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
         self.axvline_calls: list[tuple[float, dict[str, object]]] = []
         self.xticks: list[float] = []
@@ -169,6 +170,13 @@ class _FakePlotAxes:
         self._record_legend(handle, payload)
         return [handle]
 
+    def fill_between(self, *args: object, **kwargs: object) -> _FakePlotHandle:
+        payload = dict(kwargs)
+        self.fill_between_calls.append((args, payload))
+        handle = _FakePlotHandle("fill_between", payload)
+        self._record_legend(handle, payload)
+        return handle
+
     def axhline(self, *args: object, **kwargs: object) -> _FakePlotHandle:
         payload = dict(kwargs)
         self.axhline_calls.append((args, payload))
@@ -194,6 +202,9 @@ class _FakePlotAxes:
     def grid(self, *args: object, **kwargs: object) -> None:
         self.grid_calls.append((args, dict(kwargs)))
 
+    def axis(self, *args: object, **kwargs: object) -> None:
+        return None
+
     def add_patch(self, patch: object) -> None:
         self.patches.append(patch)
 
@@ -210,6 +221,11 @@ class _FakePlotAxes:
 class _FakePlotFigure:
     def __init__(self) -> None:
         self.transFigure = "transFigure"
+        self.add_axes_calls: list[list[float]] = []
+
+    def add_axes(self, bounds: list[float]) -> _FakePlotAxes:
+        self.add_axes_calls.append(list(bounds))
+        return _FakePlotAxes()
 
 
 class _FakeHeaderPatch:
@@ -1375,6 +1391,113 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             ["Pulse Mode Condition"],
         )
 
+    def test_analyze_curve_groups_prefers_admitted_initial_curve_overlay_but_keeps_visual_traces(self) -> None:
+        row_specs = [
+            {
+                "pair_id": "pair-1",
+                "selection_id": "sel-1",
+                "run": "Run A",
+                "selection_label": "Condition A",
+                "condition_label": "Condition A",
+                "base_condition_label": "Condition A",
+                "param": "Pressure",
+                "units": "psi",
+                "x_name": "Time",
+                "series": [
+                    tar.CurveSeries(serial="SN-001", x=[0.0, 1.0], y=[2.0, 2.0], observation_id="obs-1", run_name="Run A"),
+                    tar.CurveSeries(serial="SN-010", x=[0.0, 1.0], y=[10.0, 10.0], observation_id="obs-2", run_name="Run A"),
+                ],
+                "metric_mean_by_serial": {"SN-001": 2.0, "SN-010": 10.0},
+                "condition_context_rows": [{"condition_label": "Condition A"}],
+            }
+        ]
+
+        def _fake_program_model(
+            *,
+            x_name: str,
+            units: str,
+            x_grid: list[float],
+            traces_by_program: dict[str, list[float]],
+            degree: int,
+            normalize_x: bool,
+        ) -> dict[str, object]:
+            if set(traces_by_program.keys()) == {"Program A"}:
+                return {
+                    "x_name": x_name,
+                    "units": units,
+                    "domain": [0.0, 1.0],
+                    "grid_points": len(x_grid),
+                    "poly": {},
+                    "equation": "admitted",
+                    "master_y": [2.0, 2.0],
+                    "std_y": [0.25, 0.25],
+                    "denom": 1.0,
+                }
+            return {
+                "x_name": x_name,
+                "units": units,
+                "domain": [0.0, 1.0],
+                "grid_points": len(x_grid),
+                "poly": {},
+                "equation": "visual",
+                "master_y": [10.0, 10.0],
+                "std_y": [1.0, 1.0],
+                "denom": 1.0,
+            }
+
+        with mock.patch.object(
+            tar,
+            "_tar_build_curve_model_for_series",
+            return_value={"x_grid": [0.0, 1.0], "x_name": "Time", "units": "psi"},
+        ), mock.patch.object(
+            tar,
+            "_tar_prepass_gate_details_for_program_traces",
+            return_value=(["Program A"], ["Program B"], [], "patched"),
+        ), mock.patch.object(
+            tar,
+            "_tar_build_curve_model_for_program_traces",
+            side_effect=_fake_program_model,
+        ), mock.patch.object(
+            tar,
+            "_tar_build_target_excluded_pool_model",
+            return_value={
+                "selected_programs": ["Program A"],
+                "comparison_programs": ["Program A"],
+                "selected_program_count": 1,
+                "selected_pool_series_count": 1,
+                "target_excluded_comparison_series_count": 2,
+                "master_y": [2.0, 2.0],
+                "std_y": [0.25, 0.25],
+                "denom": 1.0,
+                "poly": {},
+            },
+        ), mock.patch.object(
+            tar,
+            "_tar_compute_band_deviation",
+            return_value={"deviation_score": 0.5, "max_band_deviation": 0.5, "max_pct": 1.0},
+        ):
+            analysis = tar._tar_analyze_curve_groups(
+                row_specs,
+                hi=["SN-001"],
+                program_by_serial={"SN-001": "Program A", "SN-010": "Program B"},
+                certifying_program="Program A",
+                prepass_cfg={"enabled": True},
+                grid_points=2,
+                degree=2,
+                normalize_x=True,
+                z_pass=2.0,
+                z_watch=3.0,
+                max_abs_thr=None,
+                max_pct_thr=None,
+                rms_pct_thr=None,
+            )
+
+        cohort = list(analysis.get("initial_cohort_specs") or [])[0]
+        self.assertEqual(cohort["master_y"], [2.0, 2.0])
+        self.assertEqual(cohort["std_y"], [0.25, 0.25])
+        self.assertEqual(cohort["visual_program_scope"], "admitted_programs")
+        self.assertEqual({trace["serial"] for trace in (cohort.get("trace_curves") or [])}, {"SN-001", "SN-010"})
+
     def test_prepare_row_specs_and_outputs_preserve_steady_and_pulsed_selections(self) -> None:
         fixture = self._prepare_specs_for_run_type_mode_regression()
         specs = [dict(spec) for spec in (fixture["specs"] or []) if isinstance(spec, dict)]
@@ -2140,6 +2263,26 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "SN-002": {"program_title": "Program A"},
                     "SN-003": {"program_title": "Program B"},
                 },
+                metric_rows=[
+                    {
+                        "serial": "SN-001",
+                        "program_title": "Program A",
+                        "suppression_voltage": 5.0,
+                        "valve_voltage": 24.0,
+                    },
+                    {
+                        "serial": "SN-002",
+                        "program_title": "Program A",
+                        "suppression_voltage": 5.0,
+                        "valve_voltage": 24.0,
+                    },
+                    {
+                        "serial": "SN-003",
+                        "program_title": "Program B",
+                        "suppression_voltage": 7.0,
+                        "valve_voltage": 28.0,
+                    },
+                ],
             )
 
         self.assertEqual(axes.position, [0.06, 0.20, 0.90, 0.60])
@@ -2153,7 +2296,86 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(len(axes.axvline_calls), 3)
         self.assertTrue(all(call[1]["color"] == tar._TAR_METRIC_GUIDE_COLOR for call in axes.axvline_calls))
         self.assertEqual(len(axes.patches), 2)
-        self.assertEqual([call[0][2] for call in axes.text_calls], ["Program A", "Program B"])
+        self.assertEqual(
+            [call[0][2] for call in axes.text_calls],
+            [
+                "Program A\nSupp: 5 | Valve: 24",
+                "Program B\nSupp: 7 | Valve: 28",
+            ],
+        )
+
+    def test_apply_metric_axis_format_lists_multiple_program_voltage_variants(self) -> None:
+        axes = _FakePlotAxes()
+        fig = _FakePlotFigure()
+        fake_plt = _FakePyplot()
+        fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
+        fake_patches = SimpleNamespace(Rectangle=_FakeRectangle)
+        fake_transforms = SimpleNamespace(blended_transform_factory=lambda *args: ("blend", args))
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.pyplot": fake_plt,
+                "matplotlib.patches": fake_patches,
+                "matplotlib.transforms": fake_transforms,
+            },
+        ):
+            tar._tar_apply_metric_axis_format(
+                fig,
+                axes,
+                serials=["SN-001", "SN-002"],
+                meta_by_sn={
+                    "SN-001": {"program_title": "Program A"},
+                    "SN-002": {"program_title": "Program A"},
+                },
+                metric_rows=[
+                    {
+                        "serial": "SN-001",
+                        "program_title": "Program A",
+                        "suppression_voltage": 5.0,
+                        "valve_voltage": 24.0,
+                    },
+                    {
+                        "serial": "SN-002",
+                        "program_title": "Program A",
+                        "suppression_voltage": 7.0,
+                        "valve_voltage": 28.0,
+                    },
+                ],
+            )
+
+        self.assertEqual(
+            [call[0][2] for call in axes.text_calls],
+            ["Program A\nSupp: 5, 7 | Valve: 24, 28"],
+        )
+
+    def test_apply_metric_axis_format_keeps_program_only_label_without_voltage_data(self) -> None:
+        axes = _FakePlotAxes()
+        fig = _FakePlotFigure()
+        fake_plt = _FakePyplot()
+        fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
+        fake_patches = SimpleNamespace(Rectangle=_FakeRectangle)
+        fake_transforms = SimpleNamespace(blended_transform_factory=lambda *args: ("blend", args))
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.pyplot": fake_plt,
+                "matplotlib.patches": fake_patches,
+                "matplotlib.transforms": fake_transforms,
+            },
+        ):
+            tar._tar_apply_metric_axis_format(
+                fig,
+                axes,
+                serials=["SN-001"],
+                meta_by_sn={"SN-001": {"program_title": "Program A"}},
+                metric_rows=[{"serial": "SN-001", "program_title": "Program A"}],
+            )
+
+        self.assertEqual([call[0][2] for call in axes.text_calls], ["Program A"])
 
     def test_apply_metric_axis_format_uses_display_serial_ticks_for_composite_source_keys(self) -> None:
         axes = _FakePlotAxes()
@@ -2267,11 +2489,28 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         def _fake_metric_rows(_ctx: object, pair_spec: object, _stat: str, *, filter_state_override: object = None) -> list[dict[str, object]]:
             pair_id = str((pair_spec or {}).get("pair_id") or "")
             values = (
-                [("SN-001", 10.0), ("SN-002", 12.0), ("SN-003", 14.0)]
+                [
+                    ("SN-001", 10.0, "Program A", 5.0, 24.0),
+                    ("SN-002", 12.0, "Program A", 5.0, 24.0),
+                    ("SN-003", 14.0, "Program B", 7.0, 28.0),
+                ]
                 if pair_id == "pair-1"
-                else [("SN-001", 11.0), ("SN-002", 13.0), ("SN-003", 15.0)]
+                else [
+                    ("SN-001", 11.0, "Program A", 5.0, 24.0),
+                    ("SN-002", 13.0, "Program A", 5.0, 24.0),
+                    ("SN-003", 15.0, "Program B", 7.0, 28.0),
+                ]
             )
-            return [{"serial": serial, "value_num": value} for serial, value in values]
+            return [
+                {
+                    "serial": serial,
+                    "value_num": value,
+                    "program_title": program,
+                    "suppression_voltage": suppression,
+                    "valve_voltage": valve,
+                }
+                for serial, value, program, suppression, valve in values
+            ]
 
         with mock.patch.dict(
             sys.modules,
@@ -2333,6 +2572,13 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertTrue(all(call[1]["color"] == tar._TAR_METRIC_GUIDE_COLOR for call in axes.axvline_calls))
         self.assertEqual(axes.xticklabels, ["SN-001", "SN-002", "SN-003"])
         self.assertEqual(len(axes.patches), 2)
+        self.assertEqual(
+            [call[0][2] for call in axes.text_calls],
+            [
+                "Program A\nSupp: 5 | Valve: 24",
+                "Program B\nSupp: 7 | Valve: 28",
+            ],
+        )
         self.assertEqual(len(pdf.saved_figures), 1)
         self.assertEqual(fake_plt.closed, [fig])
         self.assertIsNotNone(axes.legend_call)
@@ -2405,13 +2651,13 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 {
                     "serial": "SN-010",
                     "pair_id": "pair-1",
-                    "selection_label": "Condition A",
+                    "selection_label": "Condition A | Suppression Voltage: 5 | Valve Voltage: 28",
                     "y_curve": [1.0, 1.1, 1.2],
                 },
                 {
                     "serial": "SN-001",
                     "pair_id": "pair-1",
-                    "selection_label": "Condition A",
+                    "selection_label": "Condition A | Suppression Voltage: 5 | Valve Voltage: 28",
                     "y_curve": [1.3, 1.4, 1.5],
                 },
             ],
@@ -2485,9 +2731,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 subtitle="Pressure | Time | Condition A",
                 grade_map_by_pair_serial={("pair-1", "SN-001"): "WATCH"},
                 metric_prefix="initial",
-                family_label="Pooled family median",
-                band_label="Pooled family +/-1 sigma",
-                equation_label="Pooled family equation",
+                family_label="In-family, graded mean",
+                band_label="In-family, graded +/-2 sigma",
+                equation_label="In-family, graded equation",
             )
 
         self.assertEqual(plot_spec["section"], "run_condition_curve_overlays")
@@ -2507,8 +2753,201 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIn("bbox", axes.title[1])
         self.assertEqual(len(pdf.saved_figures), 1)
         self.assertEqual(fake_plt.closed, [fig])
-        self.assertGreaterEqual(len(axes.plot_calls), 2)
+        self.assertGreaterEqual(len(axes.plot_calls), 3)
+        self.assertEqual(len(axes.fill_between_calls), 1)
+        for actual, expected in zip(list(axes.fill_between_calls[0][0][1]), [0.9, 1.0, 1.1]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(list(axes.fill_between_calls[0][0][2]), [1.3, 1.4, 1.5]):
+            self.assertAlmostEqual(actual, expected)
         self.assertIsNotNone(axes.legend_call)
+        self.assertIn("In-family, graded mean", axes.legend_call[1])
+        self.assertIn("In-family, graded +/-2 sigma", axes.legend_call[1])
+        self.assertIn("SN-001 | Condition A (WATCH)", axes.legend_call[1])
+        self.assertFalse(any("Suppression Voltage" in label for label in axes.legend_call[1] if label.startswith("SN-001")))
+
+    def test_render_exact_condition_curve_cohort_page_family_legend_includes_voltages(self) -> None:
+        fake_plt = _FakePyplot()
+        fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
+        cohort_spec = {
+            "cohort_id": "curve-cohort-2",
+            "param": "Pressure",
+            "units": "psi",
+            "x_name": "Time",
+            "selection_labels": ["Condition A"],
+            "member_pair_ids": ["pair-1"],
+            "suppression_voltage_label": "5",
+            "valve_voltage_label": "28",
+            "trace_curves": [
+                {
+                    "serial": "SN-010",
+                    "pair_id": "pair-1",
+                    "selection_label": "Condition A",
+                    "y_curve": [1.0, 1.1, 1.2],
+                },
+                {
+                    "serial": "SN-001",
+                    "pair_id": "pair-1",
+                    "selection_label": "Condition A",
+                    "y_curve": [1.3, 1.4, 1.5],
+                },
+            ],
+            "x_grid": [0.0, 1.0, 2.0],
+            "master_y": [1.1, 1.2, 1.3],
+            "std_y": [0.1, 0.1, 0.1],
+            "model": {},
+        }
+        ctx = {
+            "print_ctx": tar.PrintContext(
+                printed_at="2026-04-12 09:00 MDT",
+                printed_timezone="MDT",
+                report_title="EIDAT Test Trend Data Analyze Auto Report",
+                report_subtitle="Certification",
+            ),
+            "hi": ["SN-001"],
+            "colors": ["#ef4444", "#2563eb"],
+            "pair_by_id": {"pair-1": {"pair_id": "pair-1", "condition_context_rows": [{"condition_label": "Condition A"}]}},
+            "finding_by_pair_serial": {("pair-1", "SN-001"): {"final_max_pct": 2.0, "final_z": 1.5}},
+        }
+        axes = _FakePlotAxes()
+        fig = _FakePlotFigure()
+        pdf = _FakePlotPdf()
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.pyplot": fake_plt,
+            },
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig, axes)):
+            tar._tar_render_curve_cohort_page(
+                ctx,
+                pdf,
+                cohort_spec=cohort_spec,
+                page_number=10,
+                section_title="Final Exact-Condition Pass",
+                section_key="regrade_pass_curve_overlays",
+                subtitle="Pressure | Time | Condition A",
+                grade_map_by_pair_serial={("pair-1", "SN-001"): "WATCH"},
+                metric_prefix="final",
+                family_label="In-family, graded mean",
+                band_label="In-family, graded +/-2 sigma",
+                equation_label="In-family, graded equation",
+            )
+
+        self.assertIsNotNone(axes.legend_call)
+        self.assertIn(
+            "In-family, graded mean | Suppression Voltage: 5 | Valve Voltage: 28",
+            axes.legend_call[1],
+        )
+        self.assertIn(
+            "In-family, graded +/-2 sigma | Suppression Voltage: 5 | Valve Voltage: 28",
+            axes.legend_call[1],
+        )
+
+    def test_render_watch_curve_page_uses_updated_family_legend_and_strips_serial_voltages(self) -> None:
+        fake_plt = _FakePyplot()
+        fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
+        pair_spec = {
+            "pair_id": "pair-1",
+            "run": "Run A",
+            "run_title": "Sequence A",
+            "param": "Pressure",
+            "units": "psi",
+            "selection_label": "Condition A | Suppression Voltage: 5 | Valve Voltage: 28",
+            "selection": {"display_text": "Condition A"},
+            "filter_state_override": {"suppression_voltages": ["5"], "valve_voltages": ["28"]},
+            "condition_context_rows": [
+                {
+                    "condition_label": "Condition A",
+                    "feed_pressure": 275.0,
+                    "feed_pressure_units": "psia",
+                    "suppression_voltage": 5.0,
+                    "valve_voltage": 28.0,
+                }
+            ],
+            "plot_payload": {
+                "x_name": "Time",
+                "x_grid": [0.0, 1.0],
+                "y_resampled_by_sn": {
+                    "SN-001": [1.3, 1.4],
+                    "SN-010": [1.0, 1.1],
+                },
+                "master_y": [1.1, 1.2],
+                "std_y": [0.1, 0.2],
+            },
+        }
+        ctx = {
+            "print_ctx": tar.PrintContext(
+                printed_at="2026-04-12 09:00 MDT",
+                printed_timezone="MDT",
+                report_title="EIDAT Test Trend Data Analyze Auto Report",
+                report_subtitle="Certification",
+            ),
+            "hi": ["SN-001"],
+            "colors": ["#ef4444", "#2563eb"],
+            "run_by_name": {},
+            "final_grade_map_by_pair_serial": {("pair-1", "SN-001"): "WATCH"},
+            "finding_by_pair_serial": {
+                ("pair-1", "SN-001"): {
+                    "final_max_pct": 2.0,
+                    "final_rms_pct": 1.5,
+                    "final_z": 1.5,
+                }
+            },
+        }
+        axes = _FakePlotAxes()
+        fig = _FakePlotFigure()
+        pdf = _FakePlotPdf()
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.pyplot": fake_plt,
+            },
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig, axes)):
+            plot_spec = tar._tar_render_watch_curve_page(
+                ctx,
+                pdf,
+                pair_spec=pair_spec,
+                page_number=11,
+            )
+
+        self.assertEqual(plot_spec["section"], "watch_nonpass_curves")
+        self.assertEqual(axes.position, [0.06, 0.09, 0.88, 0.70])
+        self.assertEqual(fig.add_axes_calls, [])
+        self.assertEqual(len(axes.fill_between_calls), 3)
+        for actual, expected in zip(list(axes.fill_between_calls[0][0][1]), [0.8, 0.6]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(list(axes.fill_between_calls[0][0][2]), [1.4, 1.8]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(list(axes.fill_between_calls[1][0][1]), [0.9, 0.8]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(list(axes.fill_between_calls[1][0][2]), [1.3, 1.6]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(list(axes.fill_between_calls[2][0][1]), [1.0, 1.0]):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(list(axes.fill_between_calls[2][0][2]), [1.2, 1.4]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertIsNotNone(axes.legend_call)
+        self.assertIn(
+            "In-family, graded mean | Suppression Voltage: 5 | Valve Voltage: 28",
+            axes.legend_call[1],
+        )
+        self.assertIn(
+            "In-family, graded +/-1 sigma | Suppression Voltage: 5 | Valve Voltage: 28",
+            axes.legend_call[1],
+        )
+        self.assertIn(
+            "In-family, graded +/-2 sigma | Suppression Voltage: 5 | Valve Voltage: 28",
+            axes.legend_call[1],
+        )
+        self.assertIn(
+            "In-family, graded +/-3 sigma | Suppression Voltage: 5 | Valve Voltage: 28",
+            axes.legend_call[1],
+        )
+        self.assertIn("SN-001 | Condition A (WATCH)", axes.legend_call[1])
+        self.assertFalse(any("Suppression Voltage" in label for label in axes.legend_call[1] if label.startswith("SN-001")))
 
     def test_build_plot_navigation_creates_compact_labels_and_ignores_non_plot_sections(self) -> None:
         navigation = tar._tar_build_plot_navigation(
@@ -2778,7 +3217,6 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             doc = fitz.open()
             intro_page = doc.new_page()
             intro_page.insert_text((72, 72), "WATCH")
-            intro_page.insert_text((72, 90), "FAIL")
             intro_page.insert_text((72, 120), "SN-001")
             intro_page.insert_text((140, 120), "Condition A")
             intro_page.insert_text((300, 120), "Seq A")
@@ -2788,7 +3226,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             intro_page.insert_text((140, 150), "Condition B")
             intro_page.insert_text((300, 150), "Seq B")
             intro_page.insert_text((390, 150), "Pressure")
-            intro_page.insert_text((520, 150), "WATCH")
+            intro_page.insert_text((470, 150), "REQUIRES EVAL")
             doc.new_page()
             doc.new_page()
             doc.save(str(pdf_path))
@@ -2811,7 +3249,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                         "run_condition_text": "Condition B",
                         "sequence_text": "Seq B",
                         "parameter_text": "Pressure",
-                        "grade_text": "WATCH",
+                        "grade_token": "FAIL",
+                        "grade_text": "REQUIRES EVAL",
                         "destination_page_index": 2,
                     },
                 ],
@@ -3277,6 +3716,42 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         ]
         self.assertIn(("BACKGROUND", (7, 1), (7, 1), "#fee2e2"), exception_style_cmds)
         self.assertIn(("TEXTCOLOR", (7, 1), (7, 1), tar._TAR_EXEC_EXCEPTION_GRADE_TEXT_COLOR), exception_style_cmds)
+        self.assertEqual(_table_text(exception_table)[1][-1], "REQUIRES EVAL")
+
+    def test_build_intro_story_renames_watch_detail_heading(self) -> None:
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            story = tar._tar_build_intro_story(
+                {
+                    "print_ctx": tar.PrintContext(
+                        printed_at="2026-04-12 09:00 MDT",
+                        printed_timezone="MDT",
+                        report_title="EIDAT Test Trend Data Analyze Auto Report",
+                        report_subtitle="Certification",
+                    ),
+                    "pair_specs": [],
+                    "options": {},
+                    "overall_by_sn": {},
+                    "nonpass_findings": [],
+                    "pair_by_id": {},
+                    "hi": [],
+                    "params": [],
+                    "metric_stats": ["mean"],
+                    "include_metrics": False,
+                    "comparison_rows": [],
+                    "meta_by_sn": {},
+                    "runs": [],
+                    "all_serials": [],
+                    "plot_navigation": [],
+                    "quick_summary": {"lines": []},
+                }
+            )
+
+        headings = [item.text for item in story if isinstance(item, _FakeParagraph)]
+        self.assertIn("Watch Items Table", headings)
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(
