@@ -11437,24 +11437,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     out.append(rn)
             return out
 
-        def _selection_param_family(selection: Mapping[str, object] | None) -> str:
+        def _selection_param_families(selection: Mapping[str, object] | None) -> set[str]:
             if not isinstance(selection, Mapping):
-                return ""
-            values: list[str] = []
-            for key in ("member_run_type_modes", "member_run_types"):
-                raw_values = selection.get(key) or []
-                if isinstance(raw_values, (list, tuple, set)):
-                    values.extend(str(value or "").strip().lower() for value in raw_values if str(value or "").strip())
-            for value in (selection.get("run_type_mode"), selection.get("run_type")):
-                text = str(value or "").strip().lower()
-                if text:
-                    values.append(text)
-            for value in values:
-                if value in {"pulsed_mode", "pm", "pulsed mode"}:
-                    return "pm"
-                if value in {"steady_state", "ss", "steady state"}:
-                    return "ss"
-            return ""
+                return set()
+            try:
+                modes = list(be.td_selection_run_type_modes(selection) or [])
+            except Exception:
+                modes = []
+            out: set[str] = set()
+            for mode in modes:
+                if mode == "pulsed_mode":
+                    out.add("pm")
+                elif mode == "steady_state":
+                    out.add("ss")
+            return out
 
         def _selected_member_runs_for_family(
             selections: Sequence[Mapping[str, object]] | None,
@@ -11464,7 +11460,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             seen: set[str] = set()
             family_key = str(family or "").strip().lower()
             for selection in selections or []:
-                if _selection_param_family(selection) != family_key:
+                if family_key not in _selection_param_families(selection):
                     continue
                 members = selection.get("member_runs") or []
                 if isinstance(members, list):
@@ -11604,24 +11600,33 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _update_runs_label() -> None:
             sel = [_selection_label(d) for d in _collect_checked_run_selections() if _selection_label(d)]
             scope_label = "run conditions" if str(cb_run_scope.currentData() or "sequence").strip().lower() == "condition" else "sequences"
-            lbl_runs_auto.setText(f"Runs Included ({scope_label}): {_selection_summary(sel, list_runs.count())}")
-            lbl_runs_auto.setToolTip(", ".join(sel))
+            try:
+                lbl_runs_auto.setText(f"Runs Included ({scope_label}): {_selection_summary(sel, list_runs.count())}")
+                lbl_runs_auto.setToolTip(", ".join(sel))
+            except RuntimeError:
+                return
 
         def _update_params_label():
             pm_sel = _collect_checked_labels(list_pm_params)
             ss_sel = _collect_checked_labels(list_ss_params)
-            lbl_pm_params_auto.setText(f"PM Parameters: {_selection_summary(pm_sel, list_pm_params.count())}")
-            lbl_pm_params_auto.setToolTip(", ".join(pm_sel))
-            lbl_ss_params_auto.setText(f"SS Parameters: {_selection_summary(ss_sel, list_ss_params.count())}")
-            lbl_ss_params_auto.setToolTip(", ".join(ss_sel))
+            try:
+                lbl_pm_params_auto.setText(f"PM Parameters: {_selection_summary(pm_sel, list_pm_params.count())}")
+                lbl_pm_params_auto.setToolTip(", ".join(pm_sel))
+                lbl_ss_params_auto.setText(f"SS Parameters: {_selection_summary(ss_sel, list_ss_params.count())}")
+                lbl_ss_params_auto.setToolTip(", ".join(ss_sel))
+            except RuntimeError:
+                return
 
         def _update_metric_params_label():
             params_sel = _collect_checked_labels(list_params)
             stats_sel = _collect_checked(list_metric_stats)
             stats_text = ", ".join(stats_sel) if stats_sel else "none"
-            lbl_metrics_auto.setText(
-                f"Metric pages use certification params: {_selection_summary(params_sel, list_params.count())} | Stats: {stats_text}"
-            )
+            try:
+                lbl_metrics_auto.setText(
+                    f"Metric pages use certification params: {_selection_summary(params_sel, list_params.count())} | Stats: {stats_text}"
+                )
+            except RuntimeError:
+                return
 
         def _refresh_certifying_program_options() -> None:
             current = str(cb_cert_program.currentText() or "").strip()

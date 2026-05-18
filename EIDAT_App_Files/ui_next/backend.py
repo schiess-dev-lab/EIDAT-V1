@@ -14600,6 +14600,30 @@ def td_perf_normalize_run_type_mode(value: object) -> str:
     return "all_conditions"
 
 
+def td_selection_run_type_modes(selection: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(selection, Mapping):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in ("member_run_type_modes", "member_run_types"):
+        raw_values = selection.get(key) or []
+        if not isinstance(raw_values, (list, tuple, set)):
+            continue
+        for value in raw_values:
+            normalized = td_perf_normalize_run_type_mode(value)
+            if normalized not in {"steady_state", "pulsed_mode"} or normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(normalized)
+    if out:
+        return out
+    for value in (selection.get("run_type_mode"), selection.get("run_type")):
+        normalized = td_perf_normalize_run_type_mode(value)
+        if normalized in {"steady_state", "pulsed_mode"}:
+            return [normalized]
+    return []
+
+
 def td_perf_run_type_mode_label(value: object) -> str:
     mode = td_perf_normalize_run_type_mode(value)
     if mode == "steady_state":

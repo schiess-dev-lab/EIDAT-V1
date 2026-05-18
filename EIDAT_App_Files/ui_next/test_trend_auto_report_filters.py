@@ -1464,6 +1464,136 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(spec_by_id["condition:ss"]["param"], "Steady Pressure")
         self.assertEqual(spec_by_id["condition:pm"]["param"], "Pulse Pressure")
 
+    def test_expand_report_selections_by_family_splits_mixed_conditions(self) -> None:
+        expanded = tar._tar_expand_report_selections_by_family(
+            [
+                {
+                    "id": "condition:mixed",
+                    "mode": "condition",
+                    "run_name": "Run A",
+                    "member_runs": ["Run A"],
+                    "member_sequences": ["Seq SS", "Seq PM"],
+                    "member_programs": ["Program A"],
+                    "display_text": "Combined Conditions",
+                    "run_condition": "Combined Conditions",
+                    "member_run_type_modes": ["steady_state", "pulsed_mode"],
+                }
+            ]
+        )
+
+        self.assertEqual({str(selection.get("id") or "") for selection in expanded}, {"condition:mixed:ss", "condition:mixed:pm"})
+        self.assertEqual(
+            {str(selection.get("run_type_mode") or "") for selection in expanded},
+            {"steady_state", "pulsed_mode"},
+        )
+        self.assertEqual(
+            {tuple(selection.get("member_run_type_modes") or []) for selection in expanded},
+            {("steady_state",), ("pulsed_mode",)},
+        )
+
+    def test_mixed_condition_branches_survive_into_comparison_rows_and_plot_specs(self) -> None:
+        mixed_selection = {
+            "id": "condition:mixed",
+            "mode": "condition",
+            "run_name": "Run A",
+            "member_runs": ["Run A"],
+            "member_sequences": ["Seq SS", "Seq PM"],
+            "member_programs": ["Program A"],
+            "display_text": "Combined Conditions",
+            "run_condition": "Combined Conditions",
+            "member_run_type_modes": ["steady_state", "pulsed_mode"],
+        }
+        expanded = tar._tar_expand_report_selections_by_family([mixed_selection])
+        fixture = self._prepare_specs_for_run_type_mode_regression(
+            selections=expanded,
+            params=["Legacy Pressure"],
+            params_by_family={
+                "steady_state": ["Steady Pressure"],
+                "pulsed_mode": ["Pulse Pressure"],
+            },
+        )
+
+        specs = [dict(spec) for spec in (fixture["specs"] or []) if isinstance(spec, dict)]
+        self.assertEqual({spec["selection_id"] for spec in specs}, {"condition:mixed:ss", "condition:mixed:pm"})
+        spec_by_id = {str(spec.get("selection_id") or ""): spec for spec in specs}
+        self.assertEqual([curve.serial for curve in spec_by_id["condition:mixed:ss"]["series"]], ["SN-SS"])
+        self.assertEqual([curve.serial for curve in spec_by_id["condition:mixed:pm"]["series"]], ["SN-PM"])
+        self.assertEqual(spec_by_id["condition:mixed:ss"]["param"], "Steady Pressure")
+        self.assertEqual(spec_by_id["condition:mixed:pm"]["param"], "Pulse Pressure")
+
+        analysis = tar._tar_analyze_curve_groups(
+            specs,
+            hi=["SN-SS", "SN-PM"],
+            program_by_serial={"SN-SS": "Program A", "SN-PM": "Program A"},
+            certifying_program="Program A",
+            prepass_cfg={"enabled": False},
+            grid_points=5,
+            degree=2,
+            normalize_x=True,
+            z_pass=2.0,
+            z_watch=3.0,
+            max_abs_thr=None,
+            max_pct_thr=None,
+            rms_pct_thr=None,
+        )
+        ctx = {
+            "filter_state": {},
+            "be": fixture["fake_be"],
+            "db_path": Path("fake.sqlite3"),
+            "options": {"run_selections": list(expanded)},
+            "parameter_context": {},
+        }
+        comparison_rows = tar._tar_build_per_serial_comparison_rows(
+            ctx,
+            pair_specs=list(analysis.get("pair_specs") or []),
+            all_serials=["SN-SS", "SN-PM"],
+            hi=["SN-SS", "SN-PM"],
+            initial_grade_map_by_pair_serial=dict(analysis.get("initial_grade_map_by_pair_serial") or {}),
+            final_grade_map_by_pair_serial=dict(analysis.get("final_grade_map_by_pair_serial") or {}),
+            finding_by_pair_serial=dict(analysis.get("finding_by_pair_serial") or {}),
+        )
+        self.assertEqual({row["selection_id"] for row in comparison_rows}, {"condition:mixed:ss", "condition:mixed:pm"})
+
+        pair_specs = [dict(spec) for spec in (analysis.get("pair_specs") or []) if isinstance(spec, dict)]
+        plot_ctx = {
+            **ctx,
+            "pair_by_id": {str(spec.get("pair_id") or ""): dict(spec) for spec in pair_specs},
+            "all_serials": ["SN-SS", "SN-PM"],
+            "initial_cohort_specs": list(analysis.get("initial_cohort_specs") or []),
+            "regrade_cohort_specs": list(analysis.get("regrade_cohort_specs") or []),
+            "performance_plot_specs": [],
+            "watch_pair_ids": [],
+            "metric_stats": ["mean"],
+            "include_metrics": True,
+            "run_by_name": dict(fixture["run_by_name"] or {}),
+            "final_grade_map_by_pair_serial": dict(analysis.get("final_grade_map_by_pair_serial") or {}),
+        }
+        plot_specs = tar._tar_plan_plot_specs(plot_ctx, intro_pages=0)
+        self.assertEqual(
+            {
+                pair_id
+                for spec in plot_specs
+                if spec.get("section") == "run_condition_plot_metrics"
+                for pair_id in (spec.get("member_pair_ids") or [])
+            },
+            {
+                "condition:mixed:ss::Run A::Steady Pressure",
+                "condition:mixed:pm::Run A::Pulse Pressure",
+            },
+        )
+        self.assertEqual(
+            {
+                pair_id
+                for spec in plot_specs
+                if spec.get("section") == "run_condition_curve_overlays"
+                for pair_id in (spec.get("member_pair_ids") or [])
+            },
+            {
+                "condition:mixed:ss::Run A::Steady Pressure",
+                "condition:mixed:pm::Run A::Pulse Pressure",
+            },
+        )
+
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
         pair_specs = [

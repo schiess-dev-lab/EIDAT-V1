@@ -116,6 +116,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertIn("Dropped: 1 seq / 2 pts", window.lbl_smart_solver_summary.text())
         finally:
             window.close()
+            self._app.closeAllWindows()
+            self._app.processEvents()
             tmpdir = getattr(window, "_test_tmpdir", "")
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
@@ -162,6 +164,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 self.assertIn("remains unchanged", captured["control_period"])
         finally:
             window.close()
+            self._app.closeAllWindows()
+            self._app.processEvents()
             tmpdir = getattr(window, "_test_tmpdir", "")
             if tmpdir:
                 shutil.rmtree(str(tmpdir), ignore_errors=True)
@@ -1352,6 +1356,7 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                 }
 
                 captured: dict[str, object] = {}
+                state = {"opened_popup": False}
 
                 def _run_dialog() -> int:
                     report_filters_popup = next(
@@ -1681,11 +1686,13 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     return list(cols_by_run.get(str(run_name or "").strip(), []))
 
                 def _run_dialog() -> int:
-                    dialog = next(
-                        widget
-                        for widget in self._app.topLevelWidgets()
-                        if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Auto Report Options"
-                    )
+                    dialog = self._app.activeModalWidget()
+                    if not isinstance(dialog, QtWidgets.QDialog) or dialog.windowTitle() != "Auto Report Options":
+                        dialog = next(
+                            widget
+                            for widget in reversed(self._app.topLevelWidgets())
+                            if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Auto Report Options"
+                        )
                     hidden_serials = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_serials")
                     hidden_pm_params = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_pm_params")
                     perf_table = next(
@@ -1725,6 +1732,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
 
                     gen_btn = next(btn for btn in dialog.findChildren(QtWidgets.QPushButton) if btn.text() == "Generate Report")
                     gen_btn.click()
+                    self._app.processEvents()
+                    dialog.accept()
                     return int(QtWidgets.QDialog.DialogCode.Accepted)
 
                 def _capture_payload(*args, **_kwargs) -> None:

@@ -290,11 +290,27 @@ def _td_normalize_run_type_mode(value: object) -> str:
 def _selection_run_type_modes(selection: Mapping[str, object] | None) -> list[str]:
     if not isinstance(selection, Mapping):
         return []
+    try:
+        from . import backend as be  # type: ignore
+    except Exception:  # pragma: no cover
+        try:
+            import ui_next.backend as be  # type: ignore
+        except Exception:  # pragma: no cover
+            be = None  # type: ignore
+    helper = getattr(be, "td_selection_run_type_modes", None) if be is not None else None
+    if callable(helper):
+        try:
+            modes = list(helper(selection) or [])
+        except Exception:
+            modes = []
+        normalized_modes = [mode for mode in modes if mode in {"steady_state", "pulsed_mode"}]
+        if normalized_modes:
+            return normalized_modes
     out: list[str] = []
     seen: set[str] = set()
     for key in ("member_run_type_modes", "member_run_types"):
         raw_values = selection.get(key) or []
-        if not isinstance(raw_values, list):
+        if not isinstance(raw_values, (list, tuple, set)):
             continue
         for value in raw_values:
             normalized = _td_normalize_run_type_mode(value)
@@ -314,6 +330,50 @@ def _selection_run_type_modes(selection: Mapping[str, object] | None) -> list[st
 def _selection_single_run_type_mode(selection: Mapping[str, object] | None) -> str:
     modes = _selection_run_type_modes(selection)
     return modes[0] if len(modes) == 1 else ""
+
+
+def _selection_has_run_type_mode(selection: Mapping[str, object] | None, mode: str) -> bool:
+    normalized_mode = _td_normalize_run_type_mode(mode)
+    return bool(normalized_mode) and normalized_mode in set(_selection_run_type_modes(selection))
+
+
+def _selection_forced_family_branch(
+    selection: Mapping[str, object] | None,
+    mode: str,
+    *,
+    branch_suffix: str = "",
+) -> dict[str, object]:
+    branch_mode = _td_normalize_run_type_mode(mode)
+    out = dict(selection or {}) if isinstance(selection, Mapping) else {}
+    if branch_mode not in {"steady_state", "pulsed_mode"}:
+        return out
+    base_id = str(out.get("id") or "").strip()
+    if base_id and branch_suffix:
+        out["id"] = f"{base_id}:{branch_suffix}"
+    out["run_type_mode"] = branch_mode
+    out["run_type"] = "steady state" if branch_mode == "steady_state" else "pulsed mode"
+    out["member_run_type_modes"] = [branch_mode]
+    if "member_run_types" in out:
+        out["member_run_types"] = [branch_mode]
+    if base_id:
+        out["source_selection_id"] = base_id
+    out["selection_family_mode"] = branch_mode
+    return out
+
+
+def _tar_expand_report_selections_by_family(selections: Sequence[Mapping[str, object]] | None) -> list[dict]:
+    out: list[dict] = []
+    for selection in selections or []:
+        if not isinstance(selection, Mapping):
+            continue
+        modes = [mode for mode in _selection_run_type_modes(selection) if mode in {"steady_state", "pulsed_mode"}]
+        if len(modes) <= 1:
+            out.append(_selection_forced_family_branch(selection, modes[0]) if modes else dict(selection))
+            continue
+        for mode in modes:
+            suffix = "ss" if mode == "steady_state" else "pm"
+            out.append(_selection_forced_family_branch(selection, mode, branch_suffix=suffix))
+    return out
 
 
 def _row_run_type_mode(row: Mapping[str, object] | None) -> str:
@@ -12805,12 +12865,13 @@ def _tar_prepare_base(
             "Update Project again and verify TD source resolution for this project."
         )
 
-    report_selections = _tar_resolve_report_selections(run_by_name, runs, initial_options)
+    raw_report_selections = _tar_resolve_report_selections(run_by_name, runs, initial_options)
+    report_selections = _tar_expand_report_selections_by_family(raw_report_selections)
     pulsed_runs = _tar_unique_text_values(
         [
             member
             for selection in report_selections
-            if _selection_single_run_type_mode(selection) == "pulsed_mode"
+            if _selection_has_run_type_mode(selection, "pulsed_mode")
             for member in (
                 _tar_unique_text_values(selection.get("member_runs") or [])
                 or [str(selection.get("run_name") or "").strip()]
@@ -12822,7 +12883,7 @@ def _tar_prepare_base(
         [
             member
             for selection in report_selections
-            if _selection_single_run_type_mode(selection) == "steady_state"
+            if _selection_has_run_type_mode(selection, "steady_state")
             for member in (
                 _tar_unique_text_values(selection.get("member_runs") or [])
                 or [str(selection.get("run_name") or "").strip()]
