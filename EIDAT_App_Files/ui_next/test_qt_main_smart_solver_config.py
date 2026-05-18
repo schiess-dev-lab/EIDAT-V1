@@ -1397,7 +1397,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         popup_program = cert_popup.findChild(QtWidgets.QComboBox, "auto_report_cert_popup_program")
                         popup_serials = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_serials")
                         popup_runs = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_runs")
-                        popup_params = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_params")
+                        popup_pm_params = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_pm_params")
+                        popup_ss_params = cert_popup.findChild(QtWidgets.QListWidget, "auto_report_cert_popup_ss_params")
                         popup_program_summary = cert_popup.findChild(
                             QtWidgets.QLabel, "auto_report_cert_popup_program_summary"
                         )
@@ -1407,8 +1408,11 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         popup_run_summary = cert_popup.findChild(
                             QtWidgets.QLabel, "auto_report_cert_popup_runs_summary"
                         )
-                        popup_params_summary = cert_popup.findChild(
-                            QtWidgets.QLabel, "auto_report_certification_params_summary"
+                        popup_pm_params_summary = cert_popup.findChild(
+                            QtWidgets.QLabel, "auto_report_certification_pm_params_summary"
+                        )
+                        popup_ss_params_summary = cert_popup.findChild(
+                            QtWidgets.QLabel, "auto_report_certification_ss_params_summary"
                         )
                         popup_grade_summary = cert_popup.findChild(
                             QtWidgets.QLabel, "auto_report_grade_scoring_summary"
@@ -1416,11 +1420,13 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         self.assertIsNotNone(popup_program)
                         self.assertIsNotNone(popup_serials)
                         self.assertIsNotNone(popup_runs)
-                        self.assertIsNotNone(popup_params)
+                        self.assertIsNotNone(popup_pm_params)
+                        self.assertIsNotNone(popup_ss_params)
                         self.assertIsNotNone(popup_program_summary)
                         self.assertIsNotNone(popup_serial_summary)
                         self.assertIsNotNone(popup_run_summary)
-                        self.assertIsNotNone(popup_params_summary)
+                        self.assertIsNotNone(popup_pm_params_summary)
+                        self.assertIsNotNone(popup_ss_params_summary)
                         self.assertIsNotNone(popup_grade_summary)
                         popup_program.setCurrentText("Program Alpha")
                         self._app.processEvents()
@@ -1437,11 +1443,13 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         popup_serials.setCurrentRow(1)
                         self._app.processEvents()
                         self.assertGreaterEqual(popup_runs.count(), 1)
-                        self.assertEqual(popup_params.count(), 2)
-                        for i in range(popup_params.count()):
-                            popup_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                        self.assertEqual(popup_pm_params.count(), 2)
+                        self.assertEqual(popup_ss_params.count(), 0)
+                        for i in range(popup_pm_params.count()):
+                            popup_pm_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
                         self._app.processEvents()
-                        self.assertIn("Certification Parameters:", popup_params_summary.text())
+                        self.assertIn("PM Parameters:", popup_pm_params_summary.text())
+                        self.assertIn("SS Parameters:", popup_ss_params_summary.text())
                         self.assertIn("1 / 2", popup_serial_summary.text())
                         self.assertIn("PASS if |z| <= 1.5", popup_grade_summary.text())
                         self.assertIn("WATCH if |z| <= 2.5", popup_grade_summary.text())
@@ -1489,11 +1497,15 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     hidden_serials = dialog.findChild(
                         QtWidgets.QListWidget, "auto_report_certification_serials"
                     )
-                    hidden_params = dialog.findChild(
-                        QtWidgets.QListWidget, "auto_report_certification_params"
+                    hidden_pm_params = dialog.findChild(
+                        QtWidgets.QListWidget, "auto_report_certification_pm_params"
+                    )
+                    hidden_ss_params = dialog.findChild(
+                        QtWidgets.QListWidget, "auto_report_certification_ss_params"
                     )
                     self.assertIsNotNone(hidden_serials)
-                    self.assertIsNotNone(hidden_params)
+                    self.assertIsNotNone(hidden_pm_params)
+                    self.assertIsNotNone(hidden_ss_params)
                     if not hidden_serials.selectedItems():
                         hidden_serials.clearSelection()
                         hidden_serials.selectionModel().select(
@@ -1501,8 +1513,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                             QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
                             | QtCore.QItemSelectionModel.SelectionFlag.Rows,
                         )
-                    for i in range(hidden_params.count()):
-                        hidden_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                    for i in range(hidden_pm_params.count()):
+                        hidden_pm_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
                     self._app.processEvents()
                     self.assertTrue(str(report_name.text()).endswith("_Test Data Report.pdf"))
                     self.assertTrue(
@@ -1552,6 +1564,11 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                     [str(value).split(":")[-1].strip().lower() for value in payload["params"]],
                     ["flow", "thrust"],
                 )
+                self.assertEqual(
+                    [str(value).split(":")[-1].strip().lower() for value in payload["pm_params"]],
+                    ["flow", "thrust"],
+                )
+                self.assertEqual(payload["ss_params"], [])
                 self.assertIn("Program Alpha", str(payload["output_pdf"]))
                 self.assertIn("EDAT reports", str(payload["output_pdf"]))
         finally:
@@ -1670,14 +1687,14 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                         if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Auto Report Options"
                     )
                     hidden_serials = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_serials")
-                    hidden_params = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_params")
+                    hidden_pm_params = dialog.findChild(QtWidgets.QListWidget, "auto_report_certification_pm_params")
                     perf_table = next(
                         table
                         for table in dialog.findChildren(QtWidgets.QTableWidget)
                         if table.columnCount() == 4
                     )
                     self.assertIsNotNone(hidden_serials)
-                    self.assertIsNotNone(hidden_params)
+                    self.assertIsNotNone(hidden_pm_params)
 
                     if not hidden_serials.selectedItems():
                         hidden_serials.clearSelection()
@@ -1686,8 +1703,8 @@ class TestQtMainSmartSolverConfig(unittest.TestCase):
                             QtCore.QItemSelectionModel.SelectionFlag.ClearAndSelect
                             | QtCore.QItemSelectionModel.SelectionFlag.Rows,
                         )
-                    for i in range(hidden_params.count()):
-                        hidden_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
+                    for i in range(hidden_pm_params.count()):
+                        hidden_pm_params.item(i).setCheckState(QtCore.Qt.CheckState.Checked)
                     self._app.processEvents()
 
                     add_btn = next(btn for btn in dialog.findChildren(QtWidgets.QPushButton) if btn.text() == "Add Equation")

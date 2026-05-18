@@ -11066,11 +11066,27 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         btn_cert_popup = QtWidgets.QPushButton("Certification Specifics...")
         btn_cert_popup.setObjectName("auto_report_certification_popup_button")
         left_l.addWidget(btn_cert_popup)
-        layout.addWidget(certification_frame)
-
         lbl_cert_program_auto = QtWidgets.QLabel("Certifying Program: -")
+        lbl_cert_program_auto.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_cert_program_auto.setWordWrap(True)
+        left_l.addWidget(lbl_cert_program_auto)
         lbl_cert_serials_auto = QtWidgets.QLabel("Certification Serials: -")
+        lbl_cert_serials_auto.setStyleSheet("color: #374151; font-size: 11px;")
+        lbl_cert_serials_auto.setWordWrap(True)
+        left_l.addWidget(lbl_cert_serials_auto)
         lbl_runs_auto = QtWidgets.QLabel("Runs Included: -")
+        lbl_runs_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_runs_auto.setWordWrap(True)
+        left_l.addWidget(lbl_runs_auto)
+        lbl_pm_params_auto = QtWidgets.QLabel("PM Parameters: -")
+        lbl_pm_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_pm_params_auto.setWordWrap(True)
+        left_l.addWidget(lbl_pm_params_auto)
+        lbl_ss_params_auto = QtWidgets.QLabel("SS Parameters: -")
+        lbl_ss_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
+        lbl_ss_params_auto.setWordWrap(True)
+        left_l.addWidget(lbl_ss_params_auto)
+        layout.addWidget(certification_frame)
 
         default_hi = []
         try:
@@ -11095,6 +11111,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         ed_param_filter.setPlaceholderText("Filter params…")
         list_params = QtWidgets.QListWidget(dlg)
         list_params.setObjectName("auto_report_certification_params")
+        list_pm_params = QtWidgets.QListWidget(dlg)
+        list_pm_params.setObjectName("auto_report_certification_pm_params")
+        list_ss_params = QtWidgets.QListWidget(dlg)
+        list_ss_params.setObjectName("auto_report_certification_ss_params")
 
         lbl_params_auto = QtWidgets.QLabel("Selected certification params: —")
         lbl_params_auto.setStyleSheet("color: #64748b; font-size: 11px;")
@@ -11135,9 +11155,6 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             it.setCheckState(QtCore.Qt.CheckState.Checked if default_checked else QtCore.Qt.CheckState.Unchecked)
             list_metric_stats.addItem(it)
         right_l.addWidget(gb_metrics)
-        lbl_params_auto = certification_frame.findChild(
-            QtWidgets.QLabel, "auto_report_certification_params_summary"
-        ) or lbl_params_auto
 
         def _collect_checked(listw: QtWidgets.QListWidget) -> list[str]:
             out = []
@@ -11179,6 +11196,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             preview = ", ".join(items[:3])
             extra = "" if len(items) <= 3 else f" +{len(items) - 3} more"
             return f"{len(items)} / {total} ({preview}{extra})"
+
+        def _unique_text_values(values: Sequence[object] | None) -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            for value in values or []:
+                text = str(value or "").strip()
+                key = text.casefold()
+                if not text or key in seen:
+                    continue
+                seen.add(key)
+                out.append(text)
+            return out
 
         report_name_auto = {"enabled": True}
 
@@ -11408,6 +11437,162 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     out.append(rn)
             return out
 
+        def _selection_param_family(selection: Mapping[str, object] | None) -> str:
+            if not isinstance(selection, Mapping):
+                return ""
+            values: list[str] = []
+            for key in ("member_run_type_modes", "member_run_types"):
+                raw_values = selection.get(key) or []
+                if isinstance(raw_values, (list, tuple, set)):
+                    values.extend(str(value or "").strip().lower() for value in raw_values if str(value or "").strip())
+            for value in (selection.get("run_type_mode"), selection.get("run_type")):
+                text = str(value or "").strip().lower()
+                if text:
+                    values.append(text)
+            for value in values:
+                if value in {"pulsed_mode", "pm", "pulsed mode"}:
+                    return "pm"
+                if value in {"steady_state", "ss", "steady state"}:
+                    return "ss"
+            return ""
+
+        def _selected_member_runs_for_family(
+            selections: Sequence[Mapping[str, object]] | None,
+            family: str,
+        ) -> list[str]:
+            out: list[str] = []
+            seen: set[str] = set()
+            family_key = str(family or "").strip().lower()
+            for selection in selections or []:
+                if _selection_param_family(selection) != family_key:
+                    continue
+                members = selection.get("member_runs") or []
+                if isinstance(members, list):
+                    for run in members:
+                        rn = str(run or "").strip()
+                        if not rn or rn in seen:
+                            continue
+                        seen.add(rn)
+                        out.append(rn)
+                rn = str(selection.get("run_name") or "").strip()
+                if rn and rn not in seen:
+                    seen.add(rn)
+                    out.append(rn)
+            return out
+
+        def _checked_state_map(listw: QtWidgets.QListWidget) -> dict[str, bool]:
+            state_map: dict[str, bool] = {}
+            for i in range(listw.count()):
+                it = listw.item(i)
+                if not it:
+                    continue
+                checked = it.checkState() == QtCore.Qt.CheckState.Checked
+                state_map[_norm_name(self._list_widget_item_value(it))] = checked
+                state_map[_norm_name(it.text())] = checked
+            return state_map
+
+        def _populate_param_list(
+            listw: QtWidgets.QListWidget,
+            param_options: Sequence[Mapping[str, object]] | None,
+            prev_checked: Mapping[str, bool] | None,
+        ) -> None:
+            state_map = dict(prev_checked or {})
+            listw.blockSignals(True)
+            try:
+                listw.clear()
+                for option in param_options or []:
+                    value = str(option.get("value") or "").strip()
+                    label = str(option.get("label") or option.get("display_name") or value).strip()
+                    if not value or not label:
+                        continue
+                    raw_names = [str(raw or "").strip() for raw in (option.get("raw_names") or []) if str(raw or "").strip()]
+                    it = QtWidgets.QListWidgetItem(label)
+                    it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                    it.setData(QtCore.Qt.ItemDataRole.UserRole, value)
+                    it.setToolTip("\n".join([part for part in (label, ", ".join(raw_names)) if part]))
+                    checked = state_map.get(_norm_name(value))
+                    if checked is None:
+                        checked = state_map.get(_norm_name(label))
+                    if checked is None:
+                        checked = any(state_map.get(_norm_name(raw), False) for raw in raw_names)
+                    it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+                    listw.addItem(it)
+            finally:
+                listw.blockSignals(False)
+
+        def _merge_param_options(*families: Sequence[Mapping[str, object]] | None) -> list[dict[str, object]]:
+            merged: dict[str, dict[str, object]] = {}
+            order: list[str] = []
+            for family in families:
+                for option in family or []:
+                    value = str(option.get("value") or "").strip()
+                    if not value:
+                        continue
+                    key = _norm_name(value)
+                    raw_names = [
+                        str(raw or "").strip()
+                        for raw in (option.get("raw_names") or [])
+                        if str(raw or "").strip()
+                    ]
+                    if key not in merged:
+                        merged[key] = {
+                            **dict(option),
+                            "raw_names": list(raw_names),
+                        }
+                        order.append(key)
+                        continue
+                    existing_raw = [
+                        str(raw or "").strip()
+                        for raw in (merged[key].get("raw_names") or [])
+                        if str(raw or "").strip()
+                    ]
+                    for raw_name in raw_names:
+                        if raw_name not in existing_raw:
+                            existing_raw.append(raw_name)
+                    merged[key]["raw_names"] = existing_raw
+            return [dict(merged[key]) for key in order]
+
+        def _checked_family_param_values() -> tuple[list[str], list[str]]:
+            return _collect_checked(list_pm_params), _collect_checked(list_ss_params)
+
+        def _sync_union_param_list(param_options: Sequence[Mapping[str, object]] | None = None) -> None:
+            prev_checked = _checked_state_map(list_params)
+            if param_options is None:
+                param_options = _merge_param_options(
+                    [
+                        {
+                            "value": self._list_widget_item_value(list_pm_params.item(i)),
+                            "label": str(list_pm_params.item(i).text() or "").strip(),
+                            "display_name": str(list_pm_params.item(i).text() or "").strip(),
+                            "raw_names": [],
+                        }
+                        for i in range(list_pm_params.count())
+                        if list_pm_params.item(i) is not None
+                    ],
+                    [
+                        {
+                            "value": self._list_widget_item_value(list_ss_params.item(i)),
+                            "label": str(list_ss_params.item(i).text() or "").strip(),
+                            "display_name": str(list_ss_params.item(i).text() or "").strip(),
+                            "raw_names": [],
+                        }
+                        for i in range(list_ss_params.count())
+                        if list_ss_params.item(i) is not None
+                    ],
+                )
+            desired = {_norm_name(value) for family_values in _checked_family_param_values() for value in family_values}
+            _populate_param_list(list_params, param_options, prev_checked)
+            list_params.blockSignals(True)
+            try:
+                for i in range(list_params.count()):
+                    it = list_params.item(i)
+                    if not it:
+                        continue
+                    checked = _norm_name(self._list_widget_item_value(it)) in desired
+                    it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
+            finally:
+                list_params.blockSignals(False)
+
         def _set_selected_serial_values(values: Sequence[object] | None) -> None:
             wanted = {str(value).strip() for value in (values or []) if str(value).strip()}
             for i in range(list_sn.count()):
@@ -11423,8 +11608,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_runs_auto.setToolTip(", ".join(sel))
 
         def _update_params_label():
-            sel = _collect_checked_labels(list_params)
-            lbl_params_auto.setText(f"Certification Parameters: {_selection_summary(sel, list_params.count())}")
+            pm_sel = _collect_checked_labels(list_pm_params)
+            ss_sel = _collect_checked_labels(list_ss_params)
+            lbl_pm_params_auto.setText(f"PM Parameters: {_selection_summary(pm_sel, list_pm_params.count())}")
+            lbl_pm_params_auto.setToolTip(", ".join(pm_sel))
+            lbl_ss_params_auto.setText(f"SS Parameters: {_selection_summary(ss_sel, list_ss_params.count())}")
+            lbl_ss_params_auto.setToolTip(", ".join(ss_sel))
 
         def _update_metric_params_label():
             params_sel = _collect_checked_labels(list_params)
@@ -11558,11 +11747,16 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             lbl_popup_runs_summary.setWordWrap(True)
             lbl_popup_runs_summary.setStyleSheet("color: #64748b; font-size: 11px;")
             summary_layout.addWidget(lbl_popup_runs_summary)
-            lbl_popup_params_summary = QtWidgets.QLabel("Certification Parameters: -")
-            lbl_popup_params_summary.setObjectName("auto_report_certification_params_summary")
-            lbl_popup_params_summary.setWordWrap(True)
-            lbl_popup_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
-            summary_layout.addWidget(lbl_popup_params_summary)
+            lbl_popup_pm_params_summary = QtWidgets.QLabel("PM Parameters: -")
+            lbl_popup_pm_params_summary.setObjectName("auto_report_certification_pm_params_summary")
+            lbl_popup_pm_params_summary.setWordWrap(True)
+            lbl_popup_pm_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            summary_layout.addWidget(lbl_popup_pm_params_summary)
+            lbl_popup_ss_params_summary = QtWidgets.QLabel("SS Parameters: -")
+            lbl_popup_ss_params_summary.setObjectName("auto_report_certification_ss_params_summary")
+            lbl_popup_ss_params_summary.setWordWrap(True)
+            lbl_popup_ss_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            summary_layout.addWidget(lbl_popup_ss_params_summary)
             grade_summary_box = QtWidgets.QFrame()
             grade_summary_box.setStyleSheet(
                 "QFrame { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 8px; }"
@@ -11657,24 +11851,43 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             params_title = QtWidgets.QLabel("Certification Parameters")
             params_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #000000;")
             params_layout.addWidget(params_title)
-            local_param_filter = QtWidgets.QLineEdit()
-            local_param_filter.setPlaceholderText("Filter certification parameters...")
-            params_layout.addWidget(local_param_filter)
-            local_params = QtWidgets.QListWidget()
-            local_params.setObjectName("auto_report_cert_popup_params")
-            local_params.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-            params_layout.addWidget(local_params, 1)
-            local_params_summary = QtWidgets.QLabel("Certification Parameters: -")
-            local_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
-            local_params_summary.setWordWrap(True)
-            params_layout.addWidget(local_params_summary)
-            param_btns = QtWidgets.QHBoxLayout()
-            btn_local_params_all = QtWidgets.QPushButton("Select All")
-            btn_local_params_clear = QtWidgets.QPushButton("Clear")
-            param_btns.addWidget(btn_local_params_all)
-            param_btns.addWidget(btn_local_params_clear)
-            param_btns.addStretch(1)
-            params_layout.addLayout(param_btns)
+            local_pm_param_filter = QtWidgets.QLineEdit()
+            local_pm_param_filter.setPlaceholderText("Filter PM parameters...")
+            params_layout.addWidget(local_pm_param_filter)
+            local_pm_params = QtWidgets.QListWidget()
+            local_pm_params.setObjectName("auto_report_cert_popup_pm_params")
+            local_pm_params.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+            params_layout.addWidget(local_pm_params, 1)
+            local_pm_params_summary = QtWidgets.QLabel("PM Parameters: -")
+            local_pm_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            local_pm_params_summary.setWordWrap(True)
+            params_layout.addWidget(local_pm_params_summary)
+            pm_param_btns = QtWidgets.QHBoxLayout()
+            btn_local_pm_params_all = QtWidgets.QPushButton("Select All PM")
+            btn_local_pm_params_clear = QtWidgets.QPushButton("Clear PM")
+            pm_param_btns.addWidget(btn_local_pm_params_all)
+            pm_param_btns.addWidget(btn_local_pm_params_clear)
+            pm_param_btns.addStretch(1)
+            params_layout.addLayout(pm_param_btns)
+            params_layout.addWidget(QtWidgets.QLabel("SS Parameters"))
+            local_ss_param_filter = QtWidgets.QLineEdit()
+            local_ss_param_filter.setPlaceholderText("Filter SS parameters...")
+            params_layout.addWidget(local_ss_param_filter)
+            local_ss_params = QtWidgets.QListWidget()
+            local_ss_params.setObjectName("auto_report_cert_popup_ss_params")
+            local_ss_params.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+            params_layout.addWidget(local_ss_params, 1)
+            local_ss_params_summary = QtWidgets.QLabel("SS Parameters: -")
+            local_ss_params_summary.setStyleSheet("color: #64748b; font-size: 11px;")
+            local_ss_params_summary.setWordWrap(True)
+            params_layout.addWidget(local_ss_params_summary)
+            ss_param_btns = QtWidgets.QHBoxLayout()
+            btn_local_ss_params_all = QtWidgets.QPushButton("Select All SS")
+            btn_local_ss_params_clear = QtWidgets.QPushButton("Clear SS")
+            ss_param_btns.addWidget(btn_local_ss_params_all)
+            ss_param_btns.addWidget(btn_local_ss_params_clear)
+            ss_param_btns.addStretch(1)
+            params_layout.addLayout(ss_param_btns)
             local_splitter.addWidget(params_frame)
             local_splitter.setStretchFactor(0, 1)
             local_splitter.setStretchFactor(1, 1)
@@ -11685,13 +11898,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "condition": dict(run_selection_check_states.get("condition") or {}),
             }
             local_current_run_mode = str(local_run_scope.currentData() or "sequence").strip().lower()
-            local_param_states: dict[str, bool] = {}
-            for i in range(list_params.count()):
-                it = list_params.item(i)
-                if it is not None:
-                    checked = bool(it.checkState() == QtCore.Qt.CheckState.Checked)
-                    local_param_states[_norm_name(self._list_widget_item_value(it))] = checked
-                    local_param_states[_norm_name(it.text())] = checked
+            local_param_states: dict[str, dict[str, bool]] = {
+                "pm": _checked_state_map(list_pm_params),
+                "ss": _checked_state_map(list_ss_params),
+            }
 
             def _local_selected_serials() -> list[str]:
                 out: list[str] = []
@@ -11716,8 +11926,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 lbl_popup_serials_summary.setToolTip(", ".join(display_serials))
                 lbl_popup_runs_summary.setText(local_runs_summary.text())
                 lbl_popup_runs_summary.setToolTip(local_runs_summary.toolTip())
-                lbl_popup_params_summary.setText(local_params_summary.text())
-                lbl_popup_params_summary.setToolTip(local_params_summary.toolTip())
+                lbl_popup_pm_params_summary.setText(local_pm_params_summary.text())
+                lbl_popup_pm_params_summary.setToolTip(local_pm_params_summary.toolTip())
+                lbl_popup_ss_params_summary.setText(local_ss_params_summary.text())
+                lbl_popup_ss_params_summary.setToolTip(local_ss_params_summary.toolTip())
 
             def _local_capture_run_states() -> None:
                 nonlocal local_current_run_mode
@@ -11753,13 +11965,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 _local_refresh_popup_summary()
 
             def _local_capture_param_states() -> None:
-                local_param_states.clear()
-                for i in range(local_params.count()):
-                    it = local_params.item(i)
-                    if it is not None:
-                        checked = bool(it.checkState() == QtCore.Qt.CheckState.Checked)
-                        local_param_states[_norm_name(self._list_widget_item_value(it))] = checked
-                        local_param_states[_norm_name(it.text())] = checked
+                local_param_states["pm"] = _checked_state_map(local_pm_params)
+                local_param_states["ss"] = _checked_state_map(local_ss_params)
 
             def _local_selected_member_runs() -> list[str]:
                 out: list[str] = []
@@ -11786,66 +11993,71 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 return out
 
             def _local_update_params_summary() -> None:
-                labels = [
-                    local_params.item(i).text().strip()
-                    for i in range(local_params.count())
-                    if local_params.item(i) is not None
-                    and local_params.item(i).checkState() == QtCore.Qt.CheckState.Checked
-                    and local_params.item(i).text().strip()
+                pm_labels = [
+                    local_pm_params.item(i).text().strip()
+                    for i in range(local_pm_params.count())
+                    if local_pm_params.item(i) is not None
+                    and local_pm_params.item(i).checkState() == QtCore.Qt.CheckState.Checked
+                    and local_pm_params.item(i).text().strip()
                 ]
-                local_params_summary.setText(
-                    f"Certification Parameters: {_selection_summary(labels, local_params.count())}"
+                ss_labels = [
+                    local_ss_params.item(i).text().strip()
+                    for i in range(local_ss_params.count())
+                    if local_ss_params.item(i) is not None
+                    and local_ss_params.item(i).checkState() == QtCore.Qt.CheckState.Checked
+                    and local_ss_params.item(i).text().strip()
+                ]
+                local_pm_params_summary.setText(
+                    f"PM Parameters: {_selection_summary(pm_labels, local_pm_params.count())}"
                 )
-                local_params_summary.setToolTip(", ".join(labels))
+                local_pm_params_summary.setToolTip(", ".join(pm_labels))
+                local_ss_params_summary.setText(
+                    f"SS Parameters: {_selection_summary(ss_labels, local_ss_params.count())}"
+                )
+                local_ss_params_summary.setToolTip(", ".join(ss_labels))
                 _local_refresh_popup_summary()
 
             def _local_populate_params(*, capture_current: bool = True) -> None:
                 if capture_current:
                     _local_capture_param_states()
-                selected_runs = _local_selected_member_runs()
-                y_norms: set[str] = set()
-                raw_columns: list[dict[str, str]] = []
-                try:
-                    for col in self._available_td_y_columns(selected_runs, surface="performance"):
-                        name = str((col or {}).get("name") or "").strip()
-                        if not name:
-                            continue
-                        nk = _norm_name(name)
-                        if nk in x_exclude_norms or nk in y_norms:
-                            continue
-                        y_norms.add(nk)
-                        raw_columns.append({"name": name, "units": str((col or {}).get("units") or "").strip()})
-                except Exception:
-                    raw_columns = []
-                raw_columns = sorted(raw_columns, key=lambda value: str(value.get("name") or "").lower())
-                param_options = self._parameter_selector_options(
-                    surface="performance",
-                    run_names=selected_runs,
-                    raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
-                    raw_columns=raw_columns,
-                )
-                local_params.blockSignals(True)
-                try:
-                    local_params.clear()
-                    for option in param_options:
-                        value = str(option.get("value") or "").strip()
-                        label = str(option.get("label") or option.get("display_name") or value).strip()
-                        if not value or not label:
-                            continue
-                        raw_names = [str(raw or "").strip() for raw in (option.get("raw_names") or []) if str(raw or "").strip()]
-                        it = QtWidgets.QListWidgetItem(label)
-                        it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                        it.setData(QtCore.Qt.ItemDataRole.UserRole, value)
-                        it.setToolTip("\n".join([part for part in (label, ", ".join(raw_names)) if part]))
-                        checked = bool(
-                            local_param_states.get(_norm_name(value), False)
-                            or local_param_states.get(_norm_name(label), False)
-                            or any(local_param_states.get(_norm_name(raw), False) for raw in raw_names)
-                        )
-                        it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
-                        local_params.addItem(it)
-                finally:
-                    local_params.blockSignals(False)
+                local_selections: list[dict[str, object]] = []
+                for i in range(local_runs.count()):
+                    it = local_runs.item(i)
+                    if not it or it.checkState() != QtCore.Qt.CheckState.Checked:
+                        continue
+                    data = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                    if isinstance(data, dict):
+                        local_selections.append(dict(data))
+                pm_runs = _selected_member_runs_for_family(local_selections, "pm")
+                ss_runs = _selected_member_runs_for_family(local_selections, "ss")
+
+                def _family_param_options(run_names: Sequence[object] | None) -> list[dict[str, object]]:
+                    y_norms: set[str] = set()
+                    raw_columns: list[dict[str, str]] = []
+                    try:
+                        for col in self._available_td_y_columns(run_names, surface="performance"):
+                            name = str((col or {}).get("name") or "").strip()
+                            if not name:
+                                continue
+                            nk = _norm_name(name)
+                            if nk in x_exclude_norms or nk in y_norms:
+                                continue
+                            y_norms.add(nk)
+                            raw_columns.append({"name": name, "units": str((col or {}).get("units") or "").strip()})
+                    except Exception:
+                        raw_columns = []
+                    raw_columns = sorted(raw_columns, key=lambda value: str(value.get("name") or "").lower())
+                    return self._parameter_selector_options(
+                        surface="performance",
+                        run_names=run_names,
+                        raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
+                        raw_columns=raw_columns,
+                    )
+
+                pm_options = _family_param_options(pm_runs)
+                ss_options = _family_param_options(ss_runs)
+                _populate_param_list(local_pm_params, pm_options, local_param_states.get("pm"))
+                _populate_param_list(local_ss_params, ss_options, local_param_states.get("ss"))
                 _local_update_params_summary()
 
             def _local_refresh_serials(*, selected_values: Sequence[object] | None = None) -> None:
@@ -11955,26 +12167,29 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 _local_update_runs_summary()
                 _local_populate_params()
 
-            def _local_set_param_checks(checked: bool) -> None:
-                local_params.blockSignals(True)
+            def _local_set_param_checks(listw: QtWidgets.QListWidget, checked: bool) -> None:
+                listw.blockSignals(True)
                 try:
-                    for i in range(local_params.count()):
-                        it = local_params.item(i)
+                    for i in range(listw.count()):
+                        it = listw.item(i)
                         if it is not None and not it.isHidden():
                             it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                 finally:
-                    local_params.blockSignals(False)
+                    listw.blockSignals(False)
                 _local_update_params_summary()
 
             btn_local_serials_all.clicked.connect(_local_select_all_serials)
             btn_local_serials_clear.clicked.connect(_local_clear_serials)
             btn_local_runs_all.clicked.connect(lambda *_: _local_set_run_checks(True))
             btn_local_runs_clear.clicked.connect(lambda *_: _local_set_run_checks(False))
-            btn_local_params_all.clicked.connect(lambda *_: _local_set_param_checks(True))
-            btn_local_params_clear.clicked.connect(lambda *_: _local_set_param_checks(False))
+            btn_local_pm_params_all.clicked.connect(lambda *_: _local_set_param_checks(local_pm_params, True))
+            btn_local_pm_params_clear.clicked.connect(lambda *_: _local_set_param_checks(local_pm_params, False))
+            btn_local_ss_params_all.clicked.connect(lambda *_: _local_set_param_checks(local_ss_params, True))
+            btn_local_ss_params_clear.clicked.connect(lambda *_: _local_set_param_checks(local_ss_params, False))
             local_serial_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_serials, text))
             local_run_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_runs, text))
-            local_param_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_params, text))
+            local_pm_param_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_pm_params, text))
+            local_ss_param_filter.textChanged.connect(lambda text: _set_filtered_hidden(local_ss_params, text))
             local_program.currentIndexChanged.connect(
                 lambda *_: (
                     _local_refresh_serials(),
@@ -11988,7 +12203,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             local_run_scope.currentIndexChanged.connect(lambda *_: (_local_populate_runs(), _local_populate_params()))
             local_runs.itemChanged.connect(lambda *_: (_local_update_runs_summary(), _local_populate_params()))
-            local_params.itemChanged.connect(lambda *_: _local_update_params_summary())
+            local_pm_params.itemChanged.connect(lambda *_: _local_update_params_summary())
+            local_ss_params.itemChanged.connect(lambda *_: _local_update_params_summary())
 
             _local_refresh_serials()
             _local_sync_run_scope_availability()
@@ -12032,22 +12248,50 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     selected_serials=chosen_serials,
                     capture_run_states=False,
                 )
-                list_params.blockSignals(True)
-                try:
-                    for i in range(list_params.count()):
-                        it = list_params.item(i)
-                        if it is None:
-                            continue
-                        checked = bool(
-                            local_param_states.get(_norm_name(self._list_widget_item_value(it)), False)
-                            or local_param_states.get(_norm_name(it.text()), False)
-                        )
-                        it.setCheckState(
-                            QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
-                        )
-                finally:
-                    list_params.blockSignals(False)
+                _populate_param_list(list_pm_params, [
+                    {
+                        "value": self._list_widget_item_value(local_pm_params.item(i)),
+                        "label": str(local_pm_params.item(i).text() or "").strip(),
+                        "display_name": str(local_pm_params.item(i).text() or "").strip(),
+                        "raw_names": [],
+                    }
+                    for i in range(local_pm_params.count())
+                    if local_pm_params.item(i) is not None
+                ], local_param_states.get("pm"))
+                _populate_param_list(list_ss_params, [
+                    {
+                        "value": self._list_widget_item_value(local_ss_params.item(i)),
+                        "label": str(local_ss_params.item(i).text() or "").strip(),
+                        "display_name": str(local_ss_params.item(i).text() or "").strip(),
+                        "raw_names": [],
+                    }
+                    for i in range(local_ss_params.count())
+                    if local_ss_params.item(i) is not None
+                ], local_param_states.get("ss"))
+                _sync_union_param_list(_merge_param_options(
+                    [
+                        {
+                            "value": self._list_widget_item_value(local_pm_params.item(i)),
+                            "label": str(local_pm_params.item(i).text() or "").strip(),
+                            "display_name": str(local_pm_params.item(i).text() or "").strip(),
+                            "raw_names": [],
+                        }
+                        for i in range(local_pm_params.count())
+                        if local_pm_params.item(i) is not None
+                    ],
+                    [
+                        {
+                            "value": self._list_widget_item_value(local_ss_params.item(i)),
+                            "label": str(local_ss_params.item(i).text() or "").strip(),
+                            "display_name": str(local_ss_params.item(i).text() or "").strip(),
+                            "raw_names": [],
+                        }
+                        for i in range(local_ss_params.count())
+                        if local_ss_params.item(i) is not None
+                    ],
+                ))
                 _update_params_label()
+                _update_metric_params_label()
                 try:
                     _refresh_perf_eq_options()
                 except Exception:
@@ -12096,9 +12340,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
 
         def _refresh_params_from_runs():
             nonlocal perf_param_options
+            selections = _collect_checked_run_selections()
             runs_sel = _selected_member_runs()
             if not runs_sel or not self._db_path:
                 perf_param_options = []
+                list_pm_params.clear()
+                list_ss_params.clear()
                 list_params.clear()
                 list_metric_params.clear()
                 _update_runs_label()
@@ -12110,14 +12357,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     pass
                 return
 
-            prev_checked: dict[str, bool] = {}
-            for i in range(list_params.count()):
-                it = list_params.item(i)
-                if not it:
-                    continue
-                checked = it.checkState() == QtCore.Qt.CheckState.Checked
-                prev_checked[_norm_name(self._list_widget_item_value(it))] = checked
-                prev_checked[_norm_name(it.text())] = checked
+            prev_pm_checked = _checked_state_map(list_pm_params)
+            prev_ss_checked = _checked_state_map(list_ss_params)
 
             prev_metric_checked: dict[str, bool] = {}
             for i in range(list_metric_params.count()):
@@ -12128,53 +12369,40 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 prev_metric_checked[_norm_name(self._list_widget_item_value(it))] = checked
                 prev_metric_checked[_norm_name(it.text())] = checked
 
-            y_norms: set[str] = set()
-            raw_columns: list[dict[str, str]] = []
-            try:
-                for c in self._available_td_y_columns(runs_sel, surface="performance"):
-                    name = str((c or {}).get("name") or "").strip()
-                    if not name:
-                        continue
-                    nk = _norm_name(name)
-                    if nk in x_exclude_norms or nk in y_norms:
-                        continue
-                    y_norms.add(nk)
-                    raw_columns.append({"name": name, "units": str((c or {}).get("units") or "").strip()})
-            except Exception:
-                raw_columns = []
+            def _family_param_options(run_names: Sequence[object] | None) -> list[dict[str, object]]:
+                y_norms: set[str] = set()
+                raw_columns: list[dict[str, str]] = []
+                try:
+                    for c in self._available_td_y_columns(run_names, surface="performance"):
+                        name = str((c or {}).get("name") or "").strip()
+                        if not name:
+                            continue
+                        nk = _norm_name(name)
+                        if nk in x_exclude_norms or nk in y_norms:
+                            continue
+                        y_norms.add(nk)
+                        raw_columns.append({"name": name, "units": str((c or {}).get("units") or "").strip()})
+                except Exception:
+                    raw_columns = []
+                raw_columns = sorted(raw_columns, key=lambda item: str(item.get("name") or "").lower())
+                return self._parameter_selector_options(
+                    surface="performance",
+                    run_names=run_names,
+                    raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
+                    raw_columns=raw_columns,
+                )
 
-            raw_columns = sorted(raw_columns, key=lambda item: str(item.get("name") or "").lower())
-            param_options = self._parameter_selector_options(
-                surface="performance",
-                run_names=runs_sel,
-                raw_names=[str(item.get("name") or "").strip() for item in raw_columns if str(item.get("name") or "").strip()],
-                raw_columns=raw_columns,
-            )
-            perf_param_options = [dict(option) for option in param_options if isinstance(option, Mapping)]
-            list_params.blockSignals(True)
-            list_params.clear()
-            for option in param_options:
-                value = str(option.get("value") or "").strip()
-                label = str(option.get("label") or option.get("display_name") or value).strip()
-                if not value or not label:
-                    continue
-                raw_names = [str(raw or "").strip() for raw in (option.get("raw_names") or []) if str(raw or "").strip()]
-                it = QtWidgets.QListWidgetItem(label)
-                it.setFlags(it.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                it.setData(QtCore.Qt.ItemDataRole.UserRole, value)
-                it.setToolTip("\n".join([part for part in (label, ", ".join(raw_names)) if part]))
-                checked = prev_checked.get(_norm_name(value))
-                if checked is None:
-                    checked = prev_checked.get(_norm_name(label))
-                if checked is None:
-                    checked = any(prev_checked.get(_norm_name(raw), False) for raw in raw_names)
-                it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
-                list_params.addItem(it)
-            list_params.blockSignals(False)
+            pm_options = _family_param_options(_selected_member_runs_for_family(selections, "pm"))
+            ss_options = _family_param_options(_selected_member_runs_for_family(selections, "ss"))
+            combined_options = _merge_param_options(pm_options, ss_options)
+            perf_param_options = [dict(option) for option in combined_options if isinstance(option, Mapping)]
+            _populate_param_list(list_pm_params, pm_options, prev_pm_checked)
+            _populate_param_list(list_ss_params, ss_options, prev_ss_checked)
+            _sync_union_param_list(combined_options)
 
             list_metric_params.blockSignals(True)
             list_metric_params.clear()
-            for option in param_options:
+            for option in combined_options:
                 value = str(option.get("value") or "").strip()
                 label = str(option.get("label") or option.get("display_name") or value).strip()
                 if not value or not label:
@@ -12190,7 +12418,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 if checked is None:
                     checked = next((True for raw in raw_names if prev_metric_checked.get(_norm_name(raw), False)), None)
                 if checked is None:
-                    checked = prev_checked.get(_norm_name(value), False)
+                    checked = bool(
+                        prev_pm_checked.get(_norm_name(value), False)
+                        or prev_ss_checked.get(_norm_name(value), False)
+                    )
                 it.setCheckState(QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked)
                 list_metric_params.addItem(it)
             list_metric_params.blockSignals(False)
@@ -12213,12 +12444,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
 
         def _open_params_popup() -> None:
-            _open_checklist_popup(
-                title_text="Certification Parameter Selection",
-                target_list=list_params,
-                filter_placeholder="Filter certification parameters...",
-                extra_apply=lambda _ctx: (_update_params_label(), _refresh_perf_eq_options()),
-            )
+            _open_certification_popup()
 
         def _open_metrics_popup() -> None:
             def _metrics_extra_setup(ctx: dict) -> None:
@@ -12281,7 +12507,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         list_sn.itemSelectionChanged.connect(lambda: _apply_certification_scope_change())
         cb_run_scope.currentIndexChanged.connect(lambda *_: _apply_certification_scope_change(capture_run_states=False))
         list_runs.itemChanged.connect(lambda *_: (_refresh_params_from_runs(), _refresh_certification_summary()))
-        list_params.itemChanged.connect(lambda *_: _update_params_label())
+        list_pm_params.itemChanged.connect(lambda *_: (_sync_union_param_list(), _update_params_label(), _update_metric_params_label(), _refresh_perf_eq_options()))
+        list_ss_params.itemChanged.connect(lambda *_: (_sync_union_param_list(), _update_params_label(), _update_metric_params_label(), _refresh_perf_eq_options()))
         list_metric_params.itemChanged.connect(lambda *_: _update_metric_params_label())
         list_metric_stats.itemChanged.connect(lambda *_: _update_metric_params_label())
         ed_output_dir.textEdited.connect(lambda *_: output_dir_auto.__setitem__("enabled", False))
@@ -12562,7 +12789,9 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not hi_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one certification serial.")
                 return
-            params_sel = _collect_checked(list_params)
+            pm_params_sel = _collect_checked(list_pm_params)
+            ss_params_sel = _collect_checked(list_ss_params)
+            params_sel = _unique_text_values(list(pm_params_sel) + list(ss_params_sel))
             if not params_sel:
                 QtWidgets.QMessageBox.information(dlg, "Auto Report", "Select at least one certification parameter.")
                 return
@@ -12683,6 +12912,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "filtered_serials": filtered_serials,
                 "certifying_program": certifying_program,
                 "highlighted_serials": hi_sel,
+                "pm_params": pm_params_sel,
+                "ss_params": ss_params_sel,
                 "params": params_sel,
                 "metric_params": metric_params_sel,
                 "metric_stats": metric_stats_sel,
@@ -12740,6 +12971,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             "filter_state": dict(payload.get("filter_state") or {}),
             "filtered_serials": payload.get("filtered_serials") or [],
             "certifying_program": certifying_program,
+            "pm_params": payload.get("pm_params") or [],
+            "ss_params": payload.get("ss_params") or [],
             "params": payload.get("params") or [],
             "metric_params": payload.get("metric_params") or [],
             "metric_stats": payload.get("metric_stats") or [],

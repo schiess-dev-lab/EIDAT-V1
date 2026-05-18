@@ -317,6 +317,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
     def _prepare_specs_for_run_type_mode_regression(
         self,
         selections: list[dict[str, object]] | None = None,
+        params: list[object] | None = None,
+        params_by_family: Mapping[str, Sequence[object]] | None = None,
     ) -> dict[str, object]:
         run_by_name = {"Run A": {"display_name": "Run A", "default_x": "Time"}}
         filter_rows = [
@@ -513,7 +515,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     conn=conn,
                     run_by_name=run_by_name,
                     selections=selected,
-                    params=["Pressure"],
+                    params=list(params or ["Pressure"]),
+                    params_by_family=params_by_family,
                     filter_rows=[dict(row) for row in filter_rows],
                     filter_state={},
                     parameter_context={},
@@ -979,6 +982,25 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(by_raw[tar._norm_key("thrust-end")]["selection_value"], "td_param:thrust_nominal")
         self.assertEqual(by_raw[tar._norm_key("thrust-normalized")]["display_name"], "Thrust nominal")
 
+    def test_resolve_selected_params_prefers_family_specific_lists_with_legacy_fallback(self) -> None:
+        options = {
+            "params": ["legacy_param"],
+            "pm_params": ["pm_param"],
+            "ss_params": ["ss_param"],
+        }
+        self.assertEqual(
+            tar._resolve_selected_params(object(), runs=["Run A"], options=options, run_type_mode="pulsed_mode"),
+            ["pm_param"],
+        )
+        self.assertEqual(
+            tar._resolve_selected_params(object(), runs=["Run A"], options=options, run_type_mode="steady_state"),
+            ["ss_param"],
+        )
+        self.assertEqual(
+            tar._resolve_selected_params(object(), runs=["Run A"], options={"params": ["legacy_param"]}, run_type_mode="pulsed_mode"),
+            ["legacy_param"],
+        )
+
     def test_load_metric_map_for_selection_unions_mapped_raw_names(self) -> None:
         fake_be = SimpleNamespace(
             td_parameter_selection_raw_names=lambda _ctx, _value, **_kwargs: ["thrust-end", "thrust-normalized"],
@@ -1427,6 +1449,20 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             {spec["base_condition_label"] for spec in plot_specs if spec.get("section") == "run_condition_curve_overlays"},
             {"Steady State Condition", "Pulse Mode Condition"},
         )
+
+    def test_prepare_row_specs_uses_family_specific_params(self) -> None:
+        fixture = self._prepare_specs_for_run_type_mode_regression(
+            params=["Legacy Pressure"],
+            params_by_family={
+                "steady_state": ["Steady Pressure"],
+                "pulsed_mode": ["Pulse Pressure"],
+            },
+        )
+        specs = [dict(spec) for spec in (fixture["specs"] or []) if isinstance(spec, dict)]
+        self.assertEqual({spec["selection_id"] for spec in specs}, {"condition:ss", "condition:pm"})
+        spec_by_id = {str(spec.get("selection_id") or ""): spec for spec in specs}
+        self.assertEqual(spec_by_id["condition:ss"]["param"], "Steady Pressure")
+        self.assertEqual(spec_by_id["condition:pm"]["param"], "Pulse Pressure")
 
     def test_build_per_serial_comparison_rows_tracks_initial_and_final_values(self) -> None:
         ctx = {"filter_state": {}, "be": object(), "db_path": Path("fake.sqlite3"), "options": {}}
@@ -2690,6 +2726,41 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             try:
                 links = result.load_page(1).get_links()
                 self.assertTrue(any(link.get("page") == 0 for link in links))
+            finally:
+                result.close()
+
+    def test_apply_pdf_navigation_draws_backlink_text_when_plot_page_label_is_missing(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "comparison_navigation_backlink_fallback.pdf"
+            doc = fitz.open()
+            doc.new_page()
+            doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[
+                    {
+                        "section_key": "run_condition_plot_metrics",
+                        "section_label": "Run Condition Metrics",
+                        "navigator_label": "Run Metrics",
+                        "plot_label": "Pressure | Time | mean",
+                        "page_number": 2,
+                        "destination_page_index": 1,
+                    }
+                ],
+                comparison_section_start_page_index=0,
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                plot_page = result.load_page(1)
+                links = plot_page.get_links()
+                self.assertTrue(any(link.get("page") == 0 for link in links))
+                backlink_rects = list(plot_page.search_for(tar._TAR_PLOT_BACKLINK_TEXT))
+                self.assertTrue(backlink_rects)
             finally:
                 result.close()
 

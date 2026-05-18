@@ -2890,6 +2890,32 @@ def _resolve_selected_runs(run_rows: list[dict], options: dict) -> list[str]:
     return [r for r in runs if r in run_by_name]
 
 
+def _selected_family_params(
+    options: Mapping[str, object] | None,
+    run_type_mode: str | None,
+) -> tuple[list[str], bool]:
+    opts = dict(options or {})
+    normalized_mode = str(run_type_mode or "").strip().lower()
+    key = ""
+    if normalized_mode == "pulsed_mode":
+        key = "pm_params"
+    elif normalized_mode == "steady_state":
+        key = "ss_params"
+    if not key:
+        return [], False
+    raw_values = opts.get(key)
+    if not isinstance(raw_values, list):
+        return [], False
+    return [str(value).strip() for value in raw_values if str(value).strip()], True
+
+
+def _selected_union_params(options: Mapping[str, object] | None) -> list[str]:
+    raw_values = (dict(options or {})).get("params")
+    if not isinstance(raw_values, list):
+        return []
+    return [str(value).strip() for value in raw_values if str(value).strip()]
+
+
 def _resolve_selected_params(
     be_or_conn: Any,
     db_path: Path | None = None,
@@ -2897,9 +2923,12 @@ def _resolve_selected_params(
     *,
     runs: list[str],
     options: dict,
+    run_type_mode: str | None = None,
 ) -> list[str]:
-    selected_params = options.get("params") or []
-    params = [str(p).strip() for p in selected_params if str(p).strip()] if isinstance(selected_params, list) else []
+    family_params, family_present = _selected_family_params(options, run_type_mode)
+    if family_present:
+        return family_params
+    params = _selected_union_params(options)
     if params:
         return params
 
@@ -3158,6 +3187,7 @@ def _tar_resolve_params_for_report(
     runs: list[str],
     options: dict,
     parameter_context: Mapping[str, object] | None,
+    run_type_mode: str | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, dict[str, str]]]:
     raw_catalog = _tar_y_column_catalog(be, db_path, conn, runs)
     raw_names = [str(item.get("name") or "").strip() for item in raw_catalog.values() if str(item.get("name") or "").strip()]
@@ -3174,13 +3204,14 @@ def _tar_resolve_params_for_report(
             if raw_norm and raw_norm not in options_by_raw_norm:
                 options_by_raw_norm[raw_norm] = dict(option)
 
-    selected_values = [
-        str(value).strip()
-        for value in (options.get("params") or [])
-        if str(value).strip()
-    ] if isinstance(options.get("params") or [], list) else []
-    if not selected_values:
-        selected_values = _resolve_selected_params(be, db_path, conn, runs=runs, options=options)
+    selected_values = _resolve_selected_params(
+        be,
+        db_path,
+        conn,
+        runs=runs,
+        options=options,
+        run_type_mode=run_type_mode,
+    )
 
     display_resolver = getattr(be, "td_parameter_value_display_name", None)
 
@@ -3261,7 +3292,21 @@ def _tar_resolve_params_for_report(
                 existing["display_units"] = display_units
 
     if not resolved_params_by_key and selected_values:
-        fallback_params = _resolve_selected_params(be, db_path, conn, runs=runs, options={**options, "params": []})
+        fallback_options = dict(options)
+        if run_type_mode == "pulsed_mode":
+            fallback_options["pm_params"] = []
+        elif run_type_mode == "steady_state":
+            fallback_options["ss_params"] = []
+        else:
+            fallback_options["params"] = []
+        fallback_params = _resolve_selected_params(
+            be,
+            db_path,
+            conn,
+            runs=runs,
+            options=fallback_options,
+            run_type_mode=run_type_mode,
+        )
         for raw_param in fallback_params:
             raw_text = str(raw_param or "").strip()
             if not raw_text:
@@ -10326,6 +10371,35 @@ def _tar_insert_page_link(page: Any, rect: Any, destination_page_index: object) 
         pass
 
 
+def _tar_insert_plot_backlink_fallback(page: Any, *, fitz_module: Any) -> Any:
+    page_rect = getattr(page, "rect", None)
+    page_width = float(getattr(page_rect, "width", 0.0) or 0.0)
+    fallback_rect = fitz_module.Rect(
+        max(36.0, page_width - 220.0),
+        70.0,
+        max(36.0, page_width - 36.0),
+        92.0,
+    )
+    try:
+        page.insert_textbox(
+            fallback_rect,
+            _TAR_PLOT_BACKLINK_TEXT,
+            fontname="helv",
+            fontsize=10,
+            color=(29 / 255.0, 78 / 255.0, 216 / 255.0),
+            align=2,
+        )
+    except Exception:
+        return fallback_rect
+    try:
+        backlink_rects = list(page.search_for(_TAR_PLOT_BACKLINK_TEXT))
+        if backlink_rects:
+            return backlink_rects[0]
+    except Exception:
+        pass
+    return fallback_rect
+
+
 def _tar_plot_toc_row_link_rect(
     page: Any,
     label_rect: Any,
@@ -10619,12 +10693,7 @@ def _tar_apply_pdf_navigation(
                 if backlink_rects:
                     _tar_insert_page_link(page, backlink_rects[0], comparison_target_page_index)
                     continue
-                fallback_rect = fitz.Rect(
-                    max(36.0, float(page.rect.width) - 190.0),
-                    70.0,
-                    max(36.0, float(page.rect.width) - 36.0),
-                    100.0,
-                )
+                fallback_rect = _tar_insert_plot_backlink_fallback(page, fitz_module=fitz)
                 _tar_insert_page_link(page, fallback_rect, comparison_target_page_index)
 
         grouped_comparison_links: dict[int, list[dict[str, Any]]] = {}
@@ -11151,6 +11220,7 @@ def _tar_prepare_row_specs(
     run_by_name: Mapping[str, dict],
     selections: list[dict],
     params: list[object],
+    params_by_family: Mapping[str, Sequence[object]] | None = None,
     filter_rows: list[dict],
     filter_state: Mapping[str, object] | None,
     parameter_display_by_raw: Mapping[str, Mapping[str, object]] | None = None,
@@ -11158,7 +11228,22 @@ def _tar_prepare_row_specs(
     progress_cb: Callable[[str], None] | None = None,
 ) -> list[dict]:
     row_specs: list[dict] = []
-    total_pairs = max(1, len(selections) * max(1, len(params)))
+    total_pairs = max(
+        1,
+        sum(
+            max(
+                1,
+                len(
+                    list(
+                        (params_by_family or {}).get(_selection_single_run_type_mode(selection) or "", [])
+                    )
+                )
+                if (params_by_family or {}).get(_selection_single_run_type_mode(selection) or "", None) is not None
+                else len(params),
+            )
+            for selection in selections
+        ),
+    )
     pair_index = 0
     for selection_index, selection in enumerate(selections, start=1):
         run_name = str(selection.get("run_name") or "").strip()
@@ -11206,7 +11291,13 @@ def _tar_prepare_row_specs(
             run_name=run_name,
         )
 
-        for target_param in params:
+        selection_params = list(params)
+        if isinstance(params_by_family, Mapping):
+            family_params = params_by_family.get(selection_run_type_mode)
+            if family_params is not None:
+                selection_params = list(family_params)
+
+        for target_param in selection_params:
             pair_index += 1
             param_meta = _tar_param_group_meta(
                 target_param,
@@ -12714,15 +12805,66 @@ def _tar_prepare_base(
             "Update Project again and verify TD source resolution for this project."
         )
 
+    report_selections = _tar_resolve_report_selections(run_by_name, runs, initial_options)
+    pulsed_runs = _tar_unique_text_values(
+        [
+            member
+            for selection in report_selections
+            if _selection_single_run_type_mode(selection) == "pulsed_mode"
+            for member in (
+                _tar_unique_text_values(selection.get("member_runs") or [])
+                or [str(selection.get("run_name") or "").strip()]
+            )
+            if str(member or "").strip()
+        ]
+    )
+    steady_runs = _tar_unique_text_values(
+        [
+            member
+            for selection in report_selections
+            if _selection_single_run_type_mode(selection) == "steady_state"
+            for member in (
+                _tar_unique_text_values(selection.get("member_runs") or [])
+                or [str(selection.get("run_name") or "").strip()]
+            )
+            if str(member or "").strip()
+        ]
+    )
+
     parameter_context = _tar_load_parameter_context(be, proj, wb, db_path)
-    param_groups, param_display_by_raw = _tar_resolve_params_for_report(
+    pm_param_groups, pm_display_by_raw = _tar_resolve_params_for_report(
         be,
         db_path,
         conn,
-        runs=runs,
+        runs=pulsed_runs,
         options=options,
         parameter_context=parameter_context,
+        run_type_mode="pulsed_mode",
     )
+    ss_param_groups, ss_display_by_raw = _tar_resolve_params_for_report(
+        be,
+        db_path,
+        conn,
+        runs=steady_runs,
+        options=options,
+        parameter_context=parameter_context,
+        run_type_mode="steady_state",
+    )
+    param_groups: list[dict[str, object]] = []
+    seen_param_group_keys: set[tuple[str, str]] = set()
+    for group in list(pm_param_groups or []) + list(ss_param_groups or []):
+        if not isinstance(group, Mapping):
+            continue
+        group_key = (
+            str(group.get("param_key") or "").strip().casefold(),
+            str(group.get("selection_value") or "").strip().casefold(),
+        )
+        if group_key in seen_param_group_keys:
+            continue
+        seen_param_group_keys.add(group_key)
+        param_groups.append(dict(group))
+    param_display_by_raw = dict(pm_display_by_raw or {})
+    param_display_by_raw.update(dict(ss_display_by_raw or {}))
     if not param_groups:
         raise RuntimeError(
             "Auto Report found no reportable Test Data parameters in the current project cache. "
@@ -12827,7 +12969,6 @@ def _tar_prepare_base(
     if not certifying_program:
         raise RuntimeError("Auto Report could not resolve the program for the highlighted certification serials.")
 
-    report_selections = _tar_resolve_report_selections(run_by_name, runs, initial_options)
     _tar_emit_progress(progress_cb, f"Preparing curve comparisons for {len(report_selections)} selection(s) and {len(param_groups)} parameter(s)")
     pair_specs = _tar_prepare_row_specs(
         be=be,
@@ -12836,6 +12977,10 @@ def _tar_prepare_base(
         run_by_name=run_by_name,
         selections=report_selections,
         params=param_groups,
+        params_by_family={
+            "pulsed_mode": list(pm_param_groups or []),
+            "steady_state": list(ss_param_groups or []),
+        },
         filter_rows=filter_rows,
         filter_state=filter_state,
         parameter_display_by_raw=param_display_by_raw,
