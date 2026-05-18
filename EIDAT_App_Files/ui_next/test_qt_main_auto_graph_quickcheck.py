@@ -35,6 +35,22 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
             window = TestDataTrendDialog(project_dir, workbook_path)
         return window
 
+    class _FakePdfPages:
+        saved_figures: list[object] = []
+
+        def __init__(self, _path: str) -> None:
+            self._saved: list[object] = []
+
+        def __enter__(self):
+            type(self).saved_figures = self._saved
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        def savefig(self, fig: object) -> None:
+            self._saved.append(fig)
+
     def test_load_auto_plots_reads_graph_snapshot_store_and_ignores_quickcheck_library(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -288,6 +304,298 @@ class TestQtMainAutoGraphQuickcheck(unittest.TestCase):
                 self.assertEqual(refreshed_paths, [str(pdf_path)])
                 payload = json.loads((project_dir / "auto_plots_test_data.json").read_text(encoding="utf-8"))
                 self.assertEqual(str((payload.get("graph_files") or [])[0].get("pdf_export_path") or ""), str(pdf_path))
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_quickcheck_render_uses_live_plot_title_format_and_keeps_status_out_of_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+
+            window = self._make_window(project_dir, workbook_path)
+            try:
+                captured: dict[str, object] = {}
+                window._available_program_filters = ["Program Alpha"]
+                window._available_serial_filter_rows = [
+                    {"serial": "SN-001", "program_title": "Program Alpha"},
+                ]
+                pack = {"eligibility_filters": {"programs": ["Program Alpha"]}}
+                plot_result = {
+                    "status": "PASS",
+                    "plot_name": "Pressure Plot",
+                    "render_context": {
+                        "plot_definition": {
+                            "mode": "metrics",
+                            "selector_mode": "sequence",
+                            "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                            "stats": ["mean"],
+                            "y": ["Pressure"],
+                        }
+                    },
+                }
+
+                def _fake_render(plot_definition: dict[str, object], *, filter_state=None, title_override: str = "") -> object:
+                    captured["plot_definition"] = dict(plot_definition)
+                    captured["filter_state"] = dict(filter_state or {})
+                    captured["title_override"] = title_override
+                    return object()
+
+                with mock.patch.object(
+                    window,
+                    "_available_auto_plot_selection_items",
+                    return_value=[
+                        {
+                            "id": "sequence:CondA|Program Alpha|Seq-1",
+                            "mode": "sequence",
+                            "run_name": "CondA",
+                            "run_conditions": ["Condition A"],
+                            "member_runs": ["CondA"],
+                        }
+                    ],
+                ), mock.patch.object(window, "_render_plot_def_to_figure", side_effect=_fake_render):
+                    _fig, warning_text, title_text, tab_text = window._render_auto_graph_quickcheck_result_figure(
+                        pack,
+                        plot_result,
+                        target_serials=["SN-001"],
+                    )
+
+                self.assertEqual(warning_text, "")
+                self.assertEqual(
+                    title_text,
+                    "Run Condition: CondA | Graph Type: Serial Number vs Pressure (mean)",
+                )
+                self.assertEqual(captured.get("title_override"), title_text)
+                self.assertNotIn("PASS | Pressure Plot", str(captured.get("title_override") or ""))
+                self.assertEqual(tab_text, "PASS | Pressure Plot")
+                self.assertEqual((captured.get("filter_state") or {}).get("serials"), ["SN-001"])
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_snapshot_from_quickcheck_freezes_target_serials_into_saved_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+
+            window = self._make_window(project_dir, workbook_path)
+            try:
+                db_path = project_dir / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._db_path = db_path
+                window._plot_ready = True
+                window._available_program_filters = ["Program Alpha"]
+                window._available_serial_filter_rows = [
+                    {"serial": "SN-001", "program_title": "Program Alpha"},
+                    {"serial": "SN-002", "program_title": "Program Alpha"},
+                ]
+
+                def _fake_plot_metrics() -> None:
+                    window._last_plot_def = {
+                        "mode": "metrics",
+                        "selector_mode": "sequence",
+                        "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                        "stats": ["mean"],
+                        "y": ["Pressure"],
+                    }
+
+                plot_entry = {
+                    "plot_definition": {
+                        "mode": "metrics",
+                        "selector_mode": "sequence",
+                        "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                        "stats": ["mean"],
+                        "y": ["Pressure"],
+                    },
+                    "snapshot_filter_state": {
+                        "programs": ["Program Alpha"],
+                        "serials": [],
+                        "control_periods": [],
+                        "suppression_voltages": [],
+                        "valve_voltages": [],
+                    },
+                    "snapshot_target_serials": ["SN-001", "SN-002"],
+                }
+
+                with mock.patch.object(window, "_selection_from_plot_def", return_value={"id": "sequence:CondA|Program Alpha|Seq-1"}), mock.patch.object(
+                    window, "_set_mode", return_value=None
+                ), mock.patch.object(
+                    window, "_select_run_by_id", return_value=None
+                ), mock.patch.object(
+                    window, "_set_metric_plot_source", return_value=None
+                ), mock.patch.object(
+                    window, "_plot_metrics", side_effect=_fake_plot_metrics
+                ):
+                    window._apply_auto_graph_quickcheck_plot_to_live_gui(plot_entry)
+
+                snapshot_file = window._current_auto_graph_snapshot_file()
+                self.assertIsNotNone(snapshot_file)
+                filters = (((snapshot_file or {}).get("global_selection") or {}).get("filters") or {})
+                self.assertEqual(filters.get("programs"), ["Program Alpha"])
+                self.assertEqual(filters.get("serials"), ["SN-001", "SN-002"])
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_saved_snapshot_render_uses_frozen_serial_filter_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+
+            window = self._make_window(project_dir, workbook_path)
+            try:
+                captured: dict[str, object] = {}
+                window._available_program_filters = ["Program Alpha"]
+                window._available_serial_filter_rows = [
+                    {"serial": "SN-001", "program_title": "Program Alpha"},
+                    {"serial": "SN-002", "program_title": "Program Alpha"},
+                ]
+                graph_file = {
+                    "name": "Saved Graph",
+                    "global_selection": {
+                        "filters": {
+                            "programs": ["Program Alpha"],
+                            "serials": ["SN-001", "SN-002"],
+                            "control_periods": [],
+                            "suppression_voltages": [],
+                            "valve_voltages": [],
+                        }
+                    },
+                    "track_program_serials": False,
+                    "plots": [
+                        {
+                            "name": "Pressure Plot",
+                            "plot_definition": {
+                                "mode": "metrics",
+                                "selector_mode": "sequence",
+                                "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                                "stats": ["mean"],
+                                "y": ["Pressure"],
+                            },
+                        }
+                    ],
+                }
+                plot_entry = dict((graph_file.get("plots") or [])[0])
+
+                def _fake_render(plot_definition: dict[str, object], *, filter_state=None, title_override: str = "") -> object:
+                    captured["plot_definition"] = dict(plot_definition)
+                    captured["filter_state"] = dict(filter_state or {})
+                    captured["title_override"] = title_override
+                    return object()
+
+                with mock.patch.object(
+                    window,
+                    "_available_auto_plot_selection_items",
+                    return_value=[
+                        {
+                            "id": "sequence:CondA|Program Alpha|Seq-1",
+                            "mode": "sequence",
+                            "run_name": "CondA",
+                            "run_conditions": ["Condition A"],
+                            "member_runs": ["CondA"],
+                        }
+                    ],
+                ), mock.patch.object(window, "_render_plot_def_to_figure", side_effect=_fake_render):
+                    _fig, warning_text = window._render_auto_graph_plot_figure(graph_file, plot_entry)
+
+                self.assertEqual(warning_text, "")
+                self.assertEqual((captured.get("filter_state") or {}).get("serials"), ["SN-001", "SN-002"])
+                self.assertEqual(
+                    captured.get("title_override"),
+                    "Run Condition: CondA | Graph Type: Serial Number vs Pressure (mean)",
+                )
+            finally:
+                window.close()
+                window.deleteLater()
+
+    def test_snapshot_pdf_export_reuses_snapshot_render_title_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            workbook_path = project_dir / "project.xlsx"
+            workbook_path.write_text("", encoding="utf-8")
+
+            window = self._make_window(project_dir, workbook_path)
+            try:
+                db_path = project_dir / "cache.sqlite3"
+                db_path.write_text("", encoding="utf-8")
+                window._db_path = db_path
+                window._plot_ready = True
+                window._available_program_filters = ["Program Alpha"]
+                window._available_serial_filter_rows = [
+                    {"serial": "SN-001", "program_title": "Program Alpha"},
+                ]
+                capture: dict[str, object] = {}
+                pdf_path = project_dir / "snapshot.pdf"
+                graph_file = {
+                    "id": "graph-1",
+                    "name": "Saved Graph",
+                    "global_selection": {
+                        "filters": {
+                            "programs": ["Program Alpha"],
+                            "serials": ["SN-001"],
+                            "control_periods": [],
+                            "suppression_voltages": [],
+                            "valve_voltages": [],
+                        }
+                    },
+                    "track_program_serials": False,
+                    "plots": [
+                        {
+                            "name": "Pressure Plot",
+                            "plot_definition": {
+                                "mode": "metrics",
+                                "selector_mode": "sequence",
+                                "selection_id": "sequence:CondA|Program Alpha|Seq-1",
+                                "stats": ["mean"],
+                                "y": ["Pressure"],
+                            },
+                        }
+                    ],
+                }
+
+                def _fake_render(plot_definition: dict[str, object], *, filter_state=None, title_override: str = "") -> object:
+                    capture["plot_definition"] = dict(plot_definition)
+                    capture["filter_state"] = dict(filter_state or {})
+                    capture["title_override"] = title_override
+                    return object()
+
+                with mock.patch.object(
+                    window,
+                    "_available_auto_plot_selection_items",
+                    return_value=[
+                        {
+                            "id": "sequence:CondA|Program Alpha|Seq-1",
+                            "mode": "sequence",
+                            "run_name": "CondA",
+                            "run_conditions": ["Condition A"],
+                            "member_runs": ["CondA"],
+                        }
+                    ],
+                ), mock.patch.object(
+                    window,
+                    "_render_plot_def_to_figure",
+                    side_effect=_fake_render,
+                ), mock.patch.dict(
+                    sys.modules,
+                    {"matplotlib.backends.backend_pdf": mock.Mock(PdfPages=self._FakePdfPages)},
+                ):
+                    saved = window._save_auto_graph_file_pdf_to_path(graph_file, pdf_path, persist_path=False, show_result=False)
+
+                self.assertIsNotNone(saved)
+                self.assertEqual(capture.get("title_override"), "Run Condition: CondA | Graph Type: Serial Number vs Pressure (mean)")
+                self.assertEqual((capture.get("filter_state") or {}).get("serials"), ["SN-001"])
+                self.assertEqual(len(self._FakePdfPages.saved_figures), 1)
             finally:
                 window.close()
                 window.deleteLater()

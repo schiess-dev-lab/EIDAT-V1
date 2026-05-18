@@ -25061,12 +25061,22 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self,
         graph_file: Mapping[str, object] | None,
         plot_entry: Mapping[str, object] | None,
+        *,
+        filter_state: Mapping[str, object] | None = None,
     ) -> str:
         plot_definition = self._auto_plot_entry_plot_definition(plot_entry)
-        selection = self._auto_graph_plot_combined_selection(plot_definition, graph_file=graph_file)
+        selection = self._auto_graph_plot_combined_selection(
+            plot_definition,
+            graph_file=graph_file,
+            filter_state=filter_state,
+        )
         run_condition = self._selection_condition_label(selection)
         if not run_condition:
-            run_condition = self._auto_graph_plot_selection_summary_text(plot_definition, graph_file=graph_file)
+            run_condition = self._auto_graph_plot_selection_summary_text(
+                plot_definition,
+                graph_file=graph_file,
+                filter_state=filter_state,
+            )
         return self._format_plot_title(run_condition, self._auto_plot_graph_type_text(plot_entry))
 
     def _auto_plot_list_item_text(self, entry: Mapping[str, object] | None) -> str:
@@ -26389,15 +26399,83 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             for value in (selection.get("member_sequences") or [])
             if str(value).strip()
         ]
+        title_text = self._auto_graph_plot_header_text(
+            graph_file,
+            {"plot_definition": render_definition, "name": plot_entry.get("name") if isinstance(plot_entry, Mapping) else ""},
+            filter_state=filter_state,
+        )
         try:
             fig = self._render_plot_def_to_figure(
                 render_definition,
                 filter_state=filter_state,
+                title_override=title_text,
             )
             return fig, ""
         except Exception as exc:
             message = str(exc or "Unable to render this Auto-Graph plot.")
-            return self._auto_plot_warning_figure(title=title or "Auto-Graph", message=message), message
+            return self._auto_plot_warning_figure(title=title_text or title or "Auto-Graph", message=message), message
+
+    def _quickcheck_render_filter_state(
+        self,
+        pack: Mapping[str, object] | None,
+        *,
+        target_serials: Sequence[object] | None = None,
+    ) -> dict[str, list[str]]:
+        filters = agq.normalize_filter_state((pack or {}).get("eligibility_filters"))
+        filters["serials"] = [
+            str(value).strip()
+            for value in (target_serials or [])
+            if str(value).strip()
+        ]
+        return filters
+
+    def _quickcheck_render_graph_file(
+        self,
+        pack: Mapping[str, object] | None,
+        *,
+        target_serials: Sequence[object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "global_selection": self._auto_graph_file_global_selection_filters_only(
+                {"filters": self._quickcheck_render_filter_state(pack, target_serials=target_serials)},
+                default_to_current=False,
+            ),
+            "track_program_serials": False,
+            "plots": [],
+        }
+
+    def _render_auto_graph_quickcheck_result_figure(
+        self,
+        pack: Mapping[str, object] | None,
+        plot_result: Mapping[str, object] | None,
+        *,
+        target_serials: Sequence[object] | None = None,
+    ) -> tuple[object, str, str, str]:
+        result = plot_result if isinstance(plot_result, Mapping) else {}
+        plot_definition = dict(
+            ((result.get("render_context") or {}) if isinstance(result.get("render_context"), Mapping) else {}).get("plot_definition") or {}
+        )
+        plot_name = str(result.get("plot_name") or "").strip() or "Plot"
+        status_text = str(result.get("status") or "NO_DATA").strip() or "NO_DATA"
+        render_filter_state = self._quickcheck_render_filter_state(pack, target_serials=target_serials)
+        render_graph_file = self._quickcheck_render_graph_file(pack, target_serials=target_serials)
+        title_text = self._auto_graph_plot_header_text(
+            render_graph_file,
+            {"plot_definition": plot_definition, "name": plot_name},
+            filter_state=render_filter_state,
+        )
+        tab_text = f"{status_text} | {plot_name}"
+        try:
+            fig = self._render_plot_def_to_figure(
+                plot_definition,
+                filter_state=render_filter_state,
+                title_override=title_text,
+            )
+            return fig, "", title_text, tab_text
+        except Exception as exc:
+            message = str(result.get("warning_text") or "").strip() or str(exc or "Unable to render this Auto-Graph plot.")
+            fig = self._auto_plot_warning_figure(title=title_text or tab_text, message=message)
+            return fig, message, title_text, tab_text
 
     def _save_auto_graph_file_pdf_to_path(
         self,
@@ -27647,6 +27725,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if not self._last_plot_def:
             return None
         plot_definition = dict(self._last_plot_def or {})
+        plot_definition.pop("quickcheck_snapshot_filter_state", None)
+        plot_definition.pop("quickcheck_target_serials", None)
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode not in {"curves", "metrics", "life_metrics", "performance"}:
             return None
@@ -27683,11 +27763,20 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if current_plot is None:
             return None
         name = self._next_auto_graph_snapshot_name(current_plot.get("name"))
+        raw_last_plot = dict(self._last_plot_def or {}) if isinstance(self._last_plot_def, dict) else {}
+        snapshot_filter_state = (
+            self._normalize_auto_plot_filter_state(
+                raw_last_plot.get("quickcheck_snapshot_filter_state"),
+                default_to_current=False,
+            )
+            if isinstance(raw_last_plot.get("quickcheck_snapshot_filter_state"), Mapping)
+            else self._current_auto_plot_filter_state()
+        )
         payload = {
             "name": name,
             "global_selection": self._auto_graph_file_global_selection_filters_only(
-                {"filters": self._current_auto_plot_filter_state()},
-                default_to_current=True,
+                {"filters": snapshot_filter_state},
+                default_to_current=False,
             ),
             "track_program_serials": False,
             "plots": [current_plot],
@@ -27707,6 +27796,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         mode = str(plot_definition.get("mode") or "").strip().lower()
         if mode not in {"curves", "metrics", "life_metrics", "performance"}:
             return
+        snapshot_filter_state = (
+            self._normalize_auto_plot_filter_state(
+                plot_entry.get("snapshot_filter_state"),
+                default_to_current=False,
+            )
+            if isinstance(plot_entry.get("snapshot_filter_state"), Mapping)
+            else {}
+        )
+        snapshot_target_serials = [
+            str(value).strip()
+            for value in (plot_entry.get("snapshot_target_serials") or [])
+            if str(value).strip()
+        ]
         self._pending_legend_highlight_labels = self._normalize_legend_highlight_labels(
             plot_definition.get("legend_highlight_labels")
         )
@@ -27862,6 +27964,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                             break
             self._redraw_performance_view()
         finally:
+            if isinstance(self._last_plot_def, dict):
+                if snapshot_filter_state or snapshot_target_serials:
+                    frozen_filter_state = self._normalize_auto_plot_filter_state(
+                        snapshot_filter_state,
+                        default_to_current=False,
+                    )
+                    if snapshot_target_serials:
+                        frozen_filter_state["serials"] = list(snapshot_target_serials)
+                    self._last_plot_def["quickcheck_snapshot_filter_state"] = frozen_filter_state
+                    self._last_plot_def["quickcheck_target_serials"] = list(snapshot_target_serials)
+                else:
+                    self._last_plot_def.pop("quickcheck_snapshot_filter_state", None)
+                    self._last_plot_def.pop("quickcheck_target_serials", None)
             self._pending_legend_highlight_labels = None
 
     def _open_auto_graph_quickcheck_rule_editor(
@@ -28371,35 +28486,25 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             warnings = [str(value).strip() for value in (latest_result.get("warnings") or []) if str(value).strip()]
             lbl_warnings.setText("\n".join(warnings))
             plot_results = [dict(item) for item in (latest_result.get("plot_results") or []) if isinstance(item, Mapping)]
-            render_filter_state = agq.normalize_filter_state(current_pack.get("eligibility_filters"))
-            render_filter_state["serials"] = list(target_serials)
             for plot_result in plot_results:
-                plot_definition = (
-                    dict(((plot_result.get("render_context") or {}) if isinstance(plot_result.get("render_context"), Mapping) else {}).get("plot_definition") or {})
+                fig, warning_text, _title_text, tab_text = self._render_auto_graph_quickcheck_result_figure(
+                    current_pack,
+                    plot_result,
+                    target_serials=target_serials,
                 )
-                title_text = f"{str(plot_result.get('status') or 'NO_DATA').strip()} | {str(plot_result.get('plot_name') or '').strip() or 'Plot'}"
-                try:
-                    fig = self._render_plot_def_to_figure(
-                        plot_definition,
-                        filter_state=render_filter_state,
-                        title_override=title_text,
-                    )
-                except Exception as exc:
-                    message = str(plot_result.get("warning_text") or "").strip() or str(exc)
-                    fig = self._auto_plot_warning_figure(title=title_text, message=message)
                 tab = QtWidgets.QWidget()
                 tab_layout = QtWidgets.QVBoxLayout(tab)
                 tab_layout.setContentsMargins(8, 8, 8, 8)
                 tab_layout.setSpacing(8)
                 summary_label = QtWidgets.QLabel(
-                    f"{str(plot_result.get('summary_text') or '').strip()}\n{str(plot_result.get('warning_text') or '').strip()}".strip()
+                    f"{str(plot_result.get('summary_text') or '').strip()}\n{warning_text or str(plot_result.get('warning_text') or '').strip()}".strip()
                 )
                 summary_label.setWordWrap(True)
                 summary_label.setStyleSheet("color: #475569; font-size: 11px;")
                 tab_layout.addWidget(summary_label)
                 canvas = FigureCanvas(fig)
                 tab_layout.addWidget(canvas, 1)
-                tabs.addTab(tab, str(plot_result.get("plot_name") or "Plot"))
+                tabs.addTab(tab, tab_text)
 
         def _select_targets() -> None:
             nonlocal manual_targets
@@ -28438,7 +28543,13 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             if not plot_definition:
                 return
-            self._apply_auto_graph_quickcheck_plot_to_live_gui({"plot_definition": plot_definition})
+            self._apply_auto_graph_quickcheck_plot_to_live_gui(
+                {
+                    "plot_definition": plot_definition,
+                    "snapshot_filter_state": self._quickcheck_render_filter_state(current_pack, target_serials=target_serials),
+                    "snapshot_target_serials": list(target_serials),
+                }
+            )
 
         btn_select_targets.clicked.connect(_select_targets)
         btn_rerun.clicked.connect(_render_result)
