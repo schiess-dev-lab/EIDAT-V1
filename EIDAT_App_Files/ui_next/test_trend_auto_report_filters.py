@@ -3134,7 +3134,11 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Run Condition"
         )
         exception_table = story[exception_table_idx]
-        self.assertFalse(any(isinstance(item, _FakePageBreak) for item in story))
+        serial_break_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakePageBreak)
+        )
         self.assertFalse(
             any(
                 isinstance(item, _FakeParagraph) and "Plot Table of Contents" in item.text
@@ -3142,14 +3146,15 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
         )
         self.assertLess(scope_idx, grading_idx)
-        self.assertLess(grading_idx, serial_table_idx)
+        self.assertLess(grading_idx, serial_break_idx)
+        self.assertLess(serial_break_idx, serial_table_idx)
         self.assertLess(serial_table_idx, exception_table_idx)
         self.assertLess(exec_idx, scope_idx)
         self.assertIsInstance(serial_table, _FakeTable)
         self.assertIsInstance(exception_table, _FakeTable)
         self.assertAlmostEqual(sum(exception_table.colWidths or []), 6.9 * 72.0)
         self.assertAlmostEqual((exception_table.colWidths or [])[0], (serial_table.colWidths or [])[0])
-        self.assertEqual(_table_text(exception_table)[0][-1], "Grade")
+        self.assertEqual(_table_text(exception_table)[0][-1], "Grading")
         self.assertEqual(len(_table_text(exception_table)[0]), 8)
         exception_style_cmds = [
             command

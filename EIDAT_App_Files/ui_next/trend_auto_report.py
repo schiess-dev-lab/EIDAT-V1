@@ -2884,6 +2884,48 @@ def _grade_from_z(z: float, pass_max: float, watch_max: float) -> str:
     return "FAIL"
 
 
+def _tar_max_band_label(max_band_deviation: object) -> str:
+    value = _safe_float(max_band_deviation)
+    if value is None:
+        return ""
+    if value <= 1.0:
+        return "one sigma"
+    if value <= 2.0:
+        return "2 sigma"
+    if value <= 3.0:
+        return "3 sigma"
+    return "exceeds 3 sigma"
+
+
+def _tar_max_band_rank(label: object) -> int:
+    token = str(label or "").strip().lower()
+    if token == "one sigma":
+        return 0
+    if token == "2 sigma":
+        return 1
+    if token == "3 sigma":
+        return 2
+    if token == "exceeds 3 sigma":
+        return 3
+    return 99
+
+
+def _tar_combined_grade(score_grade: object, max_band_label: object) -> str:
+    token = _tar_normalize_grade_token(score_grade)
+    if token in {"LIMITED", "NO_DATA", "NOT_GRADED"}:
+        return token
+    if token not in {"PASS", "WATCH", "FAIL"}:
+        return "NO_DATA"
+    band_label = str(max_band_label or "").strip().lower()
+    if token == "FAIL" or band_label == "exceeds 3 sigma":
+        return "FAIL"
+    if token == "WATCH" or band_label in {"2 sigma", "3 sigma"}:
+        return "WATCH"
+    if token == "PASS" and band_label == "one sigma":
+        return "PASS"
+    return token
+
+
 def _tar_normalize_grade_token(grade: object) -> str:
     raw = str(grade or "").strip().upper()
     if not raw:
@@ -4449,9 +4491,8 @@ def _render_portrait_story_pdf(
 _TAR_COMPARISON_FONT_CHOICES = (12, 11, 10, 9, 8)
 _TAR_COMPARISON_METRIC_ROWS = (
     "Initial Status",
-    "Graded Mean",
-    "Certified Serial Mean",
-    "Deviation Score",
+    "Graded / SN Mean",
+    "Dev Score / Max Band",
     "Official Grade",
     "Grade Basis",
     "Metric Chart",
@@ -4855,12 +4896,10 @@ def _tar_comparison_page_metric_value(
         )
     if metric_label == "Initial Status":
         return _tar_initial_status_display(row)
-    if metric_label == "Graded Mean":
-        return _fmt_num(_pick("official_baseline_mean", "final_family_mean", "final_atp_mean", "initial_family_mean", "initial_atp_mean"), sig=5)
-    if metric_label == "Certified Serial Mean":
-        return _fmt_num(_pick("official_serial_mean", "final_serial_mean", "final_actual_mean", "initial_serial_mean", "initial_actual_mean"), sig=5)
-    if metric_label in {"Deviation Score", "Z-Score"}:
-        return _fmt_num(_pick("official_deviation_score", "official_zscore", "final_zscore", "final_delta", "initial_zscore", "initial_delta"), sig=4)
+    if metric_label == "Graded / SN Mean":
+        return _tar_exec_mean_pair_text(row)
+    if metric_label in {"Dev Score / Max Band", "Deviation Score", "Z-Score"}:
+        return _tar_exec_dev_score_max_band_text(row)
     if metric_label == "Official Grade":
         return str(_pick("official_grade", "final_grade", "grade", "initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
     if metric_label == "Comparison Pool":
@@ -7377,8 +7416,42 @@ def _tar_exec_deviation_score(row: Mapping[str, object] | None) -> float | None:
     return None
 
 
-def _tar_exec_difference_pct(row: Mapping[str, object] | None) -> float | None:
-    return _tar_percent_delta_between_scalars(_tar_exec_baseline_mean(row), _tar_exec_serial_mean(row))
+def _tar_exec_max_band_deviation(row: Mapping[str, object] | None) -> float | None:
+    if not isinstance(row, Mapping):
+        return None
+    for key in (
+        "official_max_band_deviation",
+        "final_max_band_deviation",
+        "regrade_max_band_deviation",
+        "initial_max_band_deviation",
+    ):
+        value = _safe_float(row.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _tar_exec_max_band_label(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    for key in (
+        "official_max_band_label",
+        "final_max_band_label",
+        "regrade_max_band_label",
+        "initial_max_band_label",
+    ):
+        text = str(row.get(key) or "").strip()
+        if text:
+            return text
+    return _tar_max_band_label(_tar_exec_max_band_deviation(row))
+
+
+def _tar_join_display_pair(left: object, right: object) -> str:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if left_text and right_text:
+        return f"{left_text} / {right_text}"
+    return left_text or right_text
 
 
 def _tar_exec_grade_thresholds(ctx: Mapping[str, Any] | None) -> tuple[float, float]:
@@ -7472,11 +7545,18 @@ def _tar_sequence_bullet_text(row: Mapping[str, object] | None) -> str:
 def _tar_exec_mean_pair_text(row: Mapping[str, object] | None) -> str:
     if not isinstance(row, Mapping):
         return ""
-    return "\n".join(
-        [
-            f"Graded: {_fmt_num(_tar_exec_baseline_mean(row), sig=5)}",
-            f"SN: {_fmt_num(_tar_exec_serial_mean(row), sig=5)}",
-        ]
+    return _tar_join_display_pair(
+        _fmt_num(_tar_exec_baseline_mean(row), sig=5),
+        _fmt_num(_tar_exec_serial_mean(row), sig=5),
+    )
+
+
+def _tar_exec_dev_score_max_band_text(row: Mapping[str, object] | None) -> str:
+    if not isinstance(row, Mapping):
+        return ""
+    return _tar_join_display_pair(
+        _fmt_num(_tar_exec_deviation_score(row), sig=4),
+        _tar_exec_max_band_label(row),
     )
 
 
@@ -9012,6 +9092,28 @@ def _tar_build_per_serial_comparison_rows(
                 else (final_serial_mean if official_pass_type == "final_exact_condition" and final_pass_applied else initial_serial_mean)
             )
             official_zscore = final_zscore if official_pass_type == "final_exact_condition" and final_pass_applied else initial_zscore
+            initial_max_band_deviation = _safe_float(finding_row.get("initial_max_band_deviation"))
+            initial_max_band_label = str(finding_row.get("initial_max_band_label") or _tar_max_band_label(initial_max_band_deviation)).strip()
+            final_max_band_deviation = _safe_float(finding_row.get("final_max_band_deviation"))
+            if final_max_band_deviation is None:
+                final_max_band_deviation = initial_max_band_deviation
+            final_max_band_label = str(
+                finding_row.get("final_max_band_label")
+                or _tar_max_band_label(final_max_band_deviation)
+                or initial_max_band_label
+            ).strip()
+            official_max_band_deviation = _safe_float(finding_row.get("official_max_band_deviation"))
+            if official_max_band_deviation is None:
+                official_max_band_deviation = (
+                    final_max_band_deviation
+                    if official_pass_type == "final_exact_condition" and final_pass_applied
+                    else initial_max_band_deviation
+                )
+            official_max_band_label = str(
+                finding_row.get("official_max_band_label")
+                or _tar_max_band_label(official_max_band_deviation)
+                or (final_max_band_label if official_pass_type == "final_exact_condition" and final_pass_applied else initial_max_band_label)
+            ).strip()
             official_suppression = row_final_suppression if official_pass_type == "final_exact_condition" and final_pass_applied else initial_suppression
             official_valve = row_final_valve if official_pass_type == "final_exact_condition" and final_pass_applied else initial_valve
             if informational_only:
@@ -9045,6 +9147,10 @@ def _tar_build_per_serial_comparison_rows(
                 "final_actual_mean": final_serial_mean,
                 "initial_delta": initial_zscore,
                 "final_delta": final_zscore,
+                "initial_max_band_deviation": initial_max_band_deviation,
+                "initial_max_band_label": initial_max_band_label,
+                "final_max_band_deviation": final_max_band_deviation,
+                "final_max_band_label": final_max_band_label,
                 "initial_grade": initial_grade,
                 "final_grade": final_grade,
                 "grade": final_grade,
@@ -9097,6 +9203,8 @@ def _tar_build_per_serial_comparison_rows(
                     if informational_only
                     else (_safe_float(finding_row.get("official_deviation_score")) if _safe_float(finding_row.get("official_deviation_score")) is not None else official_zscore)
                 ),
+                "official_max_band_deviation": official_max_band_deviation,
+                "official_max_band_label": official_max_band_label,
                 "official_grade": ("NOT_GRADED" if informational_only else (str(finding_row.get("official_grade") or final_grade or initial_grade).strip().upper() or "NO_DATA")),
                 "official_suppression_voltage_label": str(finding_row.get("official_suppression_voltage_label") or official_suppression or "").strip(),
                 "official_valve_voltage_label": str(finding_row.get("official_valve_voltage_label") or official_valve or "").strip(),
@@ -9217,7 +9325,7 @@ def _tar_outcome_mix_text(rows: list[Mapping[str, Any]] | None) -> str:
 
 _TAR_EXEC_SERIAL_MAX_ROWS = 10
 _TAR_EXEC_EXCEPTION_GRADE_TEXT_COLOR = "#1d4ed8"
-_TAR_EXEC_EXCEPTION_HEADER = ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade"]
+_TAR_EXEC_EXCEPTION_HEADER = ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Dev Score", "Max Band", "Grading"]
 
 
 def _tar_exec_scope_table_rows(
@@ -9308,23 +9416,27 @@ def _tar_exec_grading_table_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             "Compared directly to the official graded mean.",
         ],
         [
-            "Difference %",
-            "abs(SN mean - graded mean) / max(abs(SN mean), abs(graded mean)) * 100",
-            "Shown in the WATCH / FAIL detail table for a quick magnitude check.",
-        ],
-        [
             "Deviation score",
-            "Official grading score from the selected-pool or exact-condition pass.",
+            "Whole-curve grading metric. The serial trace is compared to the official comparison band across the full curve, then summarized into one overall score.",
             (
-                f"PASS: |score| <= {_fmt_num(z_pass, sig=4)} | "
-                f"WATCH: {_fmt_num(z_pass, sig=4)} < |score| <= {_fmt_num(z_watch, sig=4)} | "
-                f"FAIL: |score| > {_fmt_num(z_watch, sig=4)}"
+                f"PASS if score <= {_fmt_num(z_pass, sig=4)} | "
+                f"WATCH if {_fmt_num(z_pass, sig=4)} < score <= {_fmt_num(z_watch, sig=4)} | "
+                f"FAIL if score > {_fmt_num(z_watch, sig=4)}"
             ),
         ],
         [
+            "Max Band",
+            "Worst single-point excursion from the official graded mean, expressed as the largest local sigma multiple anywhere on the curve.",
+            "one sigma <= 1 | 2 sigma <= 2 | 3 sigma <= 3 | exceeds 3 sigma > 3",
+        ],
+        [
             "Final grade",
-            "If an exact-condition regrade exists, the final grade replaces the initial pre-pass grade for the official result.",
-            "The WATCH / FAIL grade links jump to the supporting curve page for each item.",
+            "Deviation Score captures overall curve agreement, while Max Band captures the worst local excursion.",
+            (
+                "PASS only if Deviation Score is PASS and Max Band is one sigma | "
+                "WATCH if Deviation Score is WATCH or Max Band is 2 sigma or 3 sigma | "
+                "FAIL if Deviation Score is FAIL or Max Band exceeds 3 sigma"
+            ),
         ],
     ]
 
@@ -9393,8 +9505,8 @@ def _tar_exec_exception_table_spec(
                 sequence_text,
                 parameter_text,
                 _tar_exec_mean_pair_text(row),
-                _fmt_num(_tar_exec_difference_pct(row), sig=4),
                 _fmt_num(_tar_exec_deviation_score(row), sig=4),
+                _tar_exec_max_band_label(row),
                 grade_text,
             ]
         )
@@ -9552,11 +9664,12 @@ def _tar_build_exec_exception_rows(ctx: Mapping[str, Any]) -> list[dict[str, Any
                 "sequence_text": str(raw_row.get("sequence_text") or "").strip(),
                 "parameter": str(raw_row.get("parameter") or raw_row.get("param") or "").strip(),
                 "final_status": final_status,
-                "official_baseline_mean": raw_row.get("official_baseline_mean"),
-                "official_serial_mean": raw_row.get("official_serial_mean"),
+                "official_baseline_mean": _tar_exec_baseline_mean(raw_row),
+                "official_serial_mean": _tar_exec_serial_mean(raw_row),
                 "official_deviation_score": _tar_exec_deviation_score(raw_row),
+                "official_max_band_deviation": _tar_exec_max_band_deviation(raw_row),
+                "official_max_band_label": _tar_exec_max_band_label(raw_row),
                 "official_grade": str(raw_row.get("official_grade") or final_status).strip().upper() or final_status,
-                "difference_pct": _tar_exec_difference_pct(raw_row),
                 "grade_basis_text": str(raw_row.get("grade_basis_text") or "").strip(),
                 "selection_program_title": str(raw_row.get("selection_program_title") or "").strip(),
                 "selection_member_programs": list(raw_row.get("selection_member_programs") or []),
@@ -12105,6 +12218,9 @@ def _tar_analyze_curve_groups(
                     if comparison_series_count < 2 or not pool_model.get("master_y"):
                         dev = None
                         deviation_score = None
+                        score_grade = "LIMITED"
+                        max_band_deviation = None
+                        max_band_label = ""
                         grade = "LIMITED"
                         grading_basis_status = "limited_target_excluded_baseline"
                     else:
@@ -12116,7 +12232,10 @@ def _tar_analyze_curve_groups(
                             denom=float(pool_model.get("denom") or 1.0),
                         )
                         deviation_score = _safe_float((dev or {}).get("deviation_score"))
-                        grade = _grade_from_z(float(deviation_score), z_pass, z_watch) if deviation_score is not None else "NO_DATA"
+                        score_grade = _grade_from_z(float(deviation_score), z_pass, z_watch) if deviation_score is not None else "NO_DATA"
+                        max_band_deviation = _safe_float((dev or {}).get("max_band_deviation"))
+                        max_band_label = _tar_max_band_label(max_band_deviation)
+                        grade = _tar_combined_grade(score_grade, max_band_label) if deviation_score is not None else "NO_DATA"
                         grading_basis_status = (
                             "program_only_pool"
                             if len(selected_programs) <= 1
@@ -12143,9 +12262,11 @@ def _tar_analyze_curve_groups(
                         "initial_x_at_max_abs": (dev or {}).get("x_at_max_abs"),
                         "initial_z": deviation_score,
                         "initial_deviation_score": deviation_score,
+                        "initial_score_grade": score_grade,
                         "initial_rms_band_deviation": (dev or {}).get("rms_band_deviation"),
                         "initial_p90_band_deviation": (dev or {}).get("p90_band_deviation"),
-                        "initial_max_band_deviation": (dev or {}).get("max_band_deviation"),
+                        "initial_max_band_deviation": max_band_deviation,
+                        "initial_max_band_label": max_band_label,
                         "initial_grade": grade,
                         "initial_poly_rmse": (pool_model.get("poly") or {}).get("rmse") if isinstance(pool_model.get("poly"), Mapping) else None,
                         "initial_skipped": False,
@@ -12340,7 +12461,7 @@ def _tar_analyze_curve_groups(
             final_master_y = list(final_model.get("master_y") or [])
             final_std_y = list(final_model.get("std_y") or [])
             final_denom = float(final_model.get("denom") or 1.0)
-            all_entries: list[tuple[dict, str, dict]] = []
+            all_entries: list[tuple[dict, str, dict[str, float], dict[str, float] | None]] = []
             trace_curves: list[dict] = []
             for spec in member_specs:
                 pair_id = str(spec.get("pair_id") or "").strip()
@@ -12377,16 +12498,26 @@ def _tar_analyze_curve_groups(
                     )
                 for serial, y_curve in y_resampled_by_sn.items():
                     dev = _tar_compute_curve_deviation(y_curve, final_master_y, x_grid, denom=final_denom)
+                    band_dev = _tar_compute_band_deviation(
+                        y_curve,
+                        final_master_y,
+                        final_std_y,
+                        x_grid,
+                        denom=final_denom,
+                    )
                     if dev is not None:
-                        all_entries.append((spec, serial, dev))
+                        all_entries.append((spec, serial, dev, band_dev))
             mean_score, std_score = _tar_program_score_stats(
-                [(serial, dev) for _spec, serial, dev in all_entries],
+                [(serial, dev) for _spec, serial, dev, _band_dev in all_entries],
                 program_by_serial=program_by_serial,
             )
 
-            for spec, serial, dev in all_entries:
+            for spec, serial, dev, band_dev in all_entries:
                 z_score = (float(dev.get("max_abs") or 0.0) - mean_score) / std_score if std_score else 0.0
-                grade = _grade_from_z(z_score, z_pass, z_watch)
+                score_grade = _grade_from_z(z_score, z_pass, z_watch)
+                max_band_deviation = _safe_float((band_dev or {}).get("max_band_deviation"))
+                max_band_label = _tar_max_band_label(max_band_deviation)
+                grade = _tar_combined_grade(score_grade, max_band_label)
                 if serial not in hi_set:
                     continue
                 final_candidates.setdefault((str(spec.get("pair_id") or ""), serial), []).append(
@@ -12412,6 +12543,9 @@ def _tar_analyze_curve_groups(
                         "regrade_rms_pct": dev.get("rms_pct"),
                         "regrade_x_at_max_abs": dev.get("x_at_max_abs"),
                         "regrade_z": float(z_score),
+                        "regrade_score_grade": score_grade,
+                        "regrade_max_band_deviation": max_band_deviation,
+                        "regrade_max_band_label": max_band_label,
                         "regrade_grade": grade,
                         "regrade_poly_rmse": (final_model.get("poly") or {}).get("rmse"),
                         "regrade_cohort_id": f"regrade:{family_index}:{_norm_key(str(spec.get('base_condition_label') or ''))}:{_norm_key(suppression_value)}:{_norm_key(valve_value)}:{_norm_key(str(spec.get('param') or ''))}:{_norm_key(str(spec.get('x_name') or ''))}",
@@ -12647,6 +12781,9 @@ def _tar_analyze_curve_groups(
                     "regrade_rms_pct": regrade_row.get("regrade_rms_pct"),
                     "regrade_x_at_max_abs": regrade_row.get("regrade_x_at_max_abs"),
                     "regrade_z": regrade_row.get("regrade_z"),
+                    "regrade_score_grade": regrade_row.get("regrade_score_grade"),
+                    "regrade_max_band_deviation": regrade_row.get("regrade_max_band_deviation"),
+                    "regrade_max_band_label": regrade_row.get("regrade_max_band_label"),
                     "regrade_grade": regrade_row.get("regrade_grade"),
                     "regrade_poly_rmse": regrade_row.get("regrade_poly_rmse"),
                     "regrade_cohort_id": regrade_row.get("regrade_cohort_id"),
@@ -12662,6 +12799,13 @@ def _tar_analyze_curve_groups(
                     "final_rms_pct": final_source.get("regrade_rms_pct", final_source.get("initial_rms_pct")),
                     "final_x_at_max_abs": final_source.get("regrade_x_at_max_abs", final_source.get("initial_x_at_max_abs")),
                     "final_z": final_source.get("regrade_z", final_source.get("initial_z")),
+                    "final_score_grade": final_source.get("regrade_score_grade", final_source.get("initial_score_grade")),
+                    "final_max_band_deviation": final_source.get("regrade_max_band_deviation", final_source.get("initial_max_band_deviation")),
+                    "final_max_band_label": (
+                        final_source.get("regrade_max_band_label")
+                        or final_source.get("initial_max_band_label")
+                        or _tar_max_band_label(final_source.get("regrade_max_band_deviation", final_source.get("initial_max_band_deviation")))
+                    ),
                     "final_grade": final_grade,
                     "grade": final_grade,
                     "max_abs": final_source.get("regrade_max_abs", final_source.get("initial_max_abs")),
@@ -12695,6 +12839,13 @@ def _tar_analyze_curve_groups(
                     "official_grade": final_grade,
                     "official_zscore": final_source.get("regrade_z", final_source.get("initial_z")),
                     "official_deviation_score": final_source.get("regrade_z", final_source.get("initial_z")),
+                    "official_score_grade": final_source.get("regrade_score_grade", final_source.get("initial_score_grade")),
+                    "official_max_band_deviation": final_source.get("regrade_max_band_deviation", final_source.get("initial_max_band_deviation")),
+                    "official_max_band_label": (
+                        final_source.get("regrade_max_band_label")
+                        or final_source.get("initial_max_band_label")
+                        or _tar_max_band_label(final_source.get("regrade_max_band_deviation", final_source.get("initial_max_band_deviation")))
+                    ),
                     "official_suppression_voltage_label": final_suppression_label,
                     "official_valve_voltage_label": final_valve_label,
                     "selected_program_count": row.get("selected_program_count"),
@@ -13576,7 +13727,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             "This report validates ATP run criteria against family data and compares the selected certification serials "
             "to a selected program-pool baseline for the chosen run scope. The pre-pass selects compatible programs "
             "within each base run condition, parameter, and X axis. Official grading excludes the target serial from "
-            "its own baseline and uses a band-normalized deviation score.",
+            "its own baseline and reports both an overall deviation score and a worst-point max-band result.",
             styles["body"],
             rl,
         )
@@ -13593,10 +13744,19 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     )
     story.append(
         _portrait_paragraph(
-            "Each scored row compares the official graded mean against the certification serial mean for the same scope. "
-            f"Difference % is reported as an easy magnitude check, while the official deviation score drives the grade bands: PASS at or below {_fmt_num(z_pass, sig=4)}, "
-            f"WATCH above {_fmt_num(z_pass, sig=4)} through {_fmt_num(z_watch, sig=4)}, and FAIL above {_fmt_num(z_watch, sig=4)}. "
-            "If an exact-condition regrade exists, that result becomes the official grade shown here.",
+            "The official graded mean is the comparison-pool baseline after the target serial is removed from its own pool. "
+            "Each certification serial is then compared to that baseline in two ways: Deviation Score measures overall curve agreement across the full trace, "
+            "while Max Band reports the worst single-point excursion as a local sigma bucket.",
+            styles["body"],
+            rl,
+        )
+    )
+    story.append(
+        _portrait_paragraph(
+            f"A row passes only when the Deviation Score is PASS at or below {_fmt_num(z_pass, sig=4)} and Max Band stays within one sigma. "
+            f"It becomes WATCH when the Deviation Score lands between {_fmt_num(z_pass, sig=4)} and {_fmt_num(z_watch, sig=4)} or when Max Band reaches 2 sigma or 3 sigma. "
+            f"It fails when the Deviation Score exceeds {_fmt_num(z_watch, sig=4)} or when Max Band exceeds 3 sigma. "
+            "If an exact-condition regrade exists, that regrade replaces the initial selected-pool result as the official score, Max Band, and grade shown here.",
             styles["body"],
             rl,
         )
@@ -13626,6 +13786,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
     story.append(Spacer(1, 0.08 * inch))
+    story.append(PageBreak())
     story.append(_portrait_paragraph("Serial Results", styles["card_title"], rl))
     story.append(
         _portrait_box_table(
@@ -13644,7 +13805,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(
         _portrait_box_table(
             exception_table_rows,
-            col_widths=[0.78 * inch, 1.18 * inch, 1.07 * inch, 0.66 * inch, 1.16 * inch, 0.58 * inch, 0.54 * inch, 0.93 * inch],
+            col_widths=[0.78 * inch, 1.18 * inch, 1.02 * inch, 0.62 * inch, 1.10 * inch, 0.60 * inch, 0.82 * inch, 0.78 * inch],
             styles=styles,
             rl=rl,
             repeat_rows=1,
@@ -13671,8 +13832,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         story.append(_portrait_paragraph("Run Comparison", styles["section"], rl))
         story.append(
             _portrait_paragraph(
-                "Each table groups one selected run condition. Rows show the official graded mean for each certified serial's "
-                "selected cohort, alongside the certified serial mean, deviation score, initial status, and official grade basis.",
+                "Each table groups one selected run condition. Rows show the merged graded / serial mean, the merged deviation score / max band view, "
+                "the initial status, and the official grade basis for each certified serial and parameter.",
                 styles["body"],
                 rl,
             )

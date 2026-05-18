@@ -1748,6 +1748,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["final_grade"], "PASS")
         self.assertFalse(row["regrade_applied"])
         self.assertEqual(row["official_pass_type"], "selected_program_pool")
+        self.assertEqual(row["initial_max_band_label"], "one sigma")
+        self.assertEqual(row["official_max_band_label"], "one sigma")
         self.assertEqual(row["selected_programs"], ["Program A", "Program B"])
         self.assertEqual(row["selected_pool_series_count"], 3)
         self.assertEqual(row["target_excluded_comparison_series_count"], 2)
@@ -1803,6 +1805,22 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(row["selected_programs"], ["Program A"])
         self.assertEqual(row["selected_pool_series_count"], 1)
         self.assertEqual(row["target_excluded_comparison_series_count"], 0)
+
+    def test_max_band_labels_and_combined_grade_boundaries(self):
+        from EIDAT_App_Files.ui_next import trend_auto_report as tar
+
+        self.assertEqual(tar._tar_max_band_label(1.0), "one sigma")
+        self.assertEqual(tar._tar_max_band_label(1.01), "2 sigma")
+        self.assertEqual(tar._tar_max_band_label(2.0), "2 sigma")
+        self.assertEqual(tar._tar_max_band_label(2.01), "3 sigma")
+        self.assertEqual(tar._tar_max_band_label(3.0), "3 sigma")
+        self.assertEqual(tar._tar_max_band_label(3.01), "exceeds 3 sigma")
+        self.assertEqual(tar._tar_combined_grade("PASS", "one sigma"), "PASS")
+        self.assertEqual(tar._tar_combined_grade("PASS", "2 sigma"), "WATCH")
+        self.assertEqual(tar._tar_combined_grade("PASS", "3 sigma"), "WATCH")
+        self.assertEqual(tar._tar_combined_grade("PASS", "exceeds 3 sigma"), "FAIL")
+        self.assertEqual(tar._tar_combined_grade("WATCH", "one sigma"), "WATCH")
+        self.assertEqual(tar._tar_combined_grade("FAIL", "one sigma"), "FAIL")
 
     @unittest.skipUnless(_have_numpy(), "numpy not installed")
     def test_analyze_curve_groups_limits_regrade_cohort_to_targeted_suppression_members(self):
@@ -2917,6 +2935,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                         "regrade_cohort_id": "regrade:1",
                         "initial_z": -0.5,
                         "final_z": 1.25,
+                        "initial_max_band_label": "3 sigma",
+                        "final_max_band_label": "one sigma",
+                        "official_max_band_label": "one sigma",
                         "prepass_reference_program": "Program A",
                         "prepass_included_programs": ["Program A", "Program B"],
                         "prepass_excluded_programs": [],
@@ -2935,6 +2956,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertTrue(row["regrade_applied"])
         self.assertTrue(row["final_pass_applied"])
         self.assertEqual(row["regrade_cohort_id"], "regrade:1")
+        self.assertEqual(row["official_max_band_label"], "one sigma")
         self.assertEqual(row["prepass_reference_program"], "Program A")
         self.assertEqual(row["prepass_included_programs"], ["Program A", "Program B"])
         self.assertEqual(row["prepass_excluded_programs"], [])
@@ -3169,12 +3191,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
             matrix_rows[0][:5],
             ["Run Condition", "Sequence(s)", "Metric", "Chamber Feed Pressure", "Chamber Feed Pressure"],
         )
-        metric_rows = {str(row[2]): [str(value) for value in row[3:5]] for row in matrix_rows[2:8]}
+        metric_rows = {str(row[2]): [str(value) for value in row[3:5]] for row in matrix_rows[2:7]}
         for metric_label in (
             "Initial Status",
-            "Graded Mean",
-            "Certified Serial Mean",
-            "Deviation Score",
+            "Graded / SN Mean",
+            "Dev Score / Max Band",
             "Official Grade",
             "Grade Basis",
         ):
@@ -3313,6 +3334,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "final_delta": -0.2,
                     "initial_grade": "FAIL",
                     "final_grade": "PASS",
+                    "initial_max_band_label": "2 sigma",
+                    "final_max_band_label": "one sigma",
                     "initial_suppression_voltage_label": "All",
                     "final_suppression_voltage_label": "100",
                     "initial_bus_voltage_label": "",
@@ -3334,6 +3357,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "final_delta": 0.2,
                     "initial_grade": "FAIL",
                     "final_grade": "WATCH",
+                    "initial_max_band_label": "exceeds 3 sigma",
+                    "final_max_band_label": "2 sigma",
                     "initial_suppression_voltage_label": "All",
                     "final_suppression_voltage_label": "100",
                     "initial_bus_voltage_label": "",
@@ -3355,6 +3380,8 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                     "final_delta": None,
                     "initial_grade": "NO_DATA",
                     "final_grade": "NO_DATA",
+                    "initial_max_band_label": "",
+                    "final_max_band_label": "",
                     "initial_suppression_voltage_label": "All",
                     "final_suppression_voltage_label": "All",
                     "initial_bus_voltage_label": "",
@@ -3386,9 +3413,11 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertEqual(serial_table[1][5], "PASS 1/2 (50%)\nWATCH 1/2 (50%)\nFAIL 0/2 (0%)")
         self.assertEqual(
             exception_table[0],
-            ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Diff %", "Score", "Grade"],
+            ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Dev Score", "Max Band", "Grading"],
         )
         self.assertEqual(exception_table[1][7], "WATCH")
+        self.assertEqual(exception_table[1][4], "2.1 / 2.3")
+        self.assertEqual(exception_table[1][6], "2 sigma")
         self.assertIn("Suppression Voltage: 100", str(exception_table[1][1]))
         self.assertIn("Seq 2", str(exception_table[1][2]))
         self.assertEqual(len(exception_table[1]), 8)
@@ -3408,7 +3437,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                 "official_baseline_mean": 10.0 + index,
                 "official_serial_mean": 9.5 + index,
                 "official_deviation_score": 1.0 + index,
-                "difference_pct": 2.0 + index,
+                "official_max_band_label": "2 sigma" if index % 2 else "exceeds 3 sigma",
                 "chart_target_page_index": None,
             }
             for index in range(1, 11)
@@ -3461,6 +3490,7 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
                         "official_baseline_mean": official_baseline,
                         "official_serial_mean": official_actual,
                         "official_zscore": final_delta if regrade_applied else initial_delta,
+                        "official_max_band_label": "2 sigma" if regrade_applied else "one sigma",
                         "official_grade": official_grade,
                         "grade_basis_text": (
                             "Program-synced exact-condition final\nSupp: 5 | Valve: 28"
@@ -3546,18 +3576,17 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
         self.assertIn("Condition 00", matrix_rows[2][0])
         self.assertEqual(matrix_rows[2][1], "- Seq 00")
         self.assertNotIn("Unknown Program", matrix_rows[2][1])
-        self.assertEqual(matrix_rows[3][:5], ["", "", "Graded Mean", "12", "20"])
-        self.assertEqual(matrix_rows[4][:5], ["", "", "Certified Serial Mean", "11", "19"])
-        self.assertEqual(matrix_rows[5][:5], ["", "", "Deviation Score", "-1", "-1"])
-        self.assertEqual(matrix_rows[6][:5], ["", "", "Official Grade", "WATCH", "PASS"])
-        self.assertEqual(matrix_rows[7][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
-        self.assertEqual(matrix_rows[8][:5], ["", "", "Metric Chart", "", ""])
-        self.assertEqual(matrix_rows[9][:5], ["", "", "Plot Curves", "", ""])
-        self.assertIn(("SPAN", (0, 2), (0, 9)), style_cmds)
-        self.assertIn(("SPAN", (1, 2), (1, 9)), style_cmds)
-        self.assertIn(("BACKGROUND", (3, 2), (3, 9), "#fef3c7"), style_cmds)
-        self.assertIn(("BACKGROUND", (3, 6), (3, 6), "#fef3c7"), style_cmds)
-        self.assertIn(("BACKGROUND", (4, 6), (4, 6), "#dcfce7"), style_cmds)
+        self.assertEqual(matrix_rows[3][:5], ["", "", "Graded / SN Mean", "12 / 11", "20 / 19"])
+        self.assertEqual(matrix_rows[4][:5], ["", "", "Dev Score / Max Band", "-1 / 2 sigma", "-1 / one sigma"])
+        self.assertEqual(matrix_rows[5][:5], ["", "", "Official Grade", "WATCH", "PASS"])
+        self.assertEqual(matrix_rows[6][:5], ["", "", "Grade Basis", "Program-synced exact-condition final\nSupp: 5 | Valve: 28", "Initial admitted-program cohort"])
+        self.assertEqual(matrix_rows[7][:5], ["", "", "Metric Chart", "", ""])
+        self.assertEqual(matrix_rows[8][:5], ["", "", "Plot Curves", "", ""])
+        self.assertIn(("SPAN", (0, 2), (0, 8)), style_cmds)
+        self.assertIn(("SPAN", (1, 2), (1, 8)), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 2), (3, 8), "#fef3c7"), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 5), (3, 5), "#fef3c7"), style_cmds)
+        self.assertIn(("BACKGROUND", (4, 5), (4, 5), "#dcfce7"), style_cmds)
 
     def test_build_comparison_page_matrix_colors_official_grade_cells(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
@@ -3582,9 +3611,9 @@ class TestTrendAutoReportSynthetic(unittest.TestCase):
 
         _rows, style_cmds = tar._tar_build_comparison_page_matrix(page_spec)
 
-        self.assertIn(("BACKGROUND", (3, 6), (3, 6), "#fee2e2"), style_cmds)
-        self.assertIn(("BACKGROUND", (4, 6), (4, 6), "#fef3c7"), style_cmds)
-        self.assertIn(("BACKGROUND", (5, 6), (5, 6), "#dcfce7"), style_cmds)
+        self.assertIn(("BACKGROUND", (3, 5), (3, 5), "#fee2e2"), style_cmds)
+        self.assertIn(("BACKGROUND", (4, 5), (4, 5), "#fef3c7"), style_cmds)
+        self.assertIn(("BACKGROUND", (5, 5), (5, 5), "#dcfce7"), style_cmds)
 
     def test_plan_comparison_pages_prefers_12_point_when_page_count_ties(self):
         from EIDAT_App_Files.ui_next import trend_auto_report as tar
