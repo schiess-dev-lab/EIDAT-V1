@@ -222,10 +222,13 @@ class _FakePlotFigure:
     def __init__(self) -> None:
         self.transFigure = "transFigure"
         self.add_axes_calls: list[list[float]] = []
+        self.added_axes: list[_FakePlotAxes] = []
 
     def add_axes(self, bounds: list[float]) -> _FakePlotAxes:
         self.add_axes_calls.append(list(bounds))
-        return _FakePlotAxes()
+        axes = _FakePlotAxes()
+        self.added_axes.append(axes)
+        return axes
 
 
 class _FakeHeaderPatch:
@@ -2753,19 +2756,14 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIn("bbox", axes.title[1])
         self.assertEqual(len(pdf.saved_figures), 1)
         self.assertEqual(fake_plt.closed, [fig])
-        self.assertGreaterEqual(len(axes.plot_calls), 3)
-        self.assertEqual(len(axes.fill_between_calls), 1)
-        for actual, expected in zip(list(axes.fill_between_calls[0][0][1]), [0.9, 1.0, 1.1]):
-            self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(list(axes.fill_between_calls[0][0][2]), [1.3, 1.4, 1.5]):
-            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(len(axes.plot_calls), 2)
+        self.assertEqual(len(axes.fill_between_calls), 0)
         self.assertIsNotNone(axes.legend_call)
-        self.assertIn("In-family, graded mean", axes.legend_call[1])
-        self.assertIn("In-family, graded +/-2 sigma", axes.legend_call[1])
         self.assertIn("SN-001 | Condition A (WATCH)", axes.legend_call[1])
+        self.assertFalse(any("In-family, graded" in label for label in axes.legend_call[1]))
         self.assertFalse(any("Suppression Voltage" in label for label in axes.legend_call[1] if label.startswith("SN-001")))
 
-    def test_render_exact_condition_curve_cohort_page_family_legend_includes_voltages(self) -> None:
+    def test_render_exact_condition_curve_cohort_page_omits_family_overlay_and_equation(self) -> None:
         fake_plt = _FakePyplot()
         fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
         cohort_spec = {
@@ -2794,7 +2792,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             "x_grid": [0.0, 1.0, 2.0],
             "master_y": [1.1, 1.2, 1.3],
             "std_y": [0.1, 0.1, 0.1],
-            "model": {},
+            "model": {"equation": "y = 1.23x + 4.56", "poly": {"rmse": 0.07}},
         }
         ctx = {
             "print_ctx": tar.PrintContext(
@@ -2835,14 +2833,14 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
 
         self.assertIsNotNone(axes.legend_call)
-        self.assertIn(
-            "In-family, graded mean | Suppression Voltage: 5 | Valve Voltage: 28",
-            axes.legend_call[1],
-        )
-        self.assertIn(
-            "In-family, graded +/-2 sigma | Suppression Voltage: 5 | Valve Voltage: 28",
-            axes.legend_call[1],
-        )
+        self.assertFalse(any("In-family, graded" in label for label in axes.legend_call[1]))
+        self.assertEqual(len(axes.fill_between_calls), 0)
+        self.assertEqual(len(fig.added_axes), 1)
+        self.assertEqual(len(fig.added_axes[0].text_calls), 1)
+        side_text = str(fig.added_axes[0].text_calls[0][0][2])
+        self.assertNotIn("In-family, graded equation", side_text)
+        self.assertNotIn("RMSE", side_text)
+        self.assertIn("SN-001 | Condition A | WATCH", side_text)
 
     def test_render_watch_curve_page_uses_updated_family_legend_and_strips_serial_voltages(self) -> None:
         fake_plt = _FakePyplot()
@@ -2929,6 +2927,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             self.assertAlmostEqual(actual, expected)
         for actual, expected in zip(list(axes.fill_between_calls[2][0][2]), [1.2, 1.4]):
             self.assertAlmostEqual(actual, expected)
+        self.assertEqual(axes.fill_between_calls[0][1]["color"], "#dc2626")
+        self.assertEqual(axes.fill_between_calls[1][1]["color"], "#ca8a04")
+        self.assertEqual(axes.fill_between_calls[2][1]["color"], "#15803d")
         self.assertIsNotNone(axes.legend_call)
         self.assertIn(
             "In-family, graded mean | Suppression Voltage: 5 | Valve Voltage: 28",
@@ -3261,9 +3262,111 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             try:
                 links = result.load_page(0).get_links()
                 self.assertEqual(sorted(link.get("page") for link in links), [1, 2])
-                self.assertTrue(all(link.get("from").x0 > 500 for link in links))
+                self.assertTrue(all(link.get("from").x0 > 450 for link in links))
             finally:
                 result.close()
+
+    def test_apply_pdf_navigation_links_repeated_watch_grades_to_matching_rows(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "intro_exception_watch_row_links.pdf"
+            doc = fitz.open()
+            intro_page = doc.new_page()
+            intro_page.insert_text((72, 120), "SN-001")
+            intro_page.insert_text((140, 120), "Condition A")
+            intro_page.insert_text((300, 120), "Seq A")
+            intro_page.insert_text((390, 120), "Pressure")
+            intro_page.insert_text((520, 120), "WATCH")
+            intro_page.insert_text((72, 150), "SN-001")
+            intro_page.insert_text((140, 150), "Condition B")
+            intro_page.insert_text((300, 150), "Seq B")
+            intro_page.insert_text((390, 150), "Pressure")
+            intro_page.insert_text((520, 150), "WATCH")
+            doc.new_page()
+            doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[],
+                exception_grade_links=[
+                    {
+                        "serial_text": "SN-001",
+                        "run_condition_text": "Condition A",
+                        "sequence_text": "Seq A",
+                        "parameter_text": "Pressure",
+                        "grade_text": "WATCH",
+                        "destination_page_index": 1,
+                    },
+                    {
+                        "serial_text": "SN-001",
+                        "run_condition_text": "Condition B",
+                        "sequence_text": "Seq B",
+                        "parameter_text": "Pressure",
+                        "grade_text": "WATCH",
+                        "destination_page_index": 2,
+                    },
+                ],
+                intro_page_count=1,
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                links = sorted(result.load_page(0).get_links(), key=lambda link: float(link.get("from").y0))
+                self.assertEqual([link.get("page") for link in links], [1, 2])
+                self.assertTrue(float(links[0].get("from").y0) < float(links[1].get("from").y0))
+            finally:
+                result.close()
+
+    def test_build_exec_exception_rows_prefers_exact_condition_curves_for_requires_eval(self) -> None:
+        rows = tar._tar_build_exec_exception_rows(
+            {
+                "plot_navigation": tar._tar_build_plot_navigation(
+                    [
+                        {
+                            "section": "watch_nonpass_curves",
+                            "pair_id": "pair-1",
+                            "param": "Pressure",
+                            "page_number": 4,
+                        },
+                        {
+                            "section": "regrade_pass_curve_overlays",
+                            "cohort_id": "cohort-1",
+                            "param": "Pressure",
+                            "x_name": "Time",
+                            "page_number": 7,
+                        },
+                    ]
+                ),
+                "comparison_rows": [
+                    {
+                        "pair_id": "pair-1",
+                        "regrade_cohort_id": "cohort-1",
+                        "serial": "SN-001",
+                        "run_condition": "Condition A",
+                        "sequence_text": "Seq A",
+                        "parameter": "Pressure",
+                        "official_grade": "WATCH",
+                    },
+                    {
+                        "pair_id": "pair-1",
+                        "regrade_cohort_id": "cohort-1",
+                        "serial": "SN-002",
+                        "run_condition": "Condition A",
+                        "sequence_text": "Seq A",
+                        "parameter": "Pressure",
+                        "official_grade": "FAIL",
+                    },
+                ],
+            }
+        )
+
+        row_by_serial = {str(row.get("serial") or ""): row for row in rows}
+        self.assertEqual(row_by_serial["SN-001"]["chart_target_section"], "watch_nonpass_curves")
+        self.assertEqual(row_by_serial["SN-001"]["chart_target_page_index"], 3)
+        self.assertEqual(row_by_serial["SN-002"]["chart_target_section"], "regrade_pass_curve_overlays")
+        self.assertEqual(row_by_serial["SN-002"]["chart_target_page_index"], 6)
 
     def test_apply_pdf_navigation_adds_backlink_to_first_comparison_page(self) -> None:
         fitz = __import__("fitz")
@@ -3752,6 +3855,20 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         headings = [item.text for item in story if isinstance(item, _FakeParagraph)]
         self.assertIn("Watch Items Table", headings)
+
+    def test_pass_fail_synopsis_lines_uses_requires_eval_wording(self) -> None:
+        lines = tar._tar_pass_fail_synopsis_lines(
+            {
+                "comparison_rows": [
+                    {"serial": "SN-001", "run_condition": "Condition A", "parameter": "Pressure", "final_grade": "FAIL"},
+                    {"serial": "SN-002", "run_condition": "Condition A", "parameter": "Flow", "final_grade": "WATCH"},
+                ],
+                "overall_by_sn": {"SN-001": "FAILED", "SN-002": "WATCH", "SN-003": "CERTIFIED"},
+            }
+        )
+
+        self.assertTrue(any("REQUIRES EVAL 1" in line for line in lines))
+        self.assertFalse(any("FAILED " in line for line in lines))
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(

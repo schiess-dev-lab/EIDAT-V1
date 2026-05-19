@@ -2981,6 +2981,13 @@ def _tar_grade_display_text(grade: object) -> str:
     return str(grade or "").strip().upper()
 
 
+def _tar_overall_status_display_text(status: object) -> str:
+    raw = str(status or "").strip().upper()
+    if raw == "FAILED":
+        return "REQUIRES EVAL"
+    return raw
+
+
 def _overall_cert_status(grades: list[str], *, ignore_no_data: bool = False, empty_status: str = "NO_DATA") -> str:
     gs = [_tar_normalize_grade_token(g) for g in (grades or [])]
     evaluable = [g for g in gs if g in {"PASS", "WATCH", "FAIL"}]
@@ -6180,8 +6187,8 @@ def generate_test_data_auto_report(
                 "  • Family curve: median across all serials in the project cache (per run/param).",
                 "  • Residual metrics: max_abs, max_pct, rms_pct, x@max.",
                 "  • Grade basis: Deviation Score from the selected comparison pool.",
-                f"  • Thresholds: PASS if score≤{_fmt_num(z_pass)}; WATCH if score≤{_fmt_num(z_watch)}; else FAIL.",
-                "  • Main body shows WATCH/FAIL only; PASS details are in the appendix.",
+                f"  • Thresholds: PASS if score≤{_fmt_num(z_pass)}; WATCH if score≤{_fmt_num(z_watch)}; else REQUIRES EVAL.",
+                "  • Main body shows WATCH/REQUIRES EVAL only; PASS details are in the appendix.",
             ]
             y = 0.30
             for line in expl:
@@ -6692,7 +6699,7 @@ def generate_test_data_auto_report(
                 for idx, start in enumerate(range(0, len(matrix_rows_all), 30), start=1):
                     rows = matrix_rows_all[start : start + 30]
                     grade_cells = {(rr, cc) for rr in range(len(rows)) for cc in range(2, len(cols))}
-                    title = "Appendix — Grade Matrix (PASS/WATCH/FAIL)"
+                    title = "Appendix — Grade Matrix (PASS/WATCH/REQUIRES EVAL)"
                     if len(matrix_rows_all) > 30:
                         total_pages = _ceil_div(len(matrix_rows_all), 30)
                         title += f" ({idx}/{total_pages})"
@@ -9564,7 +9571,7 @@ def _tar_exec_scope_table_rows(
             "Serial disposition",
             (
                 f"CERTIFIED {serial_counts['CERTIFIED']} | WATCH {serial_counts['WATCH']} | "
-                f"FAILED {serial_counts['FAILED']} | LIMITED {serial_counts['LIMITED']}"
+                f"REQUIRES EVAL {serial_counts['FAILED']} | LIMITED {serial_counts['LIMITED']}"
             ),
         ],
         [
@@ -9756,7 +9763,7 @@ def _tar_pass_fail_synopsis_lines(
         (
             "Serial outcomes: "
             f"CERTIFIED {status_counts['CERTIFIED']} | WATCH {status_counts['WATCH']} | "
-            f"FAILED {status_counts['FAILED']} | LIMITED {status_counts['LIMITED']}"
+            f"REQUIRES EVAL {status_counts['FAILED']} | LIMITED {status_counts['LIMITED']}"
         ),
         (
             "Final graded items: "
@@ -9832,12 +9839,18 @@ def _tar_build_exec_exception_rows(ctx: Mapping[str, Any]) -> list[dict[str, Any
         cohort_id = str(raw_row.get("regrade_cohort_id") or "").strip()
         watch_destination = watch_destinations.get(pair_id) if pair_id else None
         regrade_destination = regrade_destinations.get(cohort_id) if cohort_id else None
-        chart_target_page_index = watch_destination if watch_destination is not None else regrade_destination
-        chart_target_section = (
-            "watch_nonpass_curves"
-            if watch_destination is not None
-            else ("regrade_pass_curve_overlays" if regrade_destination is not None else "")
-        )
+        if final_status == "FAIL" and regrade_destination is not None:
+            chart_target_page_index = regrade_destination
+            chart_target_section = "regrade_pass_curve_overlays"
+        elif watch_destination is not None:
+            chart_target_page_index = watch_destination
+            chart_target_section = "watch_nonpass_curves"
+        elif regrade_destination is not None:
+            chart_target_page_index = regrade_destination
+            chart_target_section = "regrade_pass_curve_overlays"
+        else:
+            chart_target_page_index = None
+            chart_target_section = ""
         rows.append(
             {
                 "pair_id": pair_id,
@@ -10871,31 +10884,16 @@ def _tar_find_intro_exception_grade_rect(
 
     page_rect = getattr(page, "rect", None)
     page_width = float(getattr(page_rect, "width", 0.0) or 0.0)
-    grade_queries = [grade_text]
+    grade_query_sets: list[list[str]] = [[grade_text]]
     if " " in grade_text:
-        grade_queries.extend([part for part in grade_text.split() if part])
-    seen_rects: set[tuple[float, float, float, float]] = set()
-    candidate_rects = []
-    for query in grade_queries:
-        for rect in _cached_search(query):
-            rect_key = (
-                float(getattr(rect, "x0", 0.0) or 0.0),
-                float(getattr(rect, "y0", 0.0) or 0.0),
-                float(getattr(rect, "x1", 0.0) or 0.0),
-                float(getattr(rect, "y1", 0.0) or 0.0),
-            )
-            if rect_key in seen_rects:
-                continue
-            if excluded_rect_keys is not None and rect_key in excluded_rect_keys:
-                continue
-            if page_width and _tar_rect_mid_x(rect) < page_width * 0.55:
-                continue
-            seen_rects.add(rect_key)
-            candidate_rects.append(rect)
-    if not candidate_rects:
-        candidate_rects = []
-        seen_rects.clear()
-        for query in grade_queries:
+        split_queries = [part for part in grade_text.split() if part]
+        if split_queries:
+            grade_query_sets.append(split_queries)
+
+    def _collect_candidate_rects(queries: Sequence[str], *, prefer_right_half: bool) -> list[Any]:
+        seen_rects: set[tuple[float, float, float, float]] = set()
+        rects: list[Any] = []
+        for query in queries:
             for rect in _cached_search(query):
                 rect_key = (
                     float(getattr(rect, "x0", 0.0) or 0.0),
@@ -10907,59 +10905,78 @@ def _tar_find_intro_exception_grade_rect(
                     continue
                 if excluded_rect_keys is not None and rect_key in excluded_rect_keys:
                     continue
+                if prefer_right_half and page_width and _tar_rect_mid_x(rect) < page_width * 0.55:
+                    continue
                 seen_rects.add(rect_key)
-                candidate_rects.append(rect)
+                rects.append(rect)
+        return rects
+
+    candidate_rects: list[Any] = []
+    for query_set in grade_query_sets:
+        candidate_rects = _collect_candidate_rects(query_set, prefer_right_half=True)
+        if candidate_rects:
+            break
+    if not candidate_rects:
+        for query_set in grade_query_sets:
+            candidate_rects = _collect_candidate_rects(query_set, prefer_right_half=False)
+            if candidate_rects:
+                break
     if not candidate_rects:
         return None
 
-    anchors: list[tuple[str, bool, float]] = [
-        (_tar_exception_link_search_anchor(link.get("serial_text")), True, 18.0),
-        (_tar_exception_link_search_anchor(link.get("parameter_text")), True, 18.0),
-        (_tar_exception_link_search_anchor(link.get("sequence_text")), False, 22.0),
-        (_tar_exception_link_search_anchor(link.get("run_condition_text")), False, 22.0),
+    anchors: list[tuple[str, float, bool]] = [
+        (_tar_exception_link_search_anchor(link.get("serial_text")), 18.0, True),
+        (_tar_exception_link_search_anchor(link.get("run_condition_text")), 22.0, False),
+        (_tar_exception_link_search_anchor(link.get("sequence_text")), 22.0, False),
+        (_tar_exception_link_search_anchor(link.get("parameter_text")), 18.0, True),
     ]
-    best_rect = None
-    best_score = None
-    for rect in candidate_rects:
-        rect_y = _tar_rect_mid_y(rect)
-        rect_x = float(getattr(rect, "x0", 0.0) or 0.0)
-        missing_required = 0
-        missing_optional = 0
-        gaps: list[float] = []
-        for anchor_text, required, max_gap in anchors:
-            if not anchor_text:
+
+    def _best_candidate(*, strict_context: bool) -> Any | None:
+        best_rect = None
+        best_score = None
+        for rect in candidate_rects:
+            rect_y = _tar_rect_mid_y(rect)
+            rect_x = float(getattr(rect, "x0", 0.0) or 0.0)
+            missing_required = 0
+            missing_optional = 0
+            gaps: list[float] = []
+            for anchor_text, max_gap, always_required in anchors:
+                if not anchor_text:
+                    continue
+                required = always_required or strict_context
+                anchor_rects = [
+                    candidate
+                    for candidate in _cached_search(anchor_text)
+                    if float(getattr(candidate, "x0", 0.0) or 0.0) <= rect_x + 8.0
+                ]
+                if not anchor_rects:
+                    if required:
+                        missing_required += 1
+                    else:
+                        missing_optional += 1
+                    continue
+                gap = min(abs(_tar_rect_mid_y(candidate) - rect_y) for candidate in anchor_rects)
+                if gap > max_gap:
+                    if required:
+                        missing_required += 1
+                    else:
+                        missing_optional += 1
+                    continue
+                gaps.append(gap)
+            if missing_required:
                 continue
-            anchor_rects = [
-                candidate
-                for candidate in _cached_search(anchor_text)
-                if float(getattr(candidate, "x0", 0.0) or 0.0) <= rect_x + 8.0
-            ]
-            if not anchor_rects:
-                if required:
-                    missing_required += 1
-                else:
-                    missing_optional += 1
-                continue
-            gap = min(abs(_tar_rect_mid_y(candidate) - rect_y) for candidate in anchor_rects)
-            if required and gap > max_gap:
-                missing_required += 1
-                continue
-            if not required and gap > max_gap:
-                missing_optional += 1
-                continue
-            gaps.append(gap)
-        if missing_required:
-            continue
-        score = (
-            missing_optional,
-            max(gaps or [999.0]),
-            sum(gaps or [999.0]),
-            -rect_x,
-        )
-        if best_score is None or score < best_score:
-            best_rect = rect
-            best_score = score
-    return best_rect
+            score = (
+                missing_optional,
+                max(gaps or [999.0]),
+                sum(gaps or [999.0]),
+                -rect_x,
+            )
+            if best_score is None or score < best_score:
+                best_rect = rect
+                best_score = score
+        return best_rect
+
+    return _best_candidate(strict_context=True) or _best_candidate(strict_context=False)
 
 
 def _tar_apply_pdf_navigation(
@@ -14343,7 +14360,7 @@ def _tar_render_curve_cohort_page(
     )
     plot_context_lines = _tar_plot_condition_header_lines(ctx, cohort_spec)
     full_width_layout = str(section_key or "").strip() == "run_condition_curve_overlays"
-    show_family_overlay = True
+    show_family_overlay = False
     resolved_family_label, resolved_band_label = _tar_curve_family_legend_labels(
         cohort_spec,
         mean_label=str(family_label or "").strip() or "In-family, graded mean",
@@ -14576,9 +14593,9 @@ def _tar_render_watch_curve_page(
         band_3sigma_lo, band_3sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=3.0)
         band_2sigma_lo, band_2sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=2.0)
         band_1sigma_lo, band_1sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=1.0)
-        ax.fill_between(x_grid, band_3sigma_lo, band_3sigma_hi, color="#fca5a5", alpha=0.10, label=resolved_band_3sigma_label)
-        ax.fill_between(x_grid, band_2sigma_lo, band_2sigma_hi, color="#fdba74", alpha=0.14, label=resolved_band_2sigma_label)
-        ax.fill_between(x_grid, band_1sigma_lo, band_1sigma_hi, color="#fed7aa", alpha=0.18, label=resolved_band_1sigma_label)
+        ax.fill_between(x_grid, band_3sigma_lo, band_3sigma_hi, color="#dc2626", alpha=0.14, label=resolved_band_3sigma_label)
+        ax.fill_between(x_grid, band_2sigma_lo, band_2sigma_hi, color="#ca8a04", alpha=0.18, label=resolved_band_2sigma_label)
+        ax.fill_between(x_grid, band_1sigma_lo, band_1sigma_hi, color="#15803d", alpha=0.22, label=resolved_band_1sigma_label)
     except Exception:
         pass
     palette = _tar_build_highlight_palette(ctx.get("colors"))
@@ -15373,7 +15390,7 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
             [
                 f"CERTIFIED serials: {status_counts['CERTIFIED']}",
                 f"WATCH serials: {status_counts['WATCH']}",
-                f"FAILED serials: {status_counts['FAILED']}",
+                f"REQUIRES EVAL serials: {status_counts['FAILED']}",
                 f"LIMITED serials: {status_counts['LIMITED']}",
             ],
             styles=styles,
