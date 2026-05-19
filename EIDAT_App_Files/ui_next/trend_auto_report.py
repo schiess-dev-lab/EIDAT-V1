@@ -4945,7 +4945,7 @@ def _tar_comparison_page_metric_value(
     if metric_label in {"Dev Score / Max Band", "Deviation Score", "Z-Score"}:
         return _tar_exec_dev_score_max_band_text(row)
     if metric_label == "Official Grade":
-        return str(_pick("official_grade", "final_grade", "grade", "initial_grade") or "NO_DATA").strip().upper() or "NO_DATA"
+        return _tar_grade_display_text(_pick("official_grade", "final_grade", "grade", "initial_grade") or "NO_DATA") or "NO_DATA"
     if metric_label == "Comparison Pool":
         pool_text = str(row.get("comparison_pool_text") or "").strip()
         if pool_text:
@@ -5378,11 +5378,11 @@ def _tar_build_comparison_chart_links(
                 text = str(value or "").strip()
                 if not text:
                     continue
-                occurrence_index = int(text_occurrences.get(text, 0))
-                text_occurrences[text] = occurrence_index + 1
                 cell_meta = link_cells.get((row_index, col_index))
                 if not cell_meta:
                     continue
+                occurrence_index = int(text_occurrences.get(text, 0))
+                text_occurrences[text] = occurrence_index + 1
                 links.append(
                     {
                         "source_page_index": source_page_index,
@@ -7329,7 +7329,7 @@ def _tar_curve_serial_legend_label(
 ) -> str:
     serial_text = str(serial or "").strip()
     serial_label = _tar_display_serial(ctx, serial_text) or serial_text
-    grade_label = str(grade or "NO_DATA").strip().upper() or "NO_DATA"
+    grade_label = _tar_grade_display_text(grade) or "NO_DATA"
     condition_text = _tar_curve_legend_condition_text(selection_label) or _tar_curve_legend_condition_text(fallback_label)
     if condition_text:
         return f"{serial_label} | {condition_text} ({grade_label})"
@@ -7526,7 +7526,9 @@ def _tar_exec_serial_mean(row: Mapping[str, object] | None) -> float | None:
 def _tar_exec_deviation_score(row: Mapping[str, object] | None) -> float | None:
     if not isinstance(row, Mapping):
         return None
-    for key in ("official_deviation_score", "official_zscore", "final_zscore", "final_delta", "initial_zscore", "initial_delta"):
+    # Report tables should show the official/final deviation score only.
+    # Initial-only scores still exist in the analysis payload but are not displayed.
+    for key in ("official_deviation_score", "official_zscore", "final_zscore", "final_delta"):
         value = _safe_float(row.get(key))
         if value is not None:
             return float(value)
@@ -7569,6 +7571,13 @@ def _tar_join_display_pair(left: object, right: object) -> str:
     if left_text and right_text:
         return f"{left_text} / {right_text}"
     return left_text or right_text
+
+
+def _tar_exec_deviation_score_text(row: Mapping[str, object] | None, *, sig: int = 4) -> str:
+    value = _tar_exec_deviation_score(row)
+    if value is None:
+        return ""
+    return _fmt_num(value, sig=sig)
 
 
 def _tar_exec_grade_thresholds(ctx: Mapping[str, Any] | None) -> tuple[float, float]:
@@ -7672,7 +7681,7 @@ def _tar_exec_dev_score_max_band_text(row: Mapping[str, object] | None) -> str:
     if not isinstance(row, Mapping):
         return ""
     return _tar_join_display_pair(
-        _fmt_num(_tar_exec_deviation_score(row), sig=4),
+        _tar_exec_deviation_score_text(row, sig=4),
         _tar_exec_max_band_label(row),
     )
 
@@ -8743,9 +8752,9 @@ def _tar_metric_program_segment_label(
     suppression = str(summary.get("suppression") or "").strip()
     valve = str(summary.get("valve") or "").strip()
     if suppression:
-        parts.append(f"Supp: {suppression}")
+        parts.append(f"Supp V: {suppression}")
     if valve:
-        parts.append(f"Valve: {valve}")
+        parts.append(f"Valve V: {valve}")
     if not parts:
         return label
     return f"{label}\n{' | '.join(parts)}"
@@ -8803,11 +8812,11 @@ def _tar_apply_metric_program_segments(
         try:
             axes.text(
                 (float(start) + float(end)) / 2.0,
-                0.985,
+                1.015,
                 label,
                 transform=transform,
                 ha="center",
-                va="top",
+                va="bottom",
                 fontsize=(7 if span >= 2 else 6),
                 fontweight="bold",
                 rotation=(90 if span == 1 and len(label) > 14 else 0),
@@ -8819,7 +8828,7 @@ def _tar_apply_metric_program_segments(
                     "linewidth": 1.0,
                     "alpha": 0.92,
                 },
-                clip_on=True,
+                clip_on=False,
                 zorder=4.0,
             )
         except Exception:
@@ -9510,6 +9519,21 @@ def _tar_outcome_mix_text(rows: list[Mapping[str, Any]] | None) -> str:
     )
 
 
+def _tar_exec_evaluated_parameter_count(rows: list[Mapping[str, Any]] | None) -> int:
+    parameter_keys: set[str] = set()
+    for row in rows or []:
+        if not isinstance(row, Mapping):
+            continue
+        key = _tar_comparison_parameter_key(row)
+        if key:
+            parameter_keys.add(key)
+            continue
+        fallback = str(row.get("parameter") or row.get("param") or "").strip()
+        if fallback:
+            parameter_keys.add(fallback)
+    return len(parameter_keys)
+
+
 _TAR_EXEC_SERIAL_MAX_ROWS = 10
 _TAR_EXEC_EXCEPTION_GRADE_TEXT_COLOR = "#1d4ed8"
 _TAR_EXEC_EXCEPTION_HEADER = ["SN", "Run Condition", "Sequence(s)", "Parameter", "Graded / SN Mean", "Dev Score", "Max Band", "Grading"]
@@ -9571,14 +9595,14 @@ def _tar_exec_scope_table_rows(
             "Serial disposition",
             (
                 f"CERTIFIED {serial_counts['CERTIFIED']} | WATCH {serial_counts['WATCH']} | "
-                f"REQUIRES EVAL {serial_counts['FAILED']} | LIMITED {serial_counts['LIMITED']}"
+                f"REQUIRES EVAL {serial_counts['FAILED']}"
             ),
         ],
         [
             "Graded items",
             (
                 f"PASS {grade_counts['PASS']} | WATCH {grade_counts['WATCH']} | "
-                f"REQUIRES EVAL {grade_counts['FAIL']} | LIMITED {grade_counts['LIMITED']}"
+                f"REQUIRES EVAL {grade_counts['FAIL']}"
             ),
         ],
         [
@@ -9635,10 +9659,7 @@ def _tar_exec_serial_table_rows(
     rows = [
         [
             _tar_display_serial(ctx, serial) or serial,
-            _tar_exec_overall_text(
-                (ctx.get("initial_overall_by_sn") or {}).get(serial, ""),
-                (ctx.get("final_overall_by_sn") or {}).get(serial, ""),
-            ),
+            str(_tar_exec_evaluated_parameter_count((comparison_rows_by_serial or {}).get(serial) or [])),
             _tar_meta(ctx, serial, "program_title"),
             _tar_meta(ctx, serial, "part_number"),
             _tar_meta(ctx, serial, "revision"),
@@ -9650,7 +9671,7 @@ def _tar_exec_serial_table_rows(
         hidden = len(rows) - _TAR_EXEC_SERIAL_MAX_ROWS
         rows = rows[:_TAR_EXEC_SERIAL_MAX_ROWS]
         rows.append(["Additional serials", f"+{hidden} more", "", "", "", "Listed in the scope table above."])
-    return [["SN", "Initial / Final", "Program", "Part #", "Rev", "P/W/F items"], *rows]
+    return [["SN", "Parameters Evaluated", "Program", "Part #", "Rev", "P/W/F items"], *rows]
 
 
 def _tar_exec_exception_table_rows(
@@ -9693,7 +9714,7 @@ def _tar_exec_exception_table_spec(
                 sequence_text,
                 parameter_text,
                 _tar_exec_mean_pair_text(row),
-                _fmt_num(_tar_exec_deviation_score(row), sig=4),
+                _tar_exec_deviation_score_text(row, sig=4),
                 _tar_exec_max_band_label(row),
                 grade_text,
             ]
@@ -10849,12 +10870,84 @@ def _tar_rect_mid_x(rect: Any) -> float:
     return (float(getattr(rect, "x0", 0.0) or 0.0) + float(getattr(rect, "x1", 0.0) or 0.0)) / 2.0
 
 
+def _tar_rect_key(rect: Any) -> tuple[float, float, float, float]:
+    return (
+        float(getattr(rect, "x0", 0.0) or 0.0),
+        float(getattr(rect, "y0", 0.0) or 0.0),
+        float(getattr(rect, "x1", 0.0) or 0.0),
+        float(getattr(rect, "y1", 0.0) or 0.0),
+    )
+
+
 def _tar_exception_link_search_anchor(text: object) -> str:
     for line in str(text or "").splitlines():
         candidate = str(line or "").strip()
         if candidate:
             return candidate
     return str(text or "").strip()
+
+
+def _tar_exception_link_search_queries(text: object) -> list[str]:
+    anchor = _tar_exception_link_search_anchor(text)
+    if not anchor:
+        return []
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: object) -> None:
+        value = str(candidate or "").strip()
+        if not value:
+            return
+        key = value.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        queries.append(value)
+
+    _add(anchor)
+    stripped = re.sub(r"^[\-\u2022\u2023\u25e6\u2043\u2219]+\s*", "", anchor).strip()
+    _add(stripped)
+    unprefixed = re.sub(r"^(run condition|sequence\(s\)|sequence|parameter)\s*:\s*", "", stripped, flags=re.IGNORECASE).strip()
+    _add(unprefixed)
+    return queries
+
+
+def _tar_filter_comparison_link_rects(rects: Sequence[Any] | None, *, expected_count: int | None = None) -> list[Any]:
+    grouped: list[list[Any]] = []
+    for rect in rects or []:
+        rect_mid_y = _tar_rect_mid_y(rect)
+        target_group = None
+        for group in grouped:
+            if abs(_tar_rect_mid_y(group[0]) - rect_mid_y) <= 3.0:
+                target_group = group
+                break
+        if target_group is None:
+            grouped.append([rect])
+        else:
+            target_group.append(rect)
+
+    total_rects = sum(len(group) for group in grouped)
+    extras_to_drop = max(0, total_rects - max(0, int(expected_count or 0))) if expected_count is not None else 0
+    filtered: list[Any] = []
+    for group in grouped:
+        ordered = sorted(
+            group,
+            key=lambda candidate: (
+                float(getattr(candidate, "x0", 0.0) or 0.0),
+                float(getattr(candidate, "y0", 0.0) or 0.0),
+            ),
+        )
+        if extras_to_drop > 0 and len(ordered) > 1:
+            ordered = ordered[1:]
+            extras_to_drop -= 1
+        filtered.extend(ordered)
+    return sorted(
+        filtered,
+        key=lambda candidate: (
+            float(getattr(candidate, "y0", 0.0) or 0.0),
+            float(getattr(candidate, "x0", 0.0) or 0.0),
+        ),
+    )
 
 
 def _tar_find_intro_exception_grade_rect(
@@ -10881,6 +10974,18 @@ def _tar_find_intro_exception_grade_rect(
             except Exception:
                 search_cache[text] = []
         return list(search_cache.get(text) or [])
+
+    def _cached_search_many(queries: Sequence[str]) -> list[Any]:
+        out: list[Any] = []
+        seen_rects: set[tuple[float, float, float, float]] = set()
+        for query in queries:
+            for rect in _cached_search(query):
+                rect_key = _tar_rect_key(rect)
+                if rect_key in seen_rects:
+                    continue
+                seen_rects.add(rect_key)
+                out.append(rect)
+        return out
 
     page_rect = getattr(page, "rect", None)
     page_width = float(getattr(page_rect, "width", 0.0) or 0.0)
@@ -10930,6 +11035,11 @@ def _tar_find_intro_exception_grade_rect(
         (_tar_exception_link_search_anchor(link.get("sequence_text")), 22.0, False),
         (_tar_exception_link_search_anchor(link.get("parameter_text")), 18.0, True),
     ]
+    anchor_queries = {
+        anchor_text: _tar_exception_link_search_queries(anchor_text)
+        for anchor_text, _max_gap, _required in anchors
+        if anchor_text
+    }
 
     def _best_candidate(*, strict_context: bool) -> Any | None:
         best_rect = None
@@ -10946,7 +11056,7 @@ def _tar_find_intro_exception_grade_rect(
                 required = always_required or strict_context
                 anchor_rects = [
                     candidate
-                    for candidate in _cached_search(anchor_text)
+                    for candidate in _cached_search_many(anchor_queries.get(anchor_text) or [anchor_text])
                     if float(getattr(candidate, "x0", 0.0) or 0.0) <= rect_x + 8.0
                 ]
                 if not anchor_rects:
@@ -10976,7 +11086,31 @@ def _tar_find_intro_exception_grade_rect(
                 best_score = score
         return best_rect
 
-    return _best_candidate(strict_context=True) or _best_candidate(strict_context=False)
+    best_rect = _best_candidate(strict_context=True) or _best_candidate(strict_context=False)
+    if best_rect is None:
+        return None
+    best_key = _tar_rect_key(best_rect)
+    companion_rects = [best_rect]
+    for rect in candidate_rects:
+        rect_key = _tar_rect_key(rect)
+        if rect_key == best_key:
+            continue
+        if abs(_tar_rect_mid_y(rect) - _tar_rect_mid_y(best_rect)) > 10.0:
+            continue
+        if float(getattr(rect, "x0", 0.0) or 0.0) + 6.0 < float(getattr(best_rect, "x0", 0.0) or 0.0):
+            continue
+        companion_rects.append(rect)
+    if len(companion_rects) == 1:
+        return best_rect
+    x0 = min(float(getattr(rect, "x0", 0.0) or 0.0) for rect in companion_rects)
+    y0 = min(float(getattr(rect, "y0", 0.0) or 0.0) for rect in companion_rects)
+    x1 = max(float(getattr(rect, "x1", 0.0) or 0.0) for rect in companion_rects)
+    y1 = max(float(getattr(rect, "y1", 0.0) or 0.0) for rect in companion_rects)
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        return best_rect
+    return fitz.Rect(x0, y0, x1, y1)
 
 
 def _tar_apply_pdf_navigation(
@@ -11104,13 +11238,25 @@ def _tar_apply_pdf_navigation(
         for source_page_index, links_for_page in grouped_comparison_links.items():
             page = doc.load_page(source_page_index)
             rect_cache: dict[str, list[Any]] = {}
+            label_link_counts: dict[str, int] = {}
+            for link in links_for_page:
+                label = str(link.get("link_label") or "").strip()
+                if not label:
+                    continue
+                label_link_counts[label] = int(label_link_counts.get(label, 0)) + 1
             for link in sorted(
                 links_for_page,
                 key=lambda item: (str(item.get("link_label") or ""), int(item.get("occurrence_index") or 0)),
             ):
                 label = str(link.get("link_label") or "").strip()
                 occurrence_index = int(link.get("occurrence_index") or 0)
-                rects = rect_cache.setdefault(label, list(page.search_for(label)))
+                rects = rect_cache.setdefault(
+                    label,
+                    _tar_filter_comparison_link_rects(
+                        list(page.search_for(label)),
+                        expected_count=label_link_counts.get(label),
+                    ),
+                )
                 if occurrence_index < 0 or occurrence_index >= len(rects):
                     continue
                 _tar_insert_page_link(page, rects[occurrence_index], int(link.get("destination_page_index")))
@@ -13742,16 +13888,30 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
     performance_plot_specs: list[dict] = []
     equation_cards: list[dict] = []
     metric_series_cache = ctx.setdefault("performance_metric_series_cache", {})
+    equation_seed_stats = ("mean", "min", "max")
+
+    def _configured_perf_stats(perf_def: Mapping[str, object], x_spec: Mapping[str, object] | None) -> list[str]:
+        stats_list = perf_def.get("stats")
+        if isinstance(stats_list, list):
+            perf_stats = [str(value).strip().lower() for value in stats_list if str(value).strip()]
+        else:
+            legacy_stat = str((x_spec.get("stat") if isinstance(x_spec, dict) else "mean") or "mean").strip().lower()
+            perf_stats = [legacy_stat] if legacy_stat else ["mean"]
+        if not perf_stats:
+            perf_stats = ["mean"]
+        return perf_stats
+
+    def _equation_stats_for_perf(perf_def: Mapping[str, object], x_spec: Mapping[str, object] | None) -> list[str]:
+        configured = _configured_perf_stats(perf_def, x_spec)
+        ordered = ["mean", *configured, *equation_seed_stats]
+        return [str(value).strip().lower() for value in _tar_unique_text_values(ordered) if str(value).strip()]
+
     total_perf_specs = 0
     if isinstance(raw_perf, list):
         for perf_def in raw_perf:
             if not isinstance(perf_def, dict):
                 continue
-            stats_list = perf_def.get("stats")
-            if isinstance(stats_list, list) and stats_list:
-                total_perf_specs += len([value for value in stats_list if str(value).strip()])
-            else:
-                total_perf_specs += 1
+            total_perf_specs += len(_equation_stats_for_perf(perf_def, perf_def.get("x") if isinstance(perf_def.get("x"), Mapping) else {}))
     perf_spec_index = 0
 
     if isinstance(raw_perf, list):
@@ -13777,20 +13937,17 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
             y_label = _tar_perf_target_text(y_target_meta, fallback=y_target)
             if not x_target or not y_target:
                 continue
-            stats_list = perf_def.get("stats")
-            if isinstance(stats_list, list):
-                perf_stats = [str(value).strip().lower() for value in stats_list if str(value).strip()]
-            else:
-                legacy_stat = str((x_spec.get("stat") if isinstance(x_spec, dict) else "mean") or "mean").strip().lower()
-                perf_stats = [legacy_stat] if legacy_stat else ["mean"]
-            if not perf_stats:
-                perf_stats = ["mean"]
+            perf_stats = _configured_perf_stats(perf_def, x_spec if isinstance(x_spec, Mapping) else {})
+            plot_stat = "mean"
+            equation_stats = _equation_stats_for_perf(perf_def, x_spec if isinstance(x_spec, Mapping) else {})
             require_min_points = max(2, int(perf_def.get("require_min_points") or 2))
             fit_cfg = perf_def.get("fit") or {}
             fit_degree = max(0, int((fit_cfg.get("degree") if isinstance(fit_cfg, dict) else 0) or 0))
             fit_norm = bool((fit_cfg.get("normalize_x") if isinstance(fit_cfg, dict) else True))
+            plot_model_row: dict[str, Any] | None = None
+            equation_stat_models: list[dict[str, Any]] = []
 
-            for perf_stat in perf_stats:
+            for perf_stat in equation_stats:
                 perf_spec_index += 1
                 _tar_emit_progress(
                     progress_cb,
@@ -13867,47 +14024,82 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
                     "master": {"poly": master_poly, "equation": master_eqn, "rmse": master_poly.get("rmse")},
                     "highlighted": highlighted_models,
                 }
-                performance_models.append(model_row)
-                performance_plot_specs.append(
-                    {
+                equation_stat_models.append(model_row)
+                if perf_stat == plot_stat:
+                    plot_model_row = {
                         **model_row,
                         "curves": curves,
                         "pooled_x": list(pooled_x),
                         "highlighted_serials": [serial for serial in ctx["hi"] if serial in curves],
                     }
+
+            if plot_model_row is not None:
+                performance_plot_specs.append(plot_model_row)
+
+            if not equation_stat_models:
+                continue
+
+            performance_models.append(
+                {
+                    "name": name,
+                    "x": {
+                        "column": str(x_target_meta.get("raw_column") or x_target).strip(),
+                        "selection_value": str(x_target_meta.get("selection_value") or x_target).strip(),
+                        "display_name": x_label,
+                        "units": (plot_model_row or equation_stat_models[0]).get("x", {}).get("units", ""),
+                    },
+                    "y": {
+                        "column": str(y_target_meta.get("raw_column") or y_target).strip(),
+                        "selection_value": str(y_target_meta.get("selection_value") or y_target).strip(),
+                        "display_name": y_label,
+                        "units": (plot_model_row or equation_stat_models[0]).get("y", {}).get("units", ""),
+                    },
+                    "fit": {"degree": int(fit_degree), "normalize_x": bool(fit_norm)},
+                    "require_min_points": int(require_min_points),
+                    "plot_stat": plot_stat,
+                    "configured_stats": list(perf_stats),
+                    "equation_stats": list(equation_stat_models),
+                }
+            )
+
+            family_lines = [f"Parameters: {y_label} vs {x_label}"]
+            for stat_model in equation_stat_models:
+                master = stat_model.get("master") if isinstance(stat_model.get("master"), Mapping) else {}
+                master_eqn = str((master or {}).get("equation") or "").strip()
+                if not master_eqn:
+                    continue
+                stat_label = str(stat_model.get("stat") or "").strip() or "mean"
+                family_lines.append(f"{stat_label}: {master_eqn}")
+                family_lines.append(f"{stat_label} RMSE: {_fmt_num((master or {}).get('rmse'), sig=5)}")
+                family_lines.append(f"{stat_label} curves included: {int(stat_model.get('serials_curves') or 0)}")
+            if len(family_lines) > 1:
+                equation_cards.append(
+                    {
+                        "kind": "family",
+                        "title": f"{name} | Family Fit",
+                        "lines": family_lines,
+                    }
                 )
 
-                if master_eqn:
-                    equation_cards.append(
-                        {
-                            "kind": "family",
-                            "title": f"{name} | Family Fit",
-                            "lines": [
-                                f"Parameters: {y_label} vs {x_label}",
-                                f"Statistic: {perf_stat}",
-                                f"Equation: {master_eqn}",
-                                f"RMSE: {_fmt_num(master_poly.get('rmse'), sig=5)}",
-                                f"Curves included: {len(curves)}",
-                            ],
-                        }
-                    )
-                for serial in ctx["hi"]:
-                    highlighted = highlighted_models.get(serial)
-                    if not isinstance(highlighted, dict):
+            for serial in ctx["hi"]:
+                serial_lines = [f"Parameters: {y_label} vs {x_label}"]
+                for stat_model in equation_stat_models:
+                    highlighted = stat_model.get("highlighted") if isinstance(stat_model.get("highlighted"), Mapping) else {}
+                    serial_model = highlighted.get(serial) if isinstance(highlighted, Mapping) else None
+                    if not isinstance(serial_model, Mapping):
                         continue
-                    equation = str(highlighted.get("equation") or "").strip()
+                    equation = str(serial_model.get("equation") or "").strip()
                     if not equation:
                         continue
+                    stat_label = str(stat_model.get("stat") or "").strip() or "mean"
+                    serial_lines.append(f"{stat_label}: {equation}")
+                    serial_lines.append(f"{stat_label} RMSE: {_fmt_num(serial_model.get('rmse'), sig=5)}")
+                if len(serial_lines) > 1:
                     equation_cards.append(
                         {
                             "kind": "serial",
                             "title": f"{name} | {_tar_display_serial(ctx, serial) or serial}",
-                            "lines": [
-                                f"Parameters: {y_label} vs {x_label}",
-                                f"Statistic: {perf_stat}",
-                                f"Equation: {equation}",
-                                f"RMSE: {_fmt_num(highlighted.get('rmse'), sig=5)}",
-                            ],
+                            "lines": serial_lines,
                         }
                     )
 
@@ -14063,13 +14255,30 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     return story
 
 
-def _tar_equation_summary_model_label(model: Mapping[str, Any]) -> str:
+def _tar_equation_summary_model_label(model: Mapping[str, Any], *, stat_override: object = "") -> str:
     name = str(model.get("name") or "Performance").strip() or "Performance"
     x_target = _tar_perf_target_text(model.get("x") if isinstance(model.get("x"), Mapping) else {}, fallback="")
     y_target = _tar_perf_target_text(model.get("y") if isinstance(model.get("y"), Mapping) else {}, fallback="")
-    stat = str(model.get("stat") or "").strip()
+    stat = str(stat_override or model.get("stat") or "").strip()
     compare_text = f"{y_target} vs {x_target}".strip(" |") if x_target or y_target else ""
     return " | ".join(value for value in [name, compare_text, f"Stat: {stat}" if stat else ""] if value)
+
+
+def _tar_equation_model_stat_entries(model: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(model, Mapping):
+        return []
+    grouped = model.get("equation_stats")
+    if isinstance(grouped, list):
+        entries = [dict(entry) for entry in grouped if isinstance(entry, Mapping)]
+        if entries:
+            return entries
+    return [
+        {
+            "stat": str(model.get("stat") or "").strip(),
+            "master": dict(model.get("master") or {}) if isinstance(model.get("master"), Mapping) else {},
+            "highlighted": dict(model.get("highlighted") or {}) if isinstance(model.get("highlighted"), Mapping) else {},
+        }
+    ]
 
 
 def _tar_equation_summary_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
@@ -14079,25 +14288,26 @@ def _tar_equation_summary_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
         if not isinstance(raw_model, Mapping):
             continue
         model = dict(raw_model)
-        model_label = _tar_equation_summary_model_label(model)
-        master = model.get("master") if isinstance(model.get("master"), Mapping) else {}
-        master_equation = str((master or {}).get("equation") or "").strip()
-        if master_equation:
-            rows.append([model_label, "Overall", master_equation, _fmt_num((master or {}).get("rmse"), sig=5)])
+        for stat_model in _tar_equation_model_stat_entries(model):
+            model_label = _tar_equation_summary_model_label(model, stat_override=stat_model.get("stat"))
+            master = stat_model.get("master") if isinstance(stat_model.get("master"), Mapping) else {}
+            master_equation = str((master or {}).get("equation") or "").strip()
+            if master_equation:
+                rows.append([model_label, "Overall", master_equation, _fmt_num((master or {}).get("rmse"), sig=5)])
 
-        highlighted = model.get("highlighted") if isinstance(model.get("highlighted"), Mapping) else {}
-        ordered_serials = [serial for serial in hi_order if serial in highlighted]
-        ordered_serials.extend(
-            sorted(str(serial or "").strip() for serial in highlighted.keys() if str(serial or "").strip() and str(serial or "").strip() not in ordered_serials)
-        )
-        for serial in ordered_serials:
-            serial_model = highlighted.get(serial)
-            if not isinstance(serial_model, Mapping):
-                continue
-            equation = str(serial_model.get("equation") or "").strip()
-            if not equation:
-                continue
-            rows.append([model_label, _tar_display_serial(ctx, serial) or serial, equation, _fmt_num(serial_model.get("rmse"), sig=5)])
+            highlighted = stat_model.get("highlighted") if isinstance(stat_model.get("highlighted"), Mapping) else {}
+            ordered_serials = [serial for serial in hi_order if serial in highlighted]
+            ordered_serials.extend(
+                sorted(str(serial or "").strip() for serial in highlighted.keys() if str(serial or "").strip() and str(serial or "").strip() not in ordered_serials)
+            )
+            for serial in ordered_serials:
+                serial_model = highlighted.get(serial)
+                if not isinstance(serial_model, Mapping):
+                    continue
+                equation = str(serial_model.get("equation") or "").strip()
+                if not equation:
+                    continue
+                rows.append([model_label, _tar_display_serial(ctx, serial) or serial, equation, _fmt_num(serial_model.get("rmse"), sig=5)])
     return rows
 
 

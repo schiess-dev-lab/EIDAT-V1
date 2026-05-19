@@ -860,6 +860,87 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertNotIn("Program A", text)
         self.assertNotIn("Program B", text)
 
+    def test_exec_deviation_score_ignores_initial_only_values(self) -> None:
+        self.assertIsNone(
+            tar._tar_exec_deviation_score(
+                {
+                    "initial_zscore": -0.5,
+                    "initial_delta": -0.5,
+                }
+            )
+        )
+        self.assertEqual(
+            tar._tar_exec_deviation_score(
+                {
+                    "initial_zscore": -0.5,
+                    "final_zscore": 1.25,
+                }
+            ),
+            1.25,
+        )
+
+    def test_build_comparison_page_matrix_details_omits_initial_only_dev_score(self) -> None:
+        rows, _style_cmds, _link_cells = tar._tar_build_comparison_page_matrix_details(
+            {
+                "param_keys": ["pressure"],
+                "param_names": ["Pressure"],
+                "parameter_labels": {"pressure": "Pressure"},
+                "param_units": {"pressure": "psi"},
+                "blocks": [
+                    {
+                        "run_condition": "Condition A",
+                        "sequence_text": "Seq A",
+                        "rows_by_parameter": {
+                            "pressure": {
+                                "pair_id": "pair-1",
+                                "run_condition": "Condition A",
+                                "sequence_text": "Seq A",
+                                "parameter": "Pressure",
+                                "initial_zscore": -0.5,
+                                "initial_max_band_label": "2 sigma",
+                                "official_grade": "WATCH",
+                            }
+                        },
+                    }
+                ],
+            }
+        )
+
+        dev_score_row = next(row for row in rows if row[2] == "Dev Score / Max Band")
+        self.assertEqual(dev_score_row[3], "2 sigma")
+
+    def test_exec_exception_table_spec_omits_initial_only_dev_score(self) -> None:
+        table_rows, _style_cmds, _grade_links = tar._tar_exec_exception_table_spec(
+            {},
+            [
+                {
+                    "serial": "SN-001",
+                    "run_condition": "Condition A",
+                    "sequence_text": "Seq A",
+                    "parameter": "Pressure",
+                    "initial_atp_mean": 10.0,
+                    "initial_actual_mean": 9.0,
+                    "initial_zscore": -0.5,
+                    "initial_max_band_label": "2 sigma",
+                    "official_grade": "WATCH",
+                }
+            ],
+        )
+
+        self.assertEqual(table_rows[1][5], "")
+        self.assertEqual(table_rows[1][6], "2 sigma")
+
+    def test_exec_evaluated_parameter_count_uses_distinct_parameters(self) -> None:
+        count = tar._tar_exec_evaluated_parameter_count(
+            [
+                {"parameter": "Pressure", "param": "Pressure"},
+                {"parameter": "Pressure", "param": "Pressure"},
+                {"parameter": "Flow", "param": "Flow"},
+            ]
+        )
+
+        self.assertEqual(count, 2)
+
     def test_sequence_bullet_text_uses_only_sequence_nomenclature(self) -> None:
         text = tar._tar_sequence_bullet_text(
             {
@@ -2302,10 +2383,13 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(
             [call[0][2] for call in axes.text_calls],
             [
-                "Program A\nSupp: 5 | Valve: 24",
-                "Program B\nSupp: 7 | Valve: 28",
+                "Program A\nSupp V: 5 | Valve V: 24",
+                "Program B\nSupp V: 7 | Valve V: 28",
             ],
         )
+        self.assertTrue(all(float(call[0][1]) > 1.0 for call in axes.text_calls))
+        self.assertTrue(all(call[1]["clip_on"] is False for call in axes.text_calls))
+        self.assertTrue(all(call[1]["va"] == "bottom" for call in axes.text_calls))
 
     def test_apply_metric_axis_format_lists_multiple_program_voltage_variants(self) -> None:
         axes = _FakePlotAxes()
@@ -2350,8 +2434,11 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(
             [call[0][2] for call in axes.text_calls],
-            ["Program A\nSupp: 5, 7 | Valve: 24, 28"],
+            ["Program A\nSupp V: 5, 7 | Valve V: 24, 28"],
         )
+        self.assertTrue(all(float(call[0][1]) > 1.0 for call in axes.text_calls))
+        self.assertTrue(all(call[1]["clip_on"] is False for call in axes.text_calls))
+        self.assertTrue(all(call[1]["va"] == "bottom" for call in axes.text_calls))
 
     def test_apply_metric_axis_format_keeps_program_only_label_without_voltage_data(self) -> None:
         axes = _FakePlotAxes()
@@ -2379,6 +2466,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
 
         self.assertEqual([call[0][2] for call in axes.text_calls], ["Program A"])
+        self.assertTrue(all(float(call[0][1]) > 1.0 for call in axes.text_calls))
+        self.assertTrue(all(call[1]["clip_on"] is False for call in axes.text_calls))
+        self.assertTrue(all(call[1]["va"] == "bottom" for call in axes.text_calls))
 
     def test_apply_metric_axis_format_uses_display_serial_ticks_for_composite_source_keys(self) -> None:
         axes = _FakePlotAxes()
@@ -2578,10 +2668,13 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(
             [call[0][2] for call in axes.text_calls],
             [
-                "Program A\nSupp: 5 | Valve: 24",
-                "Program B\nSupp: 7 | Valve: 28",
+                "Program A\nSupp V: 5 | Valve V: 24",
+                "Program B\nSupp V: 7 | Valve V: 28",
             ],
         )
+        self.assertTrue(all(float(call[0][1]) > 1.0 for call in axes.text_calls))
+        self.assertTrue(all(call[1]["clip_on"] is False for call in axes.text_calls))
+        self.assertTrue(all(call[1]["va"] == "bottom" for call in axes.text_calls))
         self.assertEqual(len(pdf.saved_figures), 1)
         self.assertEqual(fake_plt.closed, [fig])
         self.assertIsNotNone(axes.legend_call)
@@ -2950,6 +3043,63 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIn("SN-001 | Condition A (WATCH)", axes.legend_call[1])
         self.assertFalse(any("Suppression Voltage" in label for label in axes.legend_call[1] if label.startswith("SN-001")))
 
+    def test_render_watch_curve_page_uses_requires_eval_label_for_fail(self) -> None:
+        fake_plt = _FakePyplot()
+        fake_matplotlib = SimpleNamespace(pyplot=fake_plt)
+        pair_spec = {
+            "pair_id": "pair-1",
+            "run": "Run A",
+            "run_title": "Sequence A",
+            "param": "Pressure",
+            "units": "psi",
+            "selection_label": "Condition A",
+            "selection": {"display_text": "Condition A"},
+            "plot_payload": {
+                "x_name": "Time",
+                "x_grid": [0.0, 1.0],
+                "y_resampled_by_sn": {
+                    "SN-001": [1.3, 1.4],
+                    "SN-010": [1.0, 1.1],
+                },
+                "master_y": [1.1, 1.2],
+                "std_y": [0.1, 0.2],
+            },
+        }
+        ctx = {
+            "print_ctx": tar.PrintContext(
+                printed_at="2026-04-12 09:00 MDT",
+                printed_timezone="MDT",
+                report_title="EIDAT Test Trend Data Analyze Auto Report",
+                report_subtitle="Certification",
+            ),
+            "hi": ["SN-001"],
+            "colors": ["#ef4444", "#2563eb"],
+            "run_by_name": {},
+            "final_grade_map_by_pair_serial": {("pair-1", "SN-001"): "FAIL"},
+            "finding_by_pair_serial": {},
+        }
+        axes = _FakePlotAxes()
+        fig = _FakePlotFigure()
+        pdf = _FakePlotPdf()
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "matplotlib": fake_matplotlib,
+                "matplotlib.pyplot": fake_plt,
+            },
+        ), mock.patch.object(tar, "_create_landscape_plot_page", return_value=(fig, axes)):
+            tar._tar_render_watch_curve_page(
+                ctx,
+                pdf,
+                pair_spec=pair_spec,
+                page_number=11,
+            )
+
+        self.assertIsNotNone(axes.legend_call)
+        self.assertIn("SN-001 | Condition A (REQUIRES EVAL)", axes.legend_call[1])
+        self.assertFalse(any("(FAIL)" in label for label in axes.legend_call[1]))
+
     def test_build_plot_navigation_creates_compact_labels_and_ignores_non_plot_sections(self) -> None:
         navigation = tar._tar_build_plot_navigation(
             [
@@ -3211,6 +3361,37 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             finally:
                 result.close()
 
+    def test_apply_pdf_navigation_ignores_comparison_row_label_occurrences(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "comparison_navigation_row_label_occurrence.pdf"
+            doc = fitz.open()
+            comparison_page = doc.new_page()
+            comparison_page.insert_text((72, 72), "Metric Chart")
+            comparison_page.insert_text((260, 72), "Metric Chart")
+            comparison_page.insert_text((420, 72), "Metric Chart")
+            doc.new_page()
+            doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[],
+                comparison_chart_links=[
+                    {"source_page_index": 0, "link_label": "Metric Chart", "occurrence_index": 0, "destination_page_index": 1},
+                    {"source_page_index": 0, "link_label": "Metric Chart", "occurrence_index": 1, "destination_page_index": 2},
+                ],
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                links = sorted(result.load_page(0).get_links(), key=lambda link: float(link.get("from").x0))
+                self.assertEqual([link.get("page") for link in links], [1, 2])
+                self.assertTrue(all(float(link.get("from").x0) > 200.0 for link in links))
+            finally:
+                result.close()
+
     def test_apply_pdf_navigation_links_repeated_watch_grades_by_row_context(self) -> None:
         fitz = __import__("fitz")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3316,6 +3497,48 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 links = sorted(result.load_page(0).get_links(), key=lambda link: float(link.get("from").y0))
                 self.assertEqual([link.get("page") for link in links], [1, 2])
                 self.assertTrue(float(links[0].get("from").y0) < float(links[1].get("from").y0))
+            finally:
+                result.close()
+
+    def test_apply_pdf_navigation_links_requires_eval_with_split_words_and_bulletless_row_text(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "intro_exception_requires_eval_split.pdf"
+            doc = fitz.open()
+            intro_page = doc.new_page()
+            intro_page.insert_text((72, 150), "SN-001")
+            intro_page.insert_text((140, 150), "Condition B")
+            intro_page.insert_text((300, 150), "Seq B")
+            intro_page.insert_text((390, 150), "Pressure")
+            intro_page.insert_text((470, 150), "REQUIRES")
+            intro_page.insert_text((470, 158), "EVAL")
+            doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[],
+                exception_grade_links=[
+                    {
+                        "serial_text": "SN-001",
+                        "run_condition_text": "- Condition B",
+                        "sequence_text": "- Seq B",
+                        "parameter_text": "Pressure",
+                        "grade_token": "FAIL",
+                        "grade_text": "REQUIRES EVAL",
+                        "destination_page_index": 1,
+                    }
+                ],
+                intro_page_count=1,
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                links = result.load_page(0).get_links()
+                self.assertEqual(len(links), 1)
+                self.assertEqual(links[0].get("page"), 1)
+                self.assertTrue(float(links[0].get("from").y1) >= 158.0)
             finally:
                 result.close()
 
@@ -3667,7 +3890,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         serial_table_idx = next(
             idx
             for idx, item in enumerate(story)
-            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Initial / Final"
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Parameters Evaluated"
         )
         serial_table = story[serial_table_idx]
         exception_table_idx = next(
@@ -3694,6 +3917,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertLess(exec_idx, scope_idx)
         self.assertIsInstance(serial_table, _FakeTable)
         self.assertIsInstance(exception_table, _FakeTable)
+        self.assertEqual(_table_text(serial_table)[1][1], "1")
         self.assertAlmostEqual(sum(exception_table.colWidths or []), 6.9 * 72.0)
         self.assertAlmostEqual((exception_table.colWidths or [])[0], (serial_table.colWidths or [])[0])
         self.assertEqual(_table_text(exception_table)[0][-1], "Grading")
@@ -3727,6 +3951,10 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 for table in all_tables
             )
         )
+        scope_table = story[scope_idx]
+        scope_rows = {row[0]: row[1] for row in _table_text(scope_table)[1:]}
+        self.assertEqual(scope_rows["Serial disposition"], "CERTIFIED 1 | WATCH 0 | REQUIRES EVAL 0")
+        self.assertEqual(scope_rows["Graded items"], "PASS 0 | WATCH 1 | REQUIRES EVAL 0")
 
     def test_build_intro_story_exception_table_colors_and_links_grade_cells(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(
@@ -3870,6 +4098,15 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertTrue(any("REQUIRES EVAL 1" in line for line in lines))
         self.assertFalse(any("FAILED " in line for line in lines))
 
+    def test_comparison_page_metric_value_uses_requires_eval_for_official_grade(self) -> None:
+        value = tar._tar_comparison_page_metric_value(
+            {"official_grade": "FAIL"},
+            "Official Grade",
+            chart_destinations={},
+        )
+
+        self.assertEqual(value, "REQUIRES EVAL")
+
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(
             [
@@ -3951,6 +4188,201 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(rows[1], ["Run Fit | Flow vs Pressure | Stat: mean", "Overall", "y = 2*x + 1", "0.125"])
         self.assertEqual(rows[2], ["Run Fit | Flow vs Pressure | Stat: mean", "SN-002", "y = 1.9*x + 1.1", "0.3"])
         self.assertEqual(rows[3], ["Run Fit | Flow vs Pressure | Stat: mean", "SN-001", "y = 2.1*x + 0.9", "0.2"])
+
+    def test_build_equation_story_supports_grouped_mean_min_max_models(self) -> None:
+        ctx = {
+            "hi": ["SN-001"],
+            "performance_models": [
+                {
+                    "name": "Run Fit",
+                    "x": {"column": "Pressure"},
+                    "y": {"column": "Flow"},
+                    "equation_stats": [
+                        {
+                            "stat": "mean",
+                            "master": {"equation": "y = 2*x + 1", "rmse": 0.125},
+                            "highlighted": {"SN-001": {"equation": "y = 2.1*x + 0.9", "rmse": 0.2}},
+                        },
+                        {
+                            "stat": "min",
+                            "master": {"equation": "y = 1.8*x + 0.7", "rmse": 0.225},
+                            "highlighted": {"SN-001": {"equation": "y = 1.9*x + 0.6", "rmse": 0.21}},
+                        },
+                        {
+                            "stat": "max",
+                            "master": {"equation": "y = 2.3*x + 1.2", "rmse": 0.325},
+                            "highlighted": {"SN-001": {"equation": "y = 2.4*x + 1.1", "rmse": 0.31}},
+                        },
+                    ],
+                }
+            ],
+            "equation_cards": [],
+        }
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            story = tar._tar_build_equation_story(ctx)
+
+        table = next(
+            item
+            for item in story
+            if isinstance(item, _FakeTable) and _table_text(item)[0] == ["Run Equation", "Serial", "Equation", "RMSE"]
+        )
+        rows = _table_text(table)
+        self.assertEqual(rows[1], ["Run Fit | Flow vs Pressure | Stat: mean", "Overall", "y = 2*x + 1", "0.125"])
+        self.assertEqual(rows[2], ["Run Fit | Flow vs Pressure | Stat: mean", "SN-001", "y = 2.1*x + 0.9", "0.2"])
+        self.assertEqual(rows[3], ["Run Fit | Flow vs Pressure | Stat: min", "Overall", "y = 1.8*x + 0.7", "0.225"])
+        self.assertEqual(rows[4], ["Run Fit | Flow vs Pressure | Stat: min", "SN-001", "y = 1.9*x + 0.6", "0.21"])
+        self.assertEqual(rows[5], ["Run Fit | Flow vs Pressure | Stat: max", "Overall", "y = 2.3*x + 1.2", "0.325"])
+        self.assertEqual(rows[6], ["Run Fit | Flow vs Pressure | Stat: max", "SN-001", "y = 2.4*x + 1.1", "0.31"])
+
+    def test_prepare_performance_models_plots_mean_only_and_adds_min_max_equations(self) -> None:
+        ctx = {
+            "excel_cfg": {
+                "performance_plotters": [
+                    {
+                        "name": "Run Fit",
+                        "x": {"selection_value": "Pressure", "column": "Pressure"},
+                        "y": {"selection_value": "Flow", "column": "Flow"},
+                        "stats": ["mean"],
+                        "fit": {"degree": 1, "normalize_x": False},
+                        "require_min_points": 2,
+                    }
+                ]
+            },
+            "options": {},
+            "conn": object(),
+            "be": SimpleNamespace(td_parameter_value_display_name=lambda _ctx, _value, fallback="": fallback or str(_value)),
+            "parameter_context": {},
+            "db_path": Path("fake.sqlite3"),
+            "run_by_name": {},
+            "runs": ["Run A"],
+            "all_serials": ["SN-001", "SN-002"],
+            "hi": ["SN-001"],
+            "filter_state": {},
+        }
+
+        def _perf_curves_for_stat(*, stat: str):
+            if stat == "mean":
+                return (
+                    {
+                        "SN-001": [(1.0, 2.0, "Run A"), (2.0, 4.0, "Run A")],
+                        "SN-002": [(1.0, 3.0, "Run A"), (2.0, 5.0, "Run A")],
+                    },
+                    [1.0, 2.0, 1.0, 2.0],
+                    [2.0, 4.0, 3.0, 5.0],
+                    "psi",
+                    "gpm",
+                )
+            if stat == "min":
+                return (
+                    {
+                        "SN-001": [(1.0, 1.0, "Run A"), (2.0, 3.0, "Run A")],
+                        "SN-002": [(1.0, 2.0, "Run A"), (2.0, 4.0, "Run A")],
+                    },
+                    [1.0, 2.0, 1.0, 2.0],
+                    [1.0, 3.0, 2.0, 4.0],
+                    "psi",
+                    "gpm",
+                )
+            if stat == "max":
+                return (
+                    {
+                        "SN-001": [(1.0, 4.0, "Run A"), (2.0, 6.0, "Run A")],
+                        "SN-002": [(1.0, 5.0, "Run A"), (2.0, 7.0, "Run A")],
+                    },
+                    [1.0, 2.0, 1.0, 2.0],
+                    [4.0, 6.0, 5.0, 7.0],
+                    "psi",
+                    "gpm",
+                )
+            return ({}, [], [], "", "")
+
+        with mock.patch.object(
+            tar,
+            "_collect_performance_curves_for_stat",
+            side_effect=lambda **kwargs: _perf_curves_for_stat(stat=str(kwargs.get("stat") or "")),
+        ):
+            tar._tar_prepare_performance_models(ctx)
+
+        self.assertEqual(len(ctx["performance_plot_specs"]), 1)
+        self.assertEqual(ctx["performance_plot_specs"][0]["stat"], "mean")
+        self.assertEqual(len(ctx["performance_models"]), 1)
+        self.assertEqual(
+            [str(item.get("stat") or "") for item in (ctx["performance_models"][0].get("equation_stats") or [])],
+            ["mean", "min", "max"],
+        )
+        self.assertTrue(any("mean:" in "\n".join(card.get("lines") or []) for card in (ctx["equation_cards"] or [])))
+        self.assertTrue(any("min:" in "\n".join(card.get("lines") or []) for card in (ctx["equation_cards"] or [])))
+        self.assertTrue(any("max:" in "\n".join(card.get("lines") or []) for card in (ctx["equation_cards"] or [])))
+
+    def test_prepare_performance_models_omits_missing_max_equation_but_keeps_mean_plot(self) -> None:
+        ctx = {
+            "excel_cfg": {
+                "performance_plotters": [
+                    {
+                        "name": "Run Fit",
+                        "x": {"selection_value": "Pressure", "column": "Pressure"},
+                        "y": {"selection_value": "Flow", "column": "Flow"},
+                        "stats": ["mean"],
+                        "fit": {"degree": 1, "normalize_x": False},
+                        "require_min_points": 2,
+                    }
+                ]
+            },
+            "options": {},
+            "conn": object(),
+            "be": SimpleNamespace(td_parameter_value_display_name=lambda _ctx, _value, fallback="": fallback or str(_value)),
+            "parameter_context": {},
+            "db_path": Path("fake.sqlite3"),
+            "run_by_name": {},
+            "runs": ["Run A"],
+            "all_serials": ["SN-001", "SN-002"],
+            "hi": ["SN-001"],
+            "filter_state": {},
+        }
+
+        def _perf_curves_for_stat(*, stat: str):
+            if stat == "mean":
+                return (
+                    {
+                        "SN-001": [(1.0, 2.0, "Run A"), (2.0, 4.0, "Run A")],
+                        "SN-002": [(1.0, 3.0, "Run A"), (2.0, 5.0, "Run A")],
+                    },
+                    [1.0, 2.0, 1.0, 2.0],
+                    [2.0, 4.0, 3.0, 5.0],
+                    "psi",
+                    "gpm",
+                )
+            if stat == "min":
+                return (
+                    {
+                        "SN-001": [(1.0, 1.0, "Run A"), (2.0, 3.0, "Run A")],
+                        "SN-002": [(1.0, 2.0, "Run A"), (2.0, 4.0, "Run A")],
+                    },
+                    [1.0, 2.0, 1.0, 2.0],
+                    [1.0, 3.0, 2.0, 4.0],
+                    "psi",
+                    "gpm",
+                )
+            return ({}, [], [], "", "")
+
+        with mock.patch.object(
+            tar,
+            "_collect_performance_curves_for_stat",
+            side_effect=lambda **kwargs: _perf_curves_for_stat(stat=str(kwargs.get("stat") or "")),
+        ):
+            tar._tar_prepare_performance_models(ctx)
+
+        self.assertEqual(len(ctx["performance_plot_specs"]), 1)
+        self.assertEqual(ctx["performance_plot_specs"][0]["stat"], "mean")
+        self.assertEqual(
+            [str(item.get("stat") or "") for item in (ctx["performance_models"][0].get("equation_stats") or [])],
+            ["mean", "min"],
+        )
 
     def test_build_intro_story_excludes_regraded_run_comparison_tables(self) -> None:
         ctx = {
