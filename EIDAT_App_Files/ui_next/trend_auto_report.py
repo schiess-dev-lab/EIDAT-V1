@@ -4884,7 +4884,38 @@ def _tar_comparison_chart_destinations(
     return {
         "metric_by_pair_id": _tar_run_condition_metric_destinations(plot_navigation),
         "curve_by_pair_id": _tar_run_condition_curve_destinations(plot_navigation),
+        "watch_curve_by_pair_id": _tar_watch_curve_destinations(plot_navigation),
+        "regrade_curve_by_cohort_id": _tar_regrade_curve_destinations(plot_navigation),
     }
+
+
+def _tar_nonpass_chart_destination(
+    row: Mapping[str, object] | None,
+    *,
+    chart_destinations: Mapping[str, Mapping[str, int]] | None = None,
+) -> tuple[int | None, str]:
+    if not isinstance(row, Mapping):
+        return None, ""
+    if _tar_final_grade_token_from_row(row) not in {"WATCH", "FAIL"}:
+        return None, ""
+
+    destinations = dict(chart_destinations or {})
+    pair_id = str(row.get("pair_id") or "").strip()
+    cohort_id = str(row.get("regrade_cohort_id") or "").strip()
+    watch_map = destinations.get("watch_curve_by_pair_id") or {}
+    regrade_map = destinations.get("regrade_curve_by_cohort_id") or {}
+
+    try:
+        if pair_id and pair_id in watch_map:
+            return int(watch_map.get(pair_id)), "watch_nonpass_curves"
+    except Exception:
+        pass
+    try:
+        if cohort_id and cohort_id in regrade_map:
+            return int(regrade_map.get(cohort_id)), "regrade_pass_curve_overlays"
+    except Exception:
+        pass
+    return None, ""
 
 
 def _tar_comparison_chart_destination(
@@ -4895,10 +4926,16 @@ def _tar_comparison_chart_destination(
 ) -> int | None:
     if not isinstance(row, Mapping):
         return None
+    destinations = dict(chart_destinations or {})
+    nonpass_destination, _target_section = _tar_nonpass_chart_destination(
+        row,
+        chart_destinations=destinations,
+    )
+    if nonpass_destination is not None:
+        return nonpass_destination
     pair_id = str(row.get("pair_id") or "").strip()
     if not pair_id:
         return None
-    destinations = dict(chart_destinations or {})
     if metric_label == "Metric Chart":
         dest_map = destinations.get("metric_by_pair_id") or {}
     elif metric_label == "Plot Curves":
@@ -5358,7 +5395,7 @@ def _tar_build_comparison_chart_links(
     if not page_specs:
         return []
     chart_destinations = _tar_comparison_chart_destinations(list(ctx.get("plot_navigation") or []))
-    if not any(chart_destinations.get(key) for key in ("metric_by_pair_id", "curve_by_pair_id")):
+    if not any(chart_destinations.get(key) for key in chart_destinations):
         return []
 
     links: list[dict[str, Any]] = []
@@ -8757,7 +8794,7 @@ def _tar_metric_program_segment_label(
         parts.append(f"Valve V: {valve}")
     if not parts:
         return label
-    return f"{label}\n{' | '.join(parts)}"
+    return f"{label}\n" + "\n".join(parts)
 
 
 def _tar_apply_metric_program_segments(
@@ -9686,12 +9723,17 @@ def _tar_exec_exception_table_spec(
     ctx: Mapping[str, Any],
     exception_rows: list[Mapping[str, Any]] | None,
 ) -> tuple[list[list[str]], list[tuple], list[dict[str, Any]]]:
-    rows = [dict(row) for row in (exception_rows or []) if isinstance(row, Mapping)]
+    rows = [
+        dict(row)
+        for row in (exception_rows or [])
+        if isinstance(row, Mapping)
+        and _tar_normalize_grade_token(row.get("final_status") or row.get("official_grade") or "") == "FAIL"
+    ]
     if not rows:
         return (
             [
                 _TAR_EXEC_EXCEPTION_HEADER,
-                ["-", "No WATCH or REQUIRES EVAL items were produced for the selected certification scope.", "", "", "", "", "", ""],
+                ["-", "No REQUIRES EVAL items were produced for the selected certification scope.", "", "", "", "", "", ""],
             ],
             [],
             [],
@@ -9847,31 +9889,20 @@ def _tar_watch_curve_destinations(
 
 def _tar_build_exec_exception_rows(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     plot_navigation = list(ctx.get("plot_navigation") or [])
-    regrade_destinations = _tar_regrade_curve_destinations(plot_navigation)
-    watch_destinations = _tar_watch_curve_destinations(plot_navigation)
+    chart_destinations = _tar_comparison_chart_destinations(plot_navigation)
     rows: list[dict[str, Any]] = []
     for raw_row in (ctx.get("comparison_rows") or []):
         if not isinstance(raw_row, Mapping):
             continue
         final_status = _tar_normalize_grade_token(raw_row.get("official_grade") or raw_row.get("final_grade") or raw_row.get("grade")) or ""
-        if final_status not in {"FAIL", "WATCH"}:
+        if final_status != "FAIL":
             continue
         pair_id = str(raw_row.get("pair_id") or "").strip()
         cohort_id = str(raw_row.get("regrade_cohort_id") or "").strip()
-        watch_destination = watch_destinations.get(pair_id) if pair_id else None
-        regrade_destination = regrade_destinations.get(cohort_id) if cohort_id else None
-        if final_status == "FAIL" and regrade_destination is not None:
-            chart_target_page_index = regrade_destination
-            chart_target_section = "regrade_pass_curve_overlays"
-        elif watch_destination is not None:
-            chart_target_page_index = watch_destination
-            chart_target_section = "watch_nonpass_curves"
-        elif regrade_destination is not None:
-            chart_target_page_index = regrade_destination
-            chart_target_section = "regrade_pass_curve_overlays"
-        else:
-            chart_target_page_index = None
-            chart_target_section = ""
+        chart_target_page_index, chart_target_section = _tar_nonpass_chart_destination(
+            raw_row,
+            chart_destinations=chart_destinations,
+        )
         rows.append(
             {
                 "pair_id": pair_id,
@@ -14205,7 +14236,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
     story.append(Spacer(1, 0.08 * inch))
-    story.append(_portrait_paragraph("Watch Items Table", styles["card_title"], rl))
+    story.append(_portrait_paragraph("Eval Items List", styles["card_title"], rl))
     exception_table_rows, exception_table_style_cmds, exception_grade_links = _tar_exec_exception_table_spec(ctx, exception_rows)
     ctx["exception_grade_links"] = list(exception_grade_links)
     story.append(
@@ -14220,7 +14251,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             cell_style_overrides={
                 (row_index, len(_TAR_EXEC_EXCEPTION_HEADER) - 1): styles.get("small_link") or styles["small"]
                 for row_index, row in enumerate(exception_table_rows[1:], start=1)
-                if _tar_normalize_grade_token(row[-1]) in {"WATCH", "FAIL"}
+                if _tar_normalize_grade_token(row[-1]) == "FAIL"
                 and any(
                     str(link.get("serial_text") or "") == str(row[0] or "")
                     and str(link.get("run_condition_text") or "") == str(row[1] or "")

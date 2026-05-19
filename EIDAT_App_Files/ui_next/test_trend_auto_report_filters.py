@@ -922,13 +922,29 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                     "initial_actual_mean": 9.0,
                     "initial_zscore": -0.5,
                     "initial_max_band_label": "2 sigma",
-                    "official_grade": "WATCH",
+                    "official_grade": "FAIL",
                 }
             ],
         )
 
         self.assertEqual(table_rows[1][5], "")
         self.assertEqual(table_rows[1][6], "2 sigma")
+
+    def test_exec_exception_table_spec_omits_watch_items(self) -> None:
+        table_rows, _style_cmds, _grade_links = tar._tar_exec_exception_table_spec(
+            {},
+            [
+                {
+                    "serial": "SN-001",
+                    "run_condition": "Condition A",
+                    "sequence_text": "Seq A",
+                    "parameter": "Pressure",
+                    "official_grade": "WATCH",
+                }
+            ],
+        )
+
+        self.assertEqual(table_rows[1][1], "No REQUIRES EVAL items were produced for the selected certification scope.")
 
     def test_exec_evaluated_parameter_count_uses_distinct_parameters(self) -> None:
         count = tar._tar_exec_evaluated_parameter_count(
@@ -2383,8 +2399,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(
             [call[0][2] for call in axes.text_calls],
             [
-                "Program A\nSupp V: 5 | Valve V: 24",
-                "Program B\nSupp V: 7 | Valve V: 28",
+                "Program A\nSupp V: 5\nValve V: 24",
+                "Program B\nSupp V: 7\nValve V: 28",
             ],
         )
         self.assertTrue(all(float(call[0][1]) > 1.0 for call in axes.text_calls))
@@ -2434,7 +2450,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(
             [call[0][2] for call in axes.text_calls],
-            ["Program A\nSupp V: 5, 7 | Valve V: 24, 28"],
+            ["Program A\nSupp V: 5, 7\nValve V: 24, 28"],
         )
         self.assertTrue(all(float(call[0][1]) > 1.0 for call in axes.text_calls))
         self.assertTrue(all(call[1]["clip_on"] is False for call in axes.text_calls))
@@ -2668,8 +2684,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(
             [call[0][2] for call in axes.text_calls],
             [
-                "Program A\nSupp V: 5 | Valve V: 24",
-                "Program B\nSupp V: 7 | Valve V: 28",
+                "Program A\nSupp V: 5\nValve V: 24",
+                "Program B\nSupp V: 7\nValve V: 28",
             ],
         )
         self.assertTrue(all(float(call[0][1]) > 1.0 for call in axes.text_calls))
@@ -3542,7 +3558,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             finally:
                 result.close()
 
-    def test_build_exec_exception_rows_prefers_exact_condition_curves_for_requires_eval(self) -> None:
+    def test_build_exec_exception_rows_prefers_watch_nonpass_curves_for_requires_eval(self) -> None:
         rows = tar._tar_build_exec_exception_rows(
             {
                 "plot_navigation": tar._tar_build_plot_navigation(
@@ -3586,10 +3602,191 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         )
 
         row_by_serial = {str(row.get("serial") or ""): row for row in rows}
-        self.assertEqual(row_by_serial["SN-001"]["chart_target_section"], "watch_nonpass_curves")
-        self.assertEqual(row_by_serial["SN-001"]["chart_target_page_index"], 3)
-        self.assertEqual(row_by_serial["SN-002"]["chart_target_section"], "regrade_pass_curve_overlays")
-        self.assertEqual(row_by_serial["SN-002"]["chart_target_page_index"], 6)
+        self.assertNotIn("SN-001", row_by_serial)
+        self.assertEqual(row_by_serial["SN-002"]["chart_target_section"], "watch_nonpass_curves")
+        self.assertEqual(row_by_serial["SN-002"]["chart_target_page_index"], 3)
+
+    def test_build_comparison_chart_links_routes_watch_rows_to_watch_nonpass_curves(self) -> None:
+        ctx = {
+            "plot_navigation": tar._tar_build_plot_navigation(
+                [
+                    {
+                        "section": "run_condition_plot_metrics",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "stat": "mean",
+                        "page_number": 4,
+                    },
+                    {
+                        "section": "run_condition_curve_overlays",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "page_number": 5,
+                    },
+                    {
+                        "section": "watch_nonpass_curves",
+                        "pair_id": "pair-1",
+                        "run": "Run A",
+                        "param": "Pressure",
+                        "serials": ["SN-001"],
+                        "page_number": 9,
+                    },
+                ]
+            ),
+            "comparison_page_specs": [
+                {
+                    "report_page_index": 1,
+                    "param_keys": ["Pressure"],
+                    "param_names": ["Pressure"],
+                    "blocks": [
+                        {
+                            "rows_by_parameter": {
+                                "Pressure": {
+                                    "pair_id": "pair-1",
+                                    "serial": "SN-001",
+                                    "run_condition": "Condition A",
+                                    "sequence_text": "Seq A",
+                                    "parameter": "Pressure",
+                                    "official_grade": "WATCH",
+                                }
+                            }
+                        }
+                    ],
+                }
+            ],
+        }
+
+        links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=0)
+
+        self.assertEqual(len(links), 2)
+        self.assertEqual({str(link.get("link_label")) for link in links}, {"Metric Chart", "Plot Curves"})
+        self.assertTrue(all(int(link.get("destination_page_index")) == 8 for link in links))
+
+    def test_build_comparison_chart_links_routes_requires_eval_rows_to_watch_nonpass_curves(self) -> None:
+        ctx = {
+            "plot_navigation": tar._tar_build_plot_navigation(
+                [
+                    {
+                        "section": "run_condition_plot_metrics",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "stat": "mean",
+                        "page_number": 4,
+                    },
+                    {
+                        "section": "run_condition_curve_overlays",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "page_number": 5,
+                    },
+                    {
+                        "section": "regrade_pass_curve_overlays",
+                        "cohort_id": "cohort-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "page_number": 7,
+                    },
+                    {
+                        "section": "watch_nonpass_curves",
+                        "pair_id": "pair-1",
+                        "run": "Run A",
+                        "param": "Pressure",
+                        "serials": ["SN-001"],
+                        "page_number": 9,
+                    },
+                ]
+            ),
+            "comparison_page_specs": [
+                {
+                    "report_page_index": 1,
+                    "param_keys": ["Pressure"],
+                    "param_names": ["Pressure"],
+                    "blocks": [
+                        {
+                            "rows_by_parameter": {
+                                "Pressure": {
+                                    "pair_id": "pair-1",
+                                    "regrade_cohort_id": "cohort-1",
+                                    "serial": "SN-001",
+                                    "run_condition": "Condition A",
+                                    "sequence_text": "Seq A",
+                                    "parameter": "Pressure",
+                                    "official_grade": "FAIL",
+                                }
+                            }
+                        }
+                    ],
+                }
+            ],
+        }
+
+        links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=0)
+
+        self.assertEqual(len(links), 2)
+        self.assertEqual({str(link.get("link_label")) for link in links}, {"Metric Chart", "Plot Curves"})
+        self.assertTrue(all(int(link.get("destination_page_index")) == 8 for link in links))
+
+    def test_build_comparison_chart_links_falls_back_to_exact_condition_curves_when_watch_page_missing(self) -> None:
+        ctx = {
+            "plot_navigation": tar._tar_build_plot_navigation(
+                [
+                    {
+                        "section": "run_condition_plot_metrics",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "stat": "mean",
+                        "page_number": 4,
+                    },
+                    {
+                        "section": "run_condition_curve_overlays",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "page_number": 5,
+                    },
+                    {
+                        "section": "regrade_pass_curve_overlays",
+                        "cohort_id": "cohort-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "page_number": 7,
+                    },
+                ]
+            ),
+            "comparison_page_specs": [
+                {
+                    "report_page_index": 1,
+                    "param_keys": ["Pressure"],
+                    "param_names": ["Pressure"],
+                    "blocks": [
+                        {
+                            "rows_by_parameter": {
+                                "Pressure": {
+                                    "pair_id": "pair-1",
+                                    "regrade_cohort_id": "cohort-1",
+                                    "serial": "SN-001",
+                                    "run_condition": "Condition A",
+                                    "sequence_text": "Seq A",
+                                    "parameter": "Pressure",
+                                    "official_grade": "FAIL",
+                                }
+                            }
+                        }
+                    ],
+                }
+            ],
+        }
+
+        links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=0)
+
+        self.assertEqual(len(links), 2)
+        self.assertEqual({str(link.get("link_label")) for link in links}, {"Metric Chart", "Plot Curves"})
+        self.assertTrue(all(int(link.get("destination_page_index")) == 6 for link in links))
 
     def test_apply_pdf_navigation_adds_backlink_to_first_comparison_page(self) -> None:
         fitz = __import__("fitz")
@@ -3807,7 +4004,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                         "initial_delta": -1.0,
                         "final_delta": -1.0,
                         "initial_grade": "PASS",
-                        "final_grade": "WATCH",
+                        "final_grade": "FAIL",
                         "initial_suppression_voltage_label": "All",
                         "final_suppression_voltage_label": "5",
                         "initial_valve_voltage_label": "All",
@@ -3927,7 +4124,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for style in exception_table.table_styles
             for command in getattr(style, "commands", [])
         ]
-        self.assertIn(("BACKGROUND", (7, 1), (7, 1), "#fef3c7"), exception_style_cmds)
+        self.assertIn(("BACKGROUND", (7, 1), (7, 1), "#fee2e2"), exception_style_cmds)
 
         self.assertFalse(
             any(
@@ -3954,7 +4151,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         scope_table = story[scope_idx]
         scope_rows = {row[0]: row[1] for row in _table_text(scope_table)[1:]}
         self.assertEqual(scope_rows["Serial disposition"], "CERTIFIED 1 | WATCH 0 | REQUIRES EVAL 0")
-        self.assertEqual(scope_rows["Graded items"], "PASS 0 | WATCH 1 | REQUIRES EVAL 0")
+        self.assertEqual(scope_rows["Graded items"], "PASS 0 | WATCH 0 | REQUIRES EVAL 1")
 
     def test_build_intro_story_exception_table_colors_and_links_grade_cells(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(
@@ -4049,7 +4246,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIn(("TEXTCOLOR", (7, 1), (7, 1), tar._TAR_EXEC_EXCEPTION_GRADE_TEXT_COLOR), exception_style_cmds)
         self.assertEqual(_table_text(exception_table)[1][-1], "REQUIRES EVAL")
 
-    def test_build_intro_story_renames_watch_detail_heading(self) -> None:
+    def test_build_intro_story_renames_eval_items_heading(self) -> None:
         with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
             tar,
             "_build_portrait_styles",
@@ -4082,7 +4279,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             )
 
         headings = [item.text for item in story if isinstance(item, _FakeParagraph)]
-        self.assertIn("Watch Items Table", headings)
+        self.assertIn("Eval Items List", headings)
 
     def test_pass_fail_synopsis_lines_uses_requires_eval_wording(self) -> None:
         lines = tar._tar_pass_fail_synopsis_lines(
