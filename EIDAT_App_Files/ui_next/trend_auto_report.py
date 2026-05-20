@@ -4328,6 +4328,16 @@ def _build_portrait_styles(rl: Mapping[str, Any]) -> dict[str, Any]:
             textColor="#334155",
             spaceAfter=2,
         ),
+        "small_bold": ParagraphStyle(
+            "EdatSmallBold",
+            parent=styles["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            alignment=TA_LEFT,
+            textColor="#0f172a",
+            spaceAfter=2,
+        ),
         "small_link": ParagraphStyle(
             "EdatSmallLink",
             parent=styles["BodyText"],
@@ -9792,53 +9802,119 @@ def _tar_exec_deviation_score_summary_text() -> str:
     )
 
 
-def _tar_technical_appendix_cards(ctx: Mapping[str, Any]) -> list[tuple[str, list[str]]]:
+def _tar_technical_appendix_tables(ctx: Mapping[str, Any]) -> list[dict[str, Any]]:
     prepass = _tar_exec_prepass_settings(ctx)
     noise_score_text = _fmt_num(prepass["noise_score_max"], sig=4)
     mean_delta_guard_text = f"{float(prepass['percent_delta_guard_max']):.1f}%"
     sparse_percent_delta_text = f"{float(prepass['sparse_percent_delta_max']):.1f}%"
     sparse_serial_text = _tar_serial_count_enumeration_text(int(prepass["sparse_min_serials_per_program"]) - 1)
     return [
-        (
-            "Program-Level Pre-Pass Compatibility",
-            [
-                "Data is first grouped by base run condition, parameter, and X axis.",
-                "program_center_trace = mean(trace_i for the serials belonging to one program)",
-                "program_noise = median(RMS(trace_i - program_center_trace))",
-                "between_rms = RMS(candidate_center_trace - reference_center_trace)",
-                "mean_delta_pct = 100 * abs(candidate_mean - reference_mean) / max(abs(candidate_mean), abs(reference_mean), 1e-12)",
-                "pooled_noise = sqrt((reference_noise^2 + candidate_noise^2) / 2)",
-                "noise_floor = baseline_scale * noise_floor_pct / 100",
-                "effective_noise = max(pooled_noise, noise_floor)",
-                "noise_score = between_rms / effective_noise",
-                f"Admit the candidate program when noise_score <= {noise_score_text} and mean_delta_pct <= {mean_delta_guard_text}.",
-                f"Sparse means the reference program contributes only {sparse_serial_text} to the current cohort, or the candidate program contributes only {sparse_serial_text} to that cohort.",
-                f"When sparse, skip the noise-based gate and instead require mean_delta_pct <= {sparse_percent_delta_text}.",
-                "The reference/certifying program is always retained in the pool.",
+        {
+            "title": "Program-Level Pre-Pass Compatibility",
+            "columns": ["Term / Step", "Meaning / Logic"],
+            "rows": [
+                {"kind": "section", "term": "Inputs", "detail": "What the compatibility gate starts with."},
+                {"term": "Grouped data", "detail": "Data is first grouped by base run condition, parameter, and X axis."},
+                {"term": "Reference program", "detail": "The certifying program for the highlighted serials. It is always retained in the pool."},
+                {"kind": "section", "term": "Program Shape / Noise", "detail": "How each candidate program is summarized before comparison."},
+                {"term": "program_center_trace", "detail": "Mean trace for the serials belonging to one program."},
+                {"term": "program_noise", "detail": "Median RMS spread of that program's serial traces around program_center_trace."},
+                {"term": "between_rms", "detail": "RMS(candidate_center_trace - reference_center_trace)."},
+                {"term": "mean_delta_pct", "detail": "Mean-level offset between candidate and reference programs."},
+                {"kind": "section", "term": "Compatibility Gate", "detail": "Main gate used when both programs have enough serials."},
+                {"term": "pooled_noise", "detail": "sqrt((reference_noise^2 + candidate_noise^2) / 2)."},
+                {"term": "effective_noise", "detail": "max(pooled_noise, noise_floor)."},
+                {"term": "noise_score", "detail": "between_rms / effective_noise."},
+                {"term": "Admit program", "detail": f"Admit when noise_score <= {noise_score_text} and mean_delta_pct <= {mean_delta_guard_text}."},
+                {"kind": "section", "term": "Sparse Fallback", "detail": "Fallback gate when the noise model does not have enough serial data."},
+                {"term": "Sparse definition", "detail": f"Sparse means the reference program contributes only {sparse_serial_text}, or the candidate program contributes only {sparse_serial_text}, to the current cohort."},
+                {"term": "Sparse fallback", "detail": f"Skip the noise-based gate and require mean_delta_pct <= {sparse_percent_delta_text}."},
+                {"kind": "section", "term": "Output", "detail": "What leaves the pre-pass phase."},
+                {"term": "Comparison pool", "detail": "Admitted programs become the comparison pool used for target-excluded grading."},
             ],
-        ),
-        (
-            "Deviation Score Technical Logic",
-            [
-                "official_baseline(x) = the comparison-pool baseline rebuilt after removing the target serial from its own pool",
-                "effective_sigma_band(x) = the larger of the local comparison band and the minimum band floor used by the report",
-                "local_sigma_multiple(x) = |actual(x) - baseline(x)| / effective_sigma_band(x)",
-                "RMS_component = RMS(local_sigma_multiple(x))",
-                "P90_component = P90(local_sigma_multiple(x))",
-                "Deviation Score = max(RMS_component, P90_component)",
-                "Max Band = max(local_sigma_multiple(x))",
-                "Lower Deviation Scores indicate closer whole-curve agreement.",
-                "PASS if Deviation Score <= 1 and Max Band does not exceed 3 sigma | WATCH if 1 < Deviation Score <= 3 | Requires Eval if Deviation Score > 3 or Max Band exceeds 3 sigma",
+        },
+        {
+            "title": "Deviation Score Technical Logic",
+            "columns": ["Term / Step", "Meaning / Formula"],
+            "rows": [
+                {"kind": "section", "term": "Baseline", "detail": "What the target serial is compared against."},
+                {"term": "official_baseline(x)", "detail": "Comparison-pool baseline rebuilt after removing the target serial from its own pool."},
+                {"term": "actual(x)", "detail": "The certification serial's measured trace at the same x point."},
+                {"kind": "section", "term": "Point-by-Point Normalization", "detail": "How local trace differences become sigma-like multiples."},
+                {"term": "effective_sigma_band(x)", "detail": "The larger of the local comparison band and the minimum band floor used by the report."},
+                {"term": "local_sigma_multiple(x)", "detail": "|actual(x) - baseline(x)| / effective_sigma_band(x)."},
+                {"kind": "section", "term": "Curve Summary", "detail": "How the full trace is reduced to the reported score."},
+                {"term": "RMS component", "detail": "RMS(local_sigma_multiple(x)); whole-curve average excursion."},
+                {"term": "P90 component", "detail": "P90(local_sigma_multiple(x)); high-percentile local excursion."},
+                {"term": "Deviation Score", "detail": "max(RMS_component, P90_component). Lower scores indicate closer whole-curve agreement."},
+                {"term": "Max Band", "detail": "max(local_sigma_multiple(x)); worst local excursion."},
+                {"kind": "section", "term": "Final Grade", "detail": "How the score is translated for review."},
+                {"term": "PASS", "detail": "Deviation Score <= 1 and Max Band does not exceed 3 sigma."},
+                {"term": "WATCH", "detail": "1 < Deviation Score <= 3."},
+                {"term": "REQUIRES EVAL", "detail": "Deviation Score > 3 or Max Band exceeds 3 sigma."},
             ],
-        ),
-        (
-            "Current Active Report Behavior",
-            [
-                "The current active report grades from the initial admitted-program comparison pool after target exclusion.",
-                "Exact-condition regrade logic exists in code, but it is not the active official grading path in the current implementation.",
-            ],
-        ),
+        },
     ]
+
+
+def _tar_build_technical_appendix_table(
+    spec: Mapping[str, Any],
+    *,
+    styles: Mapping[str, Any],
+    rl: Mapping[str, Any],
+) -> Any:
+    inch = rl["inch"]
+    colors = rl["colors"]
+    title = str(spec.get("title") or "Technical Details").strip() or "Technical Details"
+    columns = [str(value or "").strip() for value in (spec.get("columns") or [])]
+    if len(columns) < 2:
+        columns = ["Term / Step", "Meaning / Formula"]
+    source_rows = [dict(row) for row in (spec.get("rows") or []) if isinstance(row, Mapping)]
+    rows: list[list[object]] = [[title, ""]]
+    rows.append([columns[0], columns[1]])
+    section_row_indexes: list[int] = [0]
+    cell_style_overrides: dict[tuple[int, int], Any] = {
+        (0, 0): styles.get("card_title") or styles["small_bold"],
+        (0, 1): styles.get("card_title") or styles["small_bold"],
+        (1, 0): styles.get("small_bold") or styles["small"],
+        (1, 1): styles.get("small_bold") or styles["small"],
+    }
+    for source_row in source_rows:
+        row_index = len(rows)
+        term = str(source_row.get("term") or "").strip()
+        detail = str(source_row.get("detail") or "").strip()
+        rows.append([term, detail])
+        cell_style_overrides[(row_index, 0)] = styles.get("small_bold") or styles["small"]
+        if str(source_row.get("kind") or "").strip().lower() == "section":
+            section_row_indexes.append(row_index)
+            cell_style_overrides[(row_index, 1)] = styles.get("small_bold") or styles["small"]
+
+    style_cmds: list[tuple] = [
+        ("SPAN", (0, 0), (1, 0)),
+        ("BACKGROUND", (0, 0), (1, 0), colors.HexColor("#dbeafe")),
+        ("BACKGROUND", (0, 1), (1, 1), colors.HexColor("#e2e8f0")),
+        ("LINEBELOW", (0, 0), (1, 0), 1, colors.HexColor("#60a5fa")),
+    ]
+    for row_index in section_row_indexes:
+        if row_index == 0:
+            continue
+        style_cmds.extend(
+            [
+                ("BACKGROUND", (0, row_index), (1, row_index), colors.HexColor("#eef2ff")),
+                ("LINEABOVE", (0, row_index), (1, row_index), 0.7, colors.HexColor("#94a3b8")),
+            ]
+        )
+    return _portrait_box_table(
+        rows,
+        col_widths=[1.85 * inch, 5.05 * inch],
+        styles=styles,
+        rl=rl,
+        repeat_rows=0,
+        compact=True,
+        header_rows=0,
+        extra_style_commands=style_cmds,
+        cell_style_overrides=cell_style_overrides,
+    )
 
 
 def _tar_exec_serial_table_rows(
@@ -16215,8 +16291,8 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
             rl,
         )
     )
-    for title, body_lines in _tar_technical_appendix_cards(ctx):
-        story.append(_portrait_card(title, body_lines, styles=styles, rl=rl))
+    for table_spec in _tar_technical_appendix_tables(ctx):
+        story.append(_tar_build_technical_appendix_table(table_spec, styles=styles, rl=rl))
         story.append(Spacer(1, 0.10 * inch))
     return story
 

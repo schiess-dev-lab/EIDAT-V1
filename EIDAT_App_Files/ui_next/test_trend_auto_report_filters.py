@@ -74,6 +74,7 @@ def _fake_styles() -> dict[str, str]:
         "cover_subtitle": "cover_subtitle",
         "body": "body",
         "small": "small",
+        "small_bold": "small_bold",
         "section": "section",
         "card_title": "card_title",
     }
@@ -4808,31 +4809,49 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         )
         self.assertLess(family_summary_idx, technical_heading_idx)
 
-        cards = {
-            _table_text(item)[0][0]: _table_text(item)[1][0]
-            for item in story
-            if isinstance(item, _FakeTable) and len(_table_text(item)) >= 2
+        tables = list(_iter_fake_tables(story))
+        all_text = "\n".join(
+            cell
+            for table in tables
+            for row in _table_text(table)
+            for cell in row
+        )
+        self.assertNotIn("Current Active Report Behavior", all_text)
+        self.assertNotIn("Exact-condition regrade logic exists in code", all_text)
+        appendix_tables = {
+            _table_text(item)[0][0]: item
+            for item in tables
+            if _table_text(item) and _table_text(item)[0][0] in {"Program-Level Pre-Pass Compatibility", "Deviation Score Technical Logic"}
         }
-        self.assertIn("Program-Level Pre-Pass Compatibility", cards)
-        self.assertIn("Deviation Score Technical Logic", cards)
-        self.assertIn("Current Active Report Behavior", cards)
-        self.assertIn("noise_score &lt;= 1.25", cards["Program-Level Pre-Pass Compatibility"])
-        self.assertIn("mean_delta_pct &lt;= 8.0%", cards["Program-Level Pre-Pass Compatibility"])
-        self.assertIn("0 or 1 serials", cards["Program-Level Pre-Pass Compatibility"])
-        self.assertIn("mean_delta_pct &lt;= 4.0%", cards["Program-Level Pre-Pass Compatibility"])
-        self.assertIn(
-            "local_sigma_multiple(x) = |actual(x) - baseline(x)| / effective_sigma_band(x)",
-            cards["Deviation Score Technical Logic"],
-        )
-        self.assertIn(
-            "Deviation Score = max(RMS_component, P90_component)",
-            cards["Deviation Score Technical Logic"],
-        )
-        self.assertIn("Max Band = max(local_sigma_multiple(x))", cards["Deviation Score Technical Logic"])
-        self.assertIn(
-            "Exact-condition regrade logic exists in code, but it is not the active official grading path in the current implementation.",
-            cards["Current Active Report Behavior"],
-        )
+        self.assertIn("Program-Level Pre-Pass Compatibility", appendix_tables)
+        self.assertIn("Deviation Score Technical Logic", appendix_tables)
+        prepass_text = "\n".join(cell for row in _table_text(appendix_tables["Program-Level Pre-Pass Compatibility"]) for cell in row)
+        deviation_text = "\n".join(cell for row in _table_text(appendix_tables["Deviation Score Technical Logic"]) for cell in row)
+        self.assertIn("Inputs", prepass_text)
+        self.assertIn("Program Shape / Noise", prepass_text)
+        self.assertIn("Compatibility Gate", prepass_text)
+        self.assertIn("Sparse Fallback", prepass_text)
+        self.assertIn("noise_score", prepass_text)
+        self.assertIn("mean_delta_pct", prepass_text)
+        self.assertIn("1.25", prepass_text)
+        self.assertIn("8.0%", prepass_text)
+        self.assertIn("0 or 1 serials", prepass_text)
+        self.assertIn("4.0%", prepass_text)
+        prepass_styles = [
+            command
+            for style in appendix_tables["Program-Level Pre-Pass Compatibility"].table_styles
+            for command in getattr(style, "commands", [])
+        ]
+        self.assertIn(("BACKGROUND", (0, 0), (1, 0), "#dbeafe"), prepass_styles)
+        self.assertIn(("BACKGROUND", (0, 2), (1, 2), "#eef2ff"), prepass_styles)
+        self.assertIn("local_sigma_multiple(x)", deviation_text)
+        self.assertIn("|actual(x) - baseline(x)| / effective_sigma_band(x)", deviation_text)
+        self.assertIn("Deviation Score", deviation_text)
+        self.assertIn("max(RMS_component, P90_component)", deviation_text)
+        self.assertIn("Max Band", deviation_text)
+        self.assertIn("PASS", deviation_text)
+        self.assertIn("WATCH", deviation_text)
+        self.assertIn("REQUIRES EVAL", deviation_text)
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(
