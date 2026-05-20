@@ -946,6 +946,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
 
         self.assertEqual(table_rows[1][1], "No REQUIRES EVAL items were produced for the selected certification scope.")
 
+    def test_combined_grade_passes_when_score_within_one_even_if_band_is_two_sigma(self) -> None:
+        self.assertEqual(tar._tar_combined_grade(1.0, "2 sigma"), "PASS")
+        self.assertEqual(tar._tar_combined_grade(0.75, "3 sigma"), "PASS")
+
+    def test_combined_grade_watches_when_score_is_between_one_and_three(self) -> None:
+        self.assertEqual(tar._tar_combined_grade(1.5, "one sigma"), "WATCH")
+        self.assertEqual(tar._tar_combined_grade(-2.25, "2 sigma"), "WATCH")
+
+    def test_combined_grade_fails_when_score_exceeds_three_or_band_exceeds_three_sigma(self) -> None:
+        self.assertEqual(tar._tar_combined_grade(3.01, "one sigma"), "FAIL")
+        self.assertEqual(tar._tar_combined_grade(0.5, "exceeds 3 sigma"), "FAIL")
+
     def test_exec_evaluated_parameter_count_uses_distinct_parameters(self) -> None:
         count = tar._tar_exec_evaluated_parameter_count(
             [
@@ -3018,34 +3030,30 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 pdf,
                 pair_spec=pair_spec,
                 page_number=11,
-            )
+        )
 
         self.assertEqual(plot_spec["section"], "watch_nonpass_curves")
         self.assertEqual(axes.position, [0.06, 0.09, 0.88, 0.70])
         self.assertEqual(fig.add_axes_calls, [])
-        self.assertEqual(len(axes.fill_between_calls), 3)
-        for actual, expected in zip(list(axes.fill_between_calls[0][0][1]), [0.8, 0.6]):
+        self.assertEqual(len(axes.fill_between_calls), 2)
+        first_plot_args, first_plot_kwargs = axes.plot_calls[1]
+        self.assertEqual(list(first_plot_args[0]), [0.0, 1.0])
+        for actual, expected in zip(list(first_plot_args[1]), [1.15, 1.25]):
             self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(list(axes.fill_between_calls[0][0][2]), [1.4, 1.8]):
+        self.assertEqual(first_plot_kwargs["label"], "In-family, graded mean | Suppression Voltage: 5 | Valve Voltage: 28")
+        for actual, expected in zip(list(axes.fill_between_calls[0][0][1]), [0.7, 0.8]):
             self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(list(axes.fill_between_calls[1][0][1]), [0.9, 0.8]):
+        for actual, expected in zip(list(axes.fill_between_calls[0][0][2]), [1.6, 1.7]):
             self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(list(axes.fill_between_calls[1][0][2]), [1.3, 1.6]):
+        for actual, expected in zip(list(axes.fill_between_calls[1][0][1]), [0.85, 0.95]):
             self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(list(axes.fill_between_calls[2][0][1]), [1.0, 1.0]):
-            self.assertAlmostEqual(actual, expected)
-        for actual, expected in zip(list(axes.fill_between_calls[2][0][2]), [1.2, 1.4]):
+        for actual, expected in zip(list(axes.fill_between_calls[1][0][2]), [1.45, 1.55]):
             self.assertAlmostEqual(actual, expected)
         self.assertEqual(axes.fill_between_calls[0][1]["color"], "#dc2626")
         self.assertEqual(axes.fill_between_calls[1][1]["color"], "#ca8a04")
-        self.assertEqual(axes.fill_between_calls[2][1]["color"], "#15803d")
         self.assertIsNotNone(axes.legend_call)
         self.assertIn(
             "In-family, graded mean | Suppression Voltage: 5 | Valve Voltage: 28",
-            axes.legend_call[1],
-        )
-        self.assertIn(
-            "In-family, graded +/-1 sigma | Suppression Voltage: 5 | Valve Voltage: 28",
             axes.legend_call[1],
         )
         self.assertIn(
@@ -3056,6 +3064,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             "In-family, graded +/-3 sigma | Suppression Voltage: 5 | Valve Voltage: 28",
             axes.legend_call[1],
         )
+        self.assertFalse(any("+/-1 sigma" in label for label in axes.legend_call[1]))
         self.assertIn("SN-001 | Condition A (WATCH)", axes.legend_call[1])
         self.assertFalse(any("Suppression Voltage" in label for label in axes.legend_call[1] if label.startswith("SN-001")))
 
@@ -3115,6 +3124,34 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertIsNotNone(axes.legend_call)
         self.assertIn("SN-001 | Condition A (REQUIRES EVAL)", axes.legend_call[1])
         self.assertFalse(any("(FAIL)" in label for label in axes.legend_call[1]))
+
+    def test_watch_curve_display_model_includes_all_serials_in_mean_and_band(self) -> None:
+        model = tar._tar_watch_curve_display_model(
+            {
+                "y_resampled_by_sn": {
+                    "SN-001": [3.0, 3.0],
+                    "SN-010": [1.0, 1.0],
+                }
+            }
+        )
+
+        self.assertEqual(list(model["master_y"]), [2.0, 2.0])
+        self.assertEqual(list(model["std_y"]), [1.0, 1.0])
+        self.assertEqual(list(model["effective_band_y"]), [1.0, 1.0])
+
+    def test_watch_curve_display_model_uses_grading_floor_when_local_sigma_is_small(self) -> None:
+        model = tar._tar_watch_curve_display_model(
+            {
+                "y_resampled_by_sn": {
+                    "SN-001": [10.0, 10.0],
+                    "SN-010": [10.0, 10.0],
+                }
+            }
+        )
+
+        self.assertEqual(list(model["master_y"]), [10.0, 10.0])
+        self.assertEqual(list(model["std_y"]), [0.0, 0.0])
+        self.assertEqual(list(model["effective_band_y"]), [0.15, 0.15])
 
     def test_build_plot_navigation_creates_compact_labels_and_ignores_non_plot_sections(self) -> None:
         navigation = tar._tar_build_plot_navigation(
@@ -4303,6 +4340,20 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         )
 
         self.assertEqual(value, "REQUIRES EVAL")
+
+    def test_exec_grading_table_rows_uses_score_driven_watch_rule(self) -> None:
+        rows = tar._tar_exec_grading_table_rows({})
+
+        deviation_row = next(row for row in rows if row[0] == "Deviation score")
+        final_row = next(row for row in rows if row[0] == "Final grade")
+        self.assertEqual(
+            deviation_row[2],
+            "PASS if score <= 1 | WATCH if 1 < score <= 3 | Requires Eval if score > 3",
+        )
+        self.assertEqual(
+            final_row[2],
+            "PASS if Deviation Score <= 1 and Max Band does not exceed 3 sigma | WATCH if 1 < Deviation Score <= 3 | Requires Eval if Deviation Score > 3 or Max Band exceeds 3 sigma",
+        )
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(

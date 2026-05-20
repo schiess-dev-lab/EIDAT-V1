@@ -2910,6 +2910,10 @@ def _grade_from_z(z: float, pass_max: float, watch_max: float) -> str:
     return "FAIL"
 
 
+_TAR_FINAL_SCORE_PASS_MAX = 1.0
+_TAR_FINAL_SCORE_WATCH_MAX = 3.0
+
+
 def _tar_max_band_label(max_band_deviation: object) -> str:
     value = _safe_float(max_band_deviation)
     if value is None:
@@ -2936,20 +2940,22 @@ def _tar_max_band_rank(label: object) -> int:
     return 99
 
 
-def _tar_combined_grade(score_grade: object, max_band_label: object) -> str:
-    token = _tar_normalize_grade_token(score_grade)
+def _tar_combined_grade(score_value: object, max_band_label: object) -> str:
+    token = _tar_normalize_grade_token(score_value)
     if token in {"LIMITED", "NO_DATA", "NOT_GRADED"}:
         return token
-    if token not in {"PASS", "WATCH", "FAIL"}:
-        return "NO_DATA"
     band_label = str(max_band_label or "").strip().lower()
-    if token == "FAIL" or band_label == "exceeds 3 sigma":
+    if band_label == "exceeds 3 sigma":
         return "FAIL"
-    if token == "WATCH" or band_label in {"2 sigma", "3 sigma"}:
-        return "WATCH"
-    if token == "PASS" and band_label == "one sigma":
+    score_num = _safe_float(score_value)
+    if score_num is None:
+        return "NO_DATA"
+    score_abs = abs(float(score_num))
+    if score_abs <= _TAR_FINAL_SCORE_PASS_MAX:
         return "PASS"
-    return token
+    if score_abs <= _TAR_FINAL_SCORE_WATCH_MAX:
+        return "WATCH"
+    return "FAIL"
 
 
 def _tar_normalize_grade_token(grade: object) -> str:
@@ -6224,7 +6230,11 @@ def generate_test_data_auto_report(
                 "  • Family curve: median across all serials in the project cache (per run/param).",
                 "  • Residual metrics: max_abs, max_pct, rms_pct, x@max.",
                 "  • Grade basis: Deviation Score from the selected comparison pool.",
-                f"  • Thresholds: PASS if score≤{_fmt_num(z_pass)}; WATCH if score≤{_fmt_num(z_watch)}; else REQUIRES EVAL.",
+                (
+                    f"  • Thresholds: PASS if score≤{_fmt_num(_TAR_FINAL_SCORE_PASS_MAX)}; "
+                    f"WATCH if score>{_fmt_num(_TAR_FINAL_SCORE_PASS_MAX)} and score≤{_fmt_num(_TAR_FINAL_SCORE_WATCH_MAX)}; "
+                    f"else REQUIRES EVAL."
+                ),
                 "  • Main body shows WATCH/REQUIRES EVAL only; PASS details are in the appendix.",
             ]
             y = 0.30
@@ -7618,14 +7628,7 @@ def _tar_exec_deviation_score_text(row: Mapping[str, object] | None, *, sig: int
 
 
 def _tar_exec_grade_thresholds(ctx: Mapping[str, Any] | None) -> tuple[float, float]:
-    report_cfg = (ctx or {}).get("report_cfg") if isinstance(ctx, Mapping) else {}
-    grading_cfg = report_cfg.get("grading") if isinstance(report_cfg, Mapping) else {}
-    pass_max = _safe_float((grading_cfg or {}).get("zscore_pass_max"))
-    watch_max = _safe_float((grading_cfg or {}).get("zscore_watch_max"))
-    return (
-        float(pass_max if pass_max is not None else 2.0),
-        float(watch_max if watch_max is not None else 3.0),
-    )
+    return (_TAR_FINAL_SCORE_PASS_MAX, _TAR_FINAL_SCORE_WATCH_MAX)
 
 
 def _tar_split_display_values(text: object, *, separators: str) -> list[str]:
@@ -9681,9 +9684,9 @@ def _tar_exec_grading_table_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             "Final grade",
             "Deviation Score captures overall curve agreement, while Max Band captures the worst local excursion.",
             (
-                "PASS only if Deviation Score is PASS and Max Band is one sigma | "
-                "WATCH if Deviation Score is WATCH or Max Band is 2 sigma or 3 sigma | "
-                "Requires Eval if Deviation Score is Requires Eval or Max Band exceeds 3 sigma"
+                "PASS if Deviation Score <= 1 and Max Band does not exceed 3 sigma | "
+                "WATCH if 1 < Deviation Score <= 3 | "
+                "Requires Eval if Deviation Score > 3 or Max Band exceeds 3 sigma"
             ),
         ],
     ]
@@ -11521,6 +11524,27 @@ def _tar_build_target_excluded_pool_model(
     }
 
 
+def _tar_effective_sigma_band(
+    master_y: Sequence[object] | None,
+    std_y: Sequence[object] | None,
+    *,
+    denom: float,
+    band_floor_pct: float = 1.5,
+) -> list[float]:
+    safe_denom = float(denom) if isinstance(denom, (int, float)) and math.isfinite(float(denom)) and float(denom) > 0 else 1.0
+    floor_abs = max(safe_denom * max(0.0, float(band_floor_pct)) / 100.0, 1e-12)
+    effective: list[float] = []
+    for idx, _baseline in enumerate(master_y or []):
+        local_band = std_y[idx] if idx < len(std_y or []) else None
+        local_band_float = (
+            float(local_band)
+            if isinstance(local_band, (int, float)) and math.isfinite(float(local_band)) and float(local_band) > 0
+            else 0.0
+        )
+        effective.append(max(local_band_float, floor_abs))
+    return effective
+
+
 def _tar_compute_band_deviation(
     y_curve: list[float],
     master_y: list[float],
@@ -11535,7 +11559,12 @@ def _tar_compute_band_deviation(
     peak_idx = 0
     peak_abs = -1.0
     safe_denom = float(denom) if isinstance(denom, (int, float)) and math.isfinite(float(denom)) and float(denom) > 0 else 1.0
-    floor_abs = max(safe_denom * max(0.0, float(band_floor_pct)) / 100.0, 1e-12)
+    effective_band_y = _tar_effective_sigma_band(
+        master_y,
+        band_y,
+        denom=safe_denom,
+        band_floor_pct=band_floor_pct,
+    )
     for idx, (actual, baseline) in enumerate(zip(y_curve, master_y)):
         if not (isinstance(actual, (int, float)) and not math.isnan(float(actual))):
             continue
@@ -11544,13 +11573,7 @@ def _tar_compute_band_deviation(
         diff = float(actual) - float(baseline)
         residual.append(diff)
         value_abs = abs(diff)
-        local_band = band_y[idx] if idx < len(band_y) else None
-        local_band_float = (
-            float(local_band)
-            if isinstance(local_band, (int, float)) and math.isfinite(float(local_band)) and float(local_band) > 0
-            else 0.0
-        )
-        effective_band = max(local_band_float, floor_abs)
+        effective_band = float(effective_band_y[idx]) if idx < len(effective_band_y) else 1e-12
         band_scores.append(value_abs / effective_band)
         if value_abs > peak_abs:
             peak_abs = value_abs
@@ -11573,6 +11596,42 @@ def _tar_compute_band_deviation(
         "rms_band_deviation": float(rms_band),
         "p90_band_deviation": float(p90_band),
         "max_band_deviation": float(max_band),
+    }
+
+
+def _tar_watch_curve_display_model(
+    payload: Mapping[str, Any] | None,
+    *,
+    band_floor_pct: float = 1.5,
+) -> dict[str, Any]:
+    spec = dict(payload or {})
+    curve_map = spec.get("y_resampled_by_sn") or {}
+    traces = [
+        list(trace)
+        for trace in (curve_map.values() if isinstance(curve_map, Mapping) else [])
+        if isinstance(trace, list)
+    ]
+    master_y = _tar_mean_trace(traces)
+    std_y = _nan_std(traces)
+    denom = max(
+        (
+            abs(value)
+            for value in master_y
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+        ),
+        default=0.0,
+    )
+    effective_band = _tar_effective_sigma_band(
+        master_y,
+        std_y,
+        denom=(float(denom) if denom > 0 else 1.0),
+        band_floor_pct=band_floor_pct,
+    )
+    return {
+        "master_y": list(master_y),
+        "std_y": list(std_y),
+        "effective_band_y": list(effective_band),
+        "denom": float(denom) if denom > 0 else 1.0,
     }
 
 
@@ -12622,7 +12681,7 @@ def _tar_analyze_curve_groups(
                         score_grade = _grade_from_z(float(deviation_score), z_pass, z_watch) if deviation_score is not None else "NO_DATA"
                         max_band_deviation = _safe_float((dev or {}).get("max_band_deviation"))
                         max_band_label = _tar_max_band_label(max_band_deviation)
-                        grade = _tar_combined_grade(score_grade, max_band_label) if deviation_score is not None else "NO_DATA"
+                        grade = _tar_combined_grade(deviation_score, max_band_label) if deviation_score is not None else "NO_DATA"
                         grading_basis_status = (
                             "program_only_pool"
                             if len(selected_programs) <= 1
@@ -12908,7 +12967,7 @@ def _tar_analyze_curve_groups(
                 score_grade = _grade_from_z(z_score, z_pass, z_watch)
                 max_band_deviation = _safe_float((band_dev or {}).get("max_band_deviation"))
                 max_band_label = _tar_max_band_label(max_band_deviation)
-                grade = _tar_combined_grade(score_grade, max_band_label)
+                grade = _tar_combined_grade(z_score, max_band_label)
                 if serial not in hi_set:
                     continue
                 final_candidates.setdefault((str(spec.get("pair_id") or ""), serial), []).append(
@@ -14190,8 +14249,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     )
     story.append(
         _portrait_paragraph(
-            f"A row passes only when the Deviation Score is PASS at or below {_fmt_num(z_pass, sig=4)} and Max Band stays within one sigma. "
-            f"It becomes WATCH when the Deviation Score lands between {_fmt_num(z_pass, sig=4)} and {_fmt_num(z_watch, sig=4)} or when Max Band reaches 2 sigma or 3 sigma. "
+            f"A row passes when the Deviation Score is at or below {_fmt_num(z_pass, sig=4)} and Max Band does not exceed 3 sigma. "
+            f"It becomes WATCH when the Deviation Score is over {_fmt_num(z_pass, sig=4)} but not over {_fmt_num(z_watch, sig=4)}. "
             f"It requires eval when the Deviation Score exceeds {_fmt_num(z_watch, sig=4)} or when Max Band exceeds 3 sigma. "
             "If an exact-condition regrade exists, that regrade replaces the initial selected-pool result as the official score, Max Band, and grade shown here.",
             styles["body"],
@@ -14774,25 +14833,16 @@ def _tar_render_watch_curve_page(
     x_name = str(plot_payload.get("x_name") or "")
     x_grid = list(plot_payload.get("x_grid") or [])
     y_resampled_by_sn = dict(plot_payload.get("y_resampled_by_sn") or {})
-    master_y = list(plot_payload.get("master_y") or [])
-    std_y = list(plot_payload.get("std_y") or [])
+    watch_display_model = _tar_watch_curve_display_model(plot_payload)
+    master_y = list(watch_display_model.get("master_y") or [])
+    effective_band_y = list(watch_display_model.get("effective_band_y") or [])
     run_condition_label = _tar_plot_run_condition_label(
         pair_spec,
         selection=(pair_spec.get("selection") if isinstance(pair_spec.get("selection"), Mapping) else None),
         run_by_name=(ctx.get("run_by_name") or {}),
     )
     plot_context_lines = _tar_plot_condition_header_lines(ctx, pair_spec)
-    resolved_family_label, resolved_band_1sigma_label = _tar_curve_family_legend_labels(
-        pair_spec,
-        mean_label="In-family, graded mean",
-        band_label="In-family, graded +/-1 sigma",
-        filter_state_override=(
-            pair_spec.get("filter_state_override")
-            if isinstance(pair_spec.get("filter_state_override"), Mapping)
-            else None
-        ),
-    )
-    _, resolved_band_2sigma_label = _tar_curve_family_legend_labels(
+    resolved_family_label, resolved_band_2sigma_label = _tar_curve_family_legend_labels(
         pair_spec,
         mean_label="In-family, graded mean",
         band_label="In-family, graded +/-2 sigma",
@@ -14831,12 +14881,10 @@ def _tar_render_watch_curve_page(
             ax.plot(x_grid, y_curve, linewidth=0.8, alpha=0.08, color="#94a3b8")
     ax.plot(x_grid, master_y, linewidth=2.1, color="#0f172a", label=resolved_family_label)
     try:
-        band_3sigma_lo, band_3sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=3.0)
-        band_2sigma_lo, band_2sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=2.0)
-        band_1sigma_lo, band_1sigma_hi = _tar_curve_sigma_band_bounds(master_y, std_y, sigma_multiplier=1.0)
+        band_3sigma_lo, band_3sigma_hi = _tar_curve_sigma_band_bounds(master_y, effective_band_y, sigma_multiplier=3.0)
+        band_2sigma_lo, band_2sigma_hi = _tar_curve_sigma_band_bounds(master_y, effective_band_y, sigma_multiplier=2.0)
         ax.fill_between(x_grid, band_3sigma_lo, band_3sigma_hi, color="#dc2626", alpha=0.14, label=resolved_band_3sigma_label)
         ax.fill_between(x_grid, band_2sigma_lo, band_2sigma_hi, color="#ca8a04", alpha=0.18, label=resolved_band_2sigma_label)
-        ax.fill_between(x_grid, band_1sigma_lo, band_1sigma_hi, color="#15803d", alpha=0.22, label=resolved_band_1sigma_label)
     except Exception:
         pass
     palette = _tar_build_highlight_palette(ctx.get("colors"))
