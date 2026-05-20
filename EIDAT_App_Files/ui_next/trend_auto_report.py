@@ -9761,36 +9761,116 @@ def _tar_serial_count_enumeration_text(max_serial_count: int) -> str:
     return ", ".join(values[:-1]) + f", or {values[-1]} serials"
 
 
-def _tar_exec_process_flow_lines(ctx: Mapping[str, Any]) -> list[str]:
+def _tar_exec_process_flow_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
     prepass = _tar_exec_prepass_settings(ctx)
     noise_score_text = _fmt_num(prepass["noise_score_max"], sig=4)
     mean_delta_guard_text = f"{float(prepass['percent_delta_guard_max']):.1f}%"
     sparse_percent_delta_text = f"{float(prepass['sparse_percent_delta_max']):.1f}%"
     sparse_serial_text = _tar_serial_count_enumeration_text(int(prepass["sparse_min_serials_per_program"]) - 1)
     return [
-        (
-            "1. Show the measured evidence: The opening metric and curve sections show the measured data for the "
-            "selected run scope before the report asks the reader to interpret scores."
-        ),
-        (
-            "2. Build the comparison pool: Data is grouped by base run condition, parameter, and X axis. The report "
-            "builds a program-level comparison between each candidate program and the certifying/reference program. "
-            f"A program is admitted only when noise_score <= {noise_score_text} and mean_delta_pct <= {mean_delta_guard_text}. "
-            f"Sparse means the reference program contributes only {sparse_serial_text} to the current cohort, or the "
-            f"candidate program contributes only {sparse_serial_text} to that same cohort. When that happens, the report "
-            f"does not use the noise-based gate and instead falls back to mean_delta_pct <= {sparse_percent_delta_text}. "
-            "The admitted programs become the comparison pool used for grading."
-        ),
-        (
-            "3. Score each certification serial: The report removes the target serial from its own comparison pool and "
-            "compares that serial to the target-excluded baseline. Deviation Score measures whole-curve agreement, while "
-            "Max Band captures the worst local excursion."
-        ),
-        (
-            "4. Surface the results: The summary tables identify which serials, parameters, and run conditions need "
-            "attention first, while the later sections preserve the trace-level evidence."
-        ),
+        ["How This Report Works", "", "", ""],
+        ["Part 1 - Show As-Tested Data", "", "Part 2 - Analyze, Score, and Surface Results", ""],
+        [
+            "Metric Sections",
+            "Compare selected parameters per run condition across the serials included in this report.",
+            "Build Comparison Pool",
+            (
+                "Group by base run condition, parameter, and X axis.\n"
+                "- Compare candidate programs to the certifying/reference program.\n"
+                "- Admit compatible programs using the current gate."
+            ),
+        ],
+        [
+            "Curve Sections",
+            "Show parameter behavior over time or pulse count using as-tested trace data.",
+            "Compatibility Gate",
+            (
+                f"- noise_score <= {noise_score_text}\n"
+                f"- mean_delta_pct <= {mean_delta_guard_text}\n"
+                f"- Sparse means the reference or candidate program contributes only {sparse_serial_text}.\n"
+                f"- Sparse fallback uses mean_delta_pct <= {sparse_percent_delta_text}."
+            ),
+        ],
+        [
+            "Reader Goal",
+            "Review what was measured before interpreting scored outcomes.",
+            "Score Certification Serials",
+            (
+                "- Remove the target serial from its own baseline.\n"
+                "- Compare to the target-excluded baseline.\n"
+                "- Calculate Deviation Score and Max Band."
+            ),
+        ],
+        [
+            "Review Flow",
+            "Raw evidence -> Analysis -> Score -> Watch / Non-PASS curves",
+            "Outcome Strip",
+            (
+                "PASS - close agreement; no scored concern surfaced.\n"
+                "WATCH - elevated score; review recommended.\n"
+                "REQUIRES EVAL - Deviation Score or Max Band crossed the evaluation threshold."
+            ),
+        ],
+        [
+            "",
+            "",
+            "Show Results in Watch / Non-PASS Curves",
+            (
+                "- Summary tables identify what matters first.\n"
+                "- Watch/non-pass curves show scored traces and comparison bands for review."
+            ),
+        ],
     ]
+
+
+def _tar_build_exec_process_flow_table(
+    ctx: Mapping[str, Any],
+    *,
+    styles: Mapping[str, Any],
+    rl: Mapping[str, Any],
+) -> Any:
+    inch = rl["inch"]
+    colors = rl["colors"]
+    rows = _tar_exec_process_flow_rows(ctx)
+    cell_style_overrides: dict[tuple[int, int], Any] = {
+        (0, col_index): styles.get("card_title") or styles["small_bold"]
+        for col_index in range(4)
+    }
+    cell_style_overrides.update(
+        {
+            (1, col_index): styles.get("small_bold") or styles["small"]
+            for col_index in range(4)
+        }
+    )
+    for row_index in range(2, len(rows)):
+        for col_index in (0, 2):
+            cell_style_overrides[(row_index, col_index)] = styles.get("small_bold") or styles["small"]
+    style_cmds = [
+        ("SPAN", (0, 0), (3, 0)),
+        ("SPAN", (0, 1), (1, 1)),
+        ("SPAN", (2, 1), (3, 1)),
+        ("BACKGROUND", (0, 0), (3, 0), colors.HexColor("#dbeafe")),
+        ("BACKGROUND", (0, 1), (1, 1), colors.HexColor("#e0f2fe")),
+        ("BACKGROUND", (2, 1), (3, 1), colors.HexColor("#eef2ff")),
+        ("BACKGROUND", (0, 2), (1, -1), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (2, 2), (3, -1), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (0, 5), (3, 5), colors.HexColor("#f1f5f9")),
+        ("LINEBELOW", (0, 0), (3, 0), 1, colors.HexColor("#60a5fa")),
+        ("LINEBELOW", (0, 1), (3, 1), 0.8, colors.HexColor("#94a3b8")),
+        ("LINEBEFORE", (2, 1), (2, -1), 1, colors.HexColor("#94a3b8")),
+        ("SPAN", (0, 6), (1, 6)),
+    ]
+    return _portrait_box_table(
+        rows,
+        col_widths=[1.05 * inch, 2.20 * inch, 1.30 * inch, 2.35 * inch],
+        styles=styles,
+        rl=rl,
+        repeat_rows=0,
+        compact=True,
+        header_rows=0,
+        extra_style_commands=style_cmds,
+        cell_style_overrides=cell_style_overrides,
+    )
 
 
 def _tar_exec_deviation_score_summary_text() -> str:
@@ -14779,9 +14859,8 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
     story.append(
-        _portrait_card(
-            "How This Report Works",
-            _tar_exec_process_flow_lines(ctx),
+        _tar_build_exec_process_flow_table(
+            ctx,
             styles=styles,
             rl=rl,
         )

@@ -4378,12 +4378,25 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertAlmostEqual((exception_table.colWidths or [])[0], (serial_table.colWidths or [])[0])
         self.assertEqual(_table_text(exception_table)[0][-1], "Grading")
         self.assertEqual(len(_table_text(exception_table)[0]), 8)
-        how_it_works_text = _table_text(how_it_works_card)[1][0]
+        how_it_works_text = "\n".join(
+            cell
+            for row in _table_text(how_it_works_card)
+            for cell in row
+        )
+        self.assertIn("Part 1 - Show As-Tested Data", how_it_works_text)
+        self.assertIn("Metric Sections", how_it_works_text)
+        self.assertIn("Curve Sections", how_it_works_text)
+        self.assertIn("Part 2 - Analyze, Score, and Surface Results", how_it_works_text)
+        self.assertIn("Build Comparison Pool", how_it_works_text)
+        self.assertIn("Score Certification Serials", how_it_works_text)
+        self.assertIn("Show Results in Watch / Non-PASS Curves", how_it_works_text)
         self.assertIn("noise_score &lt;= 1.25", how_it_works_text)
         self.assertIn("mean_delta_pct &lt;= 8.0%", how_it_works_text)
         self.assertIn("0 or 1 serials", how_it_works_text)
         self.assertIn("mean_delta_pct &lt;= 4.0%", how_it_works_text)
-        self.assertIn("The admitted programs become the comparison pool used for grading.", how_it_works_text)
+        self.assertIn("PASS", how_it_works_text)
+        self.assertIn("WATCH", how_it_works_text)
+        self.assertIn("REQUIRES EVAL", how_it_works_text)
         body_text = "\n".join(
             item.text
             for item in story
