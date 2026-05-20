@@ -4933,21 +4933,26 @@ def _tar_comparison_chart_destination(
     if not isinstance(row, Mapping):
         return None
     destinations = dict(chart_destinations or {})
+    pair_id = str(row.get("pair_id") or "").strip()
+    if metric_label == "Metric Chart":
+        if not pair_id:
+            return None
+        dest_map = destinations.get("metric_by_pair_id") or {}
+        try:
+            return int(dest_map.get(pair_id)) if pair_id in dest_map else None
+        except Exception:
+            return None
+    if metric_label != "Plot Curves":
+        return None
     nonpass_destination, _target_section = _tar_nonpass_chart_destination(
         row,
         chart_destinations=destinations,
     )
     if nonpass_destination is not None:
         return nonpass_destination
-    pair_id = str(row.get("pair_id") or "").strip()
     if not pair_id:
         return None
-    if metric_label == "Metric Chart":
-        dest_map = destinations.get("metric_by_pair_id") or {}
-    elif metric_label == "Plot Curves":
-        dest_map = destinations.get("curve_by_pair_id") or {}
-    else:
-        return None
+    dest_map = destinations.get("curve_by_pair_id") or {}
     try:
         return int(dest_map.get(pair_id)) if pair_id in dest_map else None
     except Exception:
@@ -10984,6 +10989,40 @@ def _tar_filter_comparison_link_rects(rects: Sequence[Any] | None, *, expected_c
     )
 
 
+def _tar_find_intro_toc_rect(
+    page: Any,
+    link: Mapping[str, Any] | None,
+    *,
+    search_cache: dict[str, list[Any]],
+    excluded_rect_keys: set[tuple[float, float, float, float]] | None = None,
+) -> Any | None:
+    if not isinstance(link, Mapping):
+        return None
+    label = str(link.get("link_text") or "").strip()
+    if not label:
+        return None
+    if label not in search_cache:
+        try:
+            search_cache[label] = list(page.search_for(label))
+        except Exception:
+            search_cache[label] = []
+    rects = [
+        rect
+        for rect in sorted(
+            list(search_cache.get(label) or []),
+            key=lambda candidate: (
+                float(getattr(candidate, "y0", 0.0) or 0.0),
+                float(getattr(candidate, "x0", 0.0) or 0.0),
+            ),
+        )
+        if excluded_rect_keys is None or _tar_rect_key(rect) not in excluded_rect_keys
+    ]
+    occurrence_index = max(0, int(link.get("occurrence_index") or 0))
+    if occurrence_index >= len(rects):
+        return None
+    return rects[occurrence_index]
+
+
 def _tar_find_intro_exception_grade_rect(
     page: Any,
     link: Mapping[str, Any] | None,
@@ -11155,6 +11194,7 @@ def _tar_apply_pdf_navigation(
     comparison_section_start_page_index: int | None = None,
     exception_chart_links: list[dict] | None = None,
     exception_grade_links: list[dict] | None = None,
+    intro_toc_links: list[dict] | None = None,
     intro_page_count: int | None = None,
 ) -> None:
     try:
@@ -11166,7 +11206,8 @@ def _tar_apply_pdf_navigation(
     comparison_links = [dict(entry) for entry in (comparison_chart_links or []) if isinstance(entry, Mapping)]
     chart_links = [dict(entry) for entry in (exception_chart_links or []) if isinstance(entry, Mapping)]
     intro_exception_links = [dict(entry) for entry in (exception_grade_links or []) if isinstance(entry, Mapping)]
-    if not (nav_entries or comparison_links or chart_links or intro_exception_links):
+    intro_toc_link_entries = [dict(entry) for entry in (intro_toc_links or []) if isinstance(entry, Mapping)]
+    if not (nav_entries or comparison_links or chart_links or intro_exception_links or intro_toc_link_entries):
         return
 
     doc = fitz.open(str(Path(output_pdf).expanduser()))
@@ -11314,15 +11355,49 @@ def _tar_apply_pdf_navigation(
                 for rect in rects:
                     _tar_insert_page_link(page, rect, target_page_index)
 
+        intro_toc_occurrences: dict[str, int] = {}
+        for link in intro_toc_link_entries:
+            text = str(link.get("link_text") or "").strip()
+            if not text:
+                continue
+            occurrence_index = int(intro_toc_occurrences.get(text, 0))
+            intro_toc_occurrences[text] = occurrence_index + 1
+            link["occurrence_index"] = occurrence_index
+
+        unresolved_intro_toc_links = [dict(link) for link in intro_toc_link_entries]
         unresolved_intro_links = [dict(link) for link in intro_exception_links]
         intro_page_limit = min(max(0, int(intro_page_count or 0)), int(doc.page_count or 0))
         for page_index in range(intro_page_limit):
-            if not unresolved_intro_links:
+            if not unresolved_intro_toc_links and not unresolved_intro_links:
                 break
             page = doc.load_page(page_index)
             search_cache: dict[str, list[Any]] = {}
             used_rect_keys: set[tuple[float, float, float, float]] = set()
             matched_indexes: list[int] = []
+            for link_index, link in enumerate(unresolved_intro_toc_links):
+                destination = link.get("destination_page_index")
+                if destination is None:
+                    continue
+                try:
+                    target_page_index = int(destination)
+                except Exception:
+                    continue
+                if target_page_index < 0 or target_page_index >= int(doc.page_count or 0):
+                    continue
+                rect = _tar_find_intro_toc_rect(
+                    page,
+                    link,
+                    search_cache=search_cache,
+                    excluded_rect_keys=used_rect_keys,
+                )
+                if rect is None:
+                    continue
+                _tar_insert_page_link(page, rect, target_page_index)
+                used_rect_keys.add(_tar_rect_key(rect))
+                matched_indexes.append(link_index)
+            for link_index in reversed(matched_indexes):
+                unresolved_intro_toc_links.pop(link_index)
+            matched_indexes = []
             for link_index, link in enumerate(unresolved_intro_links):
                 destination = link.get("destination_page_index")
                 if destination is None:
@@ -14198,6 +14273,246 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
     ctx["equation_cards"] = equation_cards
 
 
+_TAR_INTRO_TOC_METRICS_DESC = "Metrics charts show performance mean across all serial numbers for all programs"
+_TAR_INTRO_TOC_CURVES_DESC = "Curves charts show the parameter versus time"
+
+
+def _tar_filter_plot_navigation_entries(
+    plot_navigation: Sequence[Mapping[str, Any]] | None,
+    section_key: str,
+) -> list[dict[str, Any]]:
+    return [
+        dict(entry)
+        for entry in (plot_navigation or [])
+        if isinstance(entry, Mapping) and str(entry.get("section_key") or entry.get("section") or "").strip() == str(section_key or "").strip()
+    ]
+
+
+def _tar_intro_toc_metric_entry_label(entry: Mapping[str, Any] | None) -> str:
+    spec = dict(entry or {})
+    condition_label = str(spec.get("run_condition_label") or _tar_plot_toc_condition_label(spec)).strip()
+    param_name = str(spec.get("param_display") or spec.get("param") or "").strip()
+    x_name = str(spec.get("x_name") or "").strip()
+    metric_stat = str(spec.get("stat") or "").strip()
+    label = " | ".join(
+        value
+        for value in [
+            f"Metric Chart: {condition_label}" if condition_label else "Metric Chart",
+            f"Parameter: {param_name}" if param_name else "",
+            f"X: {x_name}" if x_name else "",
+            f"Stat: {metric_stat}" if metric_stat else "",
+        ]
+        if value
+    )
+    return textwrap.shorten(label, width=108, placeholder="...")
+
+
+def _tar_intro_toc_curve_entry_label(entry: Mapping[str, Any] | None) -> str:
+    spec = dict(entry or {})
+    condition_label = str(spec.get("run_condition_label") or _tar_plot_toc_condition_label(spec)).strip()
+    param_name = str(spec.get("param_display") or spec.get("param") or "").strip()
+    x_name = str(spec.get("x_name") or "").strip()
+    label = " | ".join(
+        value
+        for value in [
+            f"Curve Chart: {condition_label}" if condition_label else "Curve Chart",
+            f"Parameter: {param_name}" if param_name else "",
+            f"X: {x_name}" if x_name else "",
+        ]
+        if value
+    )
+    return textwrap.shorten(label, width=108, placeholder="...")
+
+
+def _tar_has_equation_section(ctx: Mapping[str, Any]) -> bool:
+    if _tar_equation_summary_rows(ctx):
+        return True
+    return bool(ctx.get("equation_cards") or [])
+
+
+def _tar_intro_toc_table_spec(ctx: Mapping[str, Any]) -> tuple[list[list[str]], list[dict[str, Any]]]:
+    comparison_pages = [
+        dict(page)
+        for page in (ctx.get("comparison_page_specs") or [])
+        if isinstance(page, Mapping)
+    ]
+    comparison_rows = [dict(row) for row in (ctx.get("comparison_rows") or []) if isinstance(row, Mapping)]
+    plot_navigation = [dict(entry) for entry in (ctx.get("plot_navigation") or []) if isinstance(entry, Mapping)]
+    metric_entries = _tar_filter_plot_navigation_entries(plot_navigation, "run_condition_plot_metrics")
+    curve_entries = _tar_filter_plot_navigation_entries(plot_navigation, "run_condition_curve_overlays")
+    watch_entries = _tar_filter_plot_navigation_entries(plot_navigation, "watch_nonpass_curves")
+
+    rows: list[list[str]] = []
+    links: list[dict[str, Any]] = []
+    seen_serials: set[str] = set()
+    for page in comparison_pages:
+        serial = str(page.get("serial") or "").strip()
+        if not serial or serial in seen_serials:
+            continue
+        seen_serials.add(serial)
+        label = f"Run Comparison - {_tar_display_serial(ctx, serial) or serial}"
+        rows.append([label, ""])
+        links.append(
+            {
+                "link_text": label,
+                "target": {"kind": "comparison_serial", "serial": serial},
+            }
+        )
+    if not seen_serials:
+        for row in comparison_rows:
+            serial = str(row.get("serial") or "").strip()
+            if not serial or serial in seen_serials:
+                continue
+            seen_serials.add(serial)
+            label = f"Run Comparison - {_tar_display_serial(ctx, serial) or serial}"
+            rows.append([label, ""])
+            links.append(
+                {
+                    "link_text": label,
+                    "target": {"kind": "comparison_serial", "serial": serial},
+                }
+            )
+
+    if metric_entries:
+        rows.append(["Plot Metrics Charts", _TAR_INTRO_TOC_METRICS_DESC])
+        links.append(
+            {
+                "link_text": "Plot Metrics Charts",
+                "target": {"kind": "plot_section", "section_key": "run_condition_plot_metrics"},
+            }
+        )
+        for entry in metric_entries:
+            label = _tar_intro_toc_metric_entry_label(entry)
+            rows.append([label, ""])
+            links.append(
+                {
+                    "link_text": label,
+                    "target": {
+                        "kind": "plot_entry",
+                        "section_key": "run_condition_plot_metrics",
+                        "nav_index": int(entry.get("nav_index") or 0),
+                    },
+                }
+            )
+
+    if curve_entries:
+        rows.append(["Plot Curves Charts", _TAR_INTRO_TOC_CURVES_DESC])
+        links.append(
+            {
+                "link_text": "Plot Curves Charts",
+                "target": {"kind": "plot_section", "section_key": "run_condition_curve_overlays"},
+            }
+        )
+        for entry in curve_entries:
+            label = _tar_intro_toc_curve_entry_label(entry)
+            rows.append([label, ""])
+            links.append(
+                {
+                    "link_text": label,
+                    "target": {
+                        "kind": "plot_entry",
+                        "section_key": "run_condition_curve_overlays",
+                        "nav_index": int(entry.get("nav_index") or 0),
+                    },
+                }
+            )
+
+    if _tar_has_equation_section(ctx):
+        rows.append(["Performance Equations", ""])
+        links.append({"link_text": "Performance Equations", "target": {"kind": "equations_start"}})
+
+    if watch_entries:
+        rows.append(["Eval / Pass-Fail Curves", ""])
+        links.append(
+            {
+                "link_text": "Eval / Pass-Fail Curves",
+                "target": {"kind": "plot_section", "section_key": "watch_nonpass_curves"},
+            }
+        )
+
+    rows.append(["Summary", ""])
+    links.append({"link_text": "Summary", "target": {"kind": "closing_summary"}})
+    return rows, links
+
+
+def _tar_resolve_intro_toc_links(
+    ctx: Mapping[str, Any],
+    *,
+    intro_page_count: int,
+    comparison_page_count: int,
+    plot_page_count: int,
+    equation_page_count: int,
+) -> list[dict[str, Any]]:
+    raw_links = [dict(link) for link in (ctx.get("intro_toc_links") or []) if isinstance(link, Mapping)]
+    if not raw_links:
+        return []
+
+    comparison_pages = [
+        dict(page)
+        for page in (ctx.get("comparison_page_specs") or [])
+        if isinstance(page, Mapping)
+    ]
+    plot_navigation = [dict(entry) for entry in (ctx.get("plot_navigation") or []) if isinstance(entry, Mapping)]
+    plot_by_nav_index: dict[tuple[str, int], dict[str, Any]] = {}
+    first_plot_by_section: dict[str, dict[str, Any]] = {}
+    for entry in plot_navigation:
+        section_key = str(entry.get("section_key") or entry.get("section") or "").strip()
+        nav_index = int(entry.get("nav_index") or 0)
+        if section_key and nav_index > 0:
+            plot_by_nav_index[(section_key, nav_index)] = entry
+        if section_key and section_key not in first_plot_by_section:
+            first_plot_by_section[section_key] = entry
+
+    resolved: list[dict[str, Any]] = []
+    for link in raw_links:
+        label = str(link.get("link_text") or "").strip()
+        target = dict(link.get("target") or {}) if isinstance(link.get("target"), Mapping) else {}
+        target_kind = str(target.get("kind") or "").strip()
+        destination_page_index: int | None = None
+        if target_kind == "comparison_serial":
+            serial = str(target.get("serial") or "").strip()
+            for page in comparison_pages:
+                if str(page.get("serial") or "").strip() != serial:
+                    continue
+                report_page_index = int(page.get("report_page_index") or 0)
+                if report_page_index > 0:
+                    destination_page_index = max(0, int(intro_page_count) + report_page_index - 1)
+                    break
+        elif target_kind == "plot_section":
+            section_key = str(target.get("section_key") or "").strip()
+            entry = first_plot_by_section.get(section_key)
+            if entry is not None:
+                try:
+                    destination_page_index = int(entry.get("destination_page_index"))
+                except Exception:
+                    destination_page_index = None
+        elif target_kind == "plot_entry":
+            section_key = str(target.get("section_key") or "").strip()
+            nav_index = int(target.get("nav_index") or 0)
+            entry = plot_by_nav_index.get((section_key, nav_index))
+            if entry is not None:
+                try:
+                    destination_page_index = int(entry.get("destination_page_index"))
+                except Exception:
+                    destination_page_index = None
+        elif target_kind == "equations_start":
+            if int(equation_page_count) > 0:
+                destination_page_index = int(intro_page_count) + int(comparison_page_count) + int(plot_page_count)
+        elif target_kind == "closing_summary":
+            destination_page_index = (
+                int(intro_page_count) + int(comparison_page_count) + int(plot_page_count) + int(equation_page_count)
+            )
+        if destination_page_index is None or destination_page_index < 0:
+            continue
+        resolved.append(
+            {
+                "link_text": label,
+                "destination_page_index": int(destination_page_index),
+            }
+        )
+    return resolved
+
+
 def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     rl = _reportlab_imports()
     styles = _build_portrait_styles(rl)
@@ -14322,6 +14637,26 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
             },
         )
     )
+    story.append(PageBreak())
+    story.append(_portrait_paragraph("Table of Contents", styles["section"], rl))
+    intro_toc_rows, intro_toc_links = _tar_intro_toc_table_spec(ctx)
+    ctx["intro_toc_links"] = list(intro_toc_links)
+    if intro_toc_rows:
+        story.append(
+            _portrait_box_table(
+                intro_toc_rows,
+                col_widths=[2.35 * inch, 4.55 * inch],
+                styles=styles,
+                rl=rl,
+                repeat_rows=0,
+                compact=True,
+                header_rows=0,
+                cell_style_overrides={
+                    (row_index, 0): styles.get("small_link") or styles["small"]
+                    for row_index, _row in enumerate(intro_toc_rows)
+                },
+            )
+        )
 
     if not comparison_rows:
         story.append(PageBreak())
@@ -15911,6 +16246,13 @@ def generate_test_data_auto_report(
             )
             timings["render_equation_pages_seconds"] = round(time.perf_counter() - equation_render_start, 3)
             plot_counts["equation_page_count"] = int(equation_pages)
+            ctx["resolved_intro_toc_links"] = _tar_resolve_intro_toc_links(
+                ctx,
+                intro_page_count=int(intro_pages),
+                comparison_page_count=int(comparison_pages),
+                plot_page_count=int(plot_counts["plot_page_count"]),
+                equation_page_count=int(equation_pages),
+            )
 
             section_order = ["cover"]
             section_order.extend(["executive_summary", "comparison_table"])
@@ -15971,6 +16313,7 @@ def generate_test_data_auto_report(
                 comparison_section_start_page_index=(int(intro_pages) if comparison_pages else None),
                 exception_chart_links=list(ctx.get("exception_chart_links") or []),
                 exception_grade_links=list(ctx.get("exception_grade_links") or []),
+                intro_toc_links=list(ctx.get("resolved_intro_toc_links") or []),
                 intro_page_count=int(intro_pages),
             )
             timings["apply_pdf_navigation_seconds"] = round(time.perf_counter() - navigation_start, 3)

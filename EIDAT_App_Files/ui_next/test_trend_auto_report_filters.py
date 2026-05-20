@@ -3381,6 +3381,101 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             finally:
                 result.close()
 
+    def test_resolve_intro_toc_links_maps_symbolic_targets_to_report_pages(self) -> None:
+        ctx = {
+            "comparison_page_specs": [
+                {"serial": "SN-001", "report_page_index": 1},
+                {"serial": "SN-001", "report_page_index": 2, "continued": True},
+            ],
+            "plot_navigation": tar._tar_build_plot_navigation(
+                [
+                    {
+                        "section": "run_condition_plot_metrics",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "stat": "mean",
+                        "page_number": 6,
+                    },
+                    {
+                        "section": "run_condition_curve_overlays",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "page_number": 7,
+                    },
+                    {
+                        "section": "watch_nonpass_curves",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "page_number": 8,
+                    },
+                ]
+            ),
+            "intro_toc_links": [
+                {"link_text": "Run Comparison - SN-001", "target": {"kind": "comparison_serial", "serial": "SN-001"}},
+                {"link_text": "Plot Metrics Charts", "target": {"kind": "plot_section", "section_key": "run_condition_plot_metrics"}},
+                {"link_text": "Metric Chart: Pressure", "target": {"kind": "plot_entry", "section_key": "run_condition_plot_metrics", "nav_index": 1}},
+                {"link_text": "Plot Curves Charts", "target": {"kind": "plot_section", "section_key": "run_condition_curve_overlays"}},
+                {"link_text": "Performance Equations", "target": {"kind": "equations_start"}},
+                {"link_text": "Eval / Pass-Fail Curves", "target": {"kind": "plot_section", "section_key": "watch_nonpass_curves"}},
+                {"link_text": "Summary", "target": {"kind": "closing_summary"}},
+            ],
+        }
+
+        resolved = tar._tar_resolve_intro_toc_links(
+            ctx,
+            intro_page_count=3,
+            comparison_page_count=2,
+            plot_page_count=4,
+            equation_page_count=2,
+        )
+
+        resolved_by_text = {str(link.get("link_text") or ""): int(link.get("destination_page_index")) for link in resolved}
+        self.assertEqual(resolved_by_text["Run Comparison - SN-001"], 3)
+        self.assertEqual(resolved_by_text["Plot Metrics Charts"], 5)
+        self.assertEqual(resolved_by_text["Metric Chart: Pressure"], 5)
+        self.assertEqual(resolved_by_text["Plot Curves Charts"], 6)
+        self.assertEqual(resolved_by_text["Performance Equations"], 9)
+        self.assertEqual(resolved_by_text["Eval / Pass-Fail Curves"], 7)
+        self.assertEqual(resolved_by_text["Summary"], 11)
+
+    def test_apply_pdf_navigation_links_intro_toc_rows(self) -> None:
+        fitz = __import__("fitz")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pdf_path = Path(tmp_dir) / "intro_toc_links.pdf"
+            doc = fitz.open()
+            intro_page = doc.new_page()
+            intro_page.insert_text((72, 96), "Run Comparison - SN-001")
+            intro_page.insert_text((72, 126), "Plot Metrics Charts")
+            intro_page.insert_text((72, 156), "Plot Curves Charts")
+            intro_page.insert_text((72, 186), "Performance Equations")
+            intro_page.insert_text((72, 216), "Eval / Pass-Fail Curves")
+            intro_page.insert_text((72, 246), "Summary")
+            for _idx in range(6):
+                doc.new_page()
+            doc.save(str(pdf_path))
+            doc.close()
+
+            tar._tar_apply_pdf_navigation(
+                pdf_path,
+                plot_navigation=[],
+                intro_toc_links=[
+                    {"link_text": "Run Comparison - SN-001", "destination_page_index": 1},
+                    {"link_text": "Plot Metrics Charts", "destination_page_index": 2},
+                    {"link_text": "Plot Curves Charts", "destination_page_index": 3},
+                    {"link_text": "Performance Equations", "destination_page_index": 4},
+                    {"link_text": "Eval / Pass-Fail Curves", "destination_page_index": 5},
+                    {"link_text": "Summary", "destination_page_index": 6},
+                ],
+                intro_page_count=1,
+            )
+
+            result = fitz.open(str(pdf_path))
+            try:
+                links = sorted(result.load_page(0).get_links(), key=lambda link: float(link.get("from").y0))
+                self.assertEqual([link.get("page") for link in links], [1, 2, 3, 4, 5, 6])
+            finally:
+                result.close()
+
     def test_apply_pdf_navigation_uses_occurrence_order_for_repeated_comparison_labels(self) -> None:
         fitz = __import__("fitz")
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3698,8 +3793,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=0)
 
         self.assertEqual(len(links), 2)
-        self.assertEqual({str(link.get("link_label")) for link in links}, {"Metric Chart", "Plot Curves"})
-        self.assertTrue(all(int(link.get("destination_page_index")) == 8 for link in links))
+        by_label = {str(link.get("link_label")): int(link.get("destination_page_index")) for link in links}
+        self.assertEqual(by_label["Metric Chart"], 3)
+        self.assertEqual(by_label["Plot Curves"], 8)
 
     def test_build_comparison_chart_links_routes_requires_eval_rows_to_watch_nonpass_curves(self) -> None:
         ctx = {
@@ -3764,8 +3860,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=0)
 
         self.assertEqual(len(links), 2)
-        self.assertEqual({str(link.get("link_label")) for link in links}, {"Metric Chart", "Plot Curves"})
-        self.assertTrue(all(int(link.get("destination_page_index")) == 8 for link in links))
+        by_label = {str(link.get("link_label")): int(link.get("destination_page_index")) for link in links}
+        self.assertEqual(by_label["Metric Chart"], 3)
+        self.assertEqual(by_label["Plot Curves"], 8)
 
     def test_build_comparison_chart_links_falls_back_to_exact_condition_curves_when_watch_page_missing(self) -> None:
         ctx = {
@@ -3822,8 +3919,90 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=0)
 
         self.assertEqual(len(links), 2)
-        self.assertEqual({str(link.get("link_label")) for link in links}, {"Metric Chart", "Plot Curves"})
-        self.assertTrue(all(int(link.get("destination_page_index")) == 6 for link in links))
+        by_label = {str(link.get("link_label")): int(link.get("destination_page_index")) for link in links}
+        self.assertEqual(by_label["Metric Chart"], 3)
+        self.assertEqual(by_label["Plot Curves"], 6)
+
+    def test_build_comparison_chart_links_routes_pass_rows_to_run_metric_and_curve_pages(self) -> None:
+        ctx = {
+            "plot_navigation": tar._tar_build_plot_navigation(
+                [
+                    {
+                        "section": "run_condition_plot_metrics",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "stat": "mean",
+                        "page_number": 4,
+                    },
+                    {
+                        "section": "run_condition_curve_overlays",
+                        "pair_id": "pair-1",
+                        "param": "Pressure",
+                        "x_name": "Time",
+                        "page_number": 5,
+                    },
+                ]
+            ),
+            "comparison_page_specs": [
+                {
+                    "report_page_index": 1,
+                    "param_keys": ["Pressure"],
+                    "param_names": ["Pressure"],
+                    "blocks": [
+                        {
+                            "rows_by_parameter": {
+                                "Pressure": {
+                                    "pair_id": "pair-1",
+                                    "serial": "SN-001",
+                                    "run_condition": "Condition A",
+                                    "sequence_text": "Seq A",
+                                    "parameter": "Pressure",
+                                    "official_grade": "PASS",
+                                }
+                            }
+                        }
+                    ],
+                }
+            ],
+        }
+
+        links = tar._tar_build_comparison_chart_links(ctx, comparison_page_index_offset=0)
+
+        self.assertEqual(len(links), 2)
+        by_label = {str(link.get("link_label")): int(link.get("destination_page_index")) for link in links}
+        self.assertEqual(by_label["Metric Chart"], 3)
+        self.assertEqual(by_label["Plot Curves"], 4)
+
+    def test_build_comparison_page_metric_value_blanks_missing_metric_link_but_keeps_curve_link(self) -> None:
+        chart_destinations = {
+            "metric_by_pair_id": {},
+            "curve_by_pair_id": {"pair-1": 4},
+            "watch_curve_by_pair_id": {},
+            "regrade_curve_by_cohort_id": {},
+        }
+        row = {
+            "pair_id": "pair-1",
+            "serial": "SN-001",
+            "run_condition": "Condition A",
+            "sequence_text": "Seq A",
+            "parameter": "Pressure",
+            "official_grade": "PASS",
+        }
+
+        metric_value = tar._tar_comparison_page_metric_value(
+            row,
+            "Metric Chart",
+            chart_destinations=chart_destinations,
+        )
+        curve_value = tar._tar_comparison_page_metric_value(
+            row,
+            "Plot Curves",
+            chart_destinations=chart_destinations,
+        )
+
+        self.assertEqual(metric_value, "")
+        self.assertEqual(curve_value, "Plot Curves")
 
     def test_apply_pdf_navigation_adds_backlink_to_first_comparison_page(self) -> None:
         fitz = __import__("fitz")
@@ -4133,10 +4312,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "SN" and _table_text(item)[0][1] == "Run Condition"
         )
         exception_table = story[exception_table_idx]
-        serial_break_idx = next(
+        page_break_indexes = [idx for idx, item in enumerate(story) if isinstance(item, _FakePageBreak)]
+        serial_break_idx = page_break_indexes[0]
+        toc_break_idx = page_break_indexes[1]
+        toc_heading_idx = next(
             idx
             for idx, item in enumerate(story)
-            if isinstance(item, _FakePageBreak)
+            if isinstance(item, _FakeParagraph) and item.text == "Table of Contents"
+        )
+        toc_table = next(
+            item
+            for item in story
+            if isinstance(item, _FakeTable) and any(row[0] == "Plot Metrics Charts" for row in _table_text(item))
         )
         self.assertFalse(
             any(
@@ -4148,9 +4335,12 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertLess(grading_idx, serial_break_idx)
         self.assertLess(serial_break_idx, serial_table_idx)
         self.assertLess(serial_table_idx, exception_table_idx)
+        self.assertLess(exception_table_idx, toc_break_idx)
+        self.assertLess(toc_break_idx, toc_heading_idx)
         self.assertLess(exec_idx, scope_idx)
         self.assertIsInstance(serial_table, _FakeTable)
         self.assertIsInstance(exception_table, _FakeTable)
+        self.assertEqual(_table_text(toc_table)[0][0], "Run Comparison - SN-001")
         self.assertEqual(_table_text(serial_table)[1][1], "1")
         self.assertAlmostEqual(sum(exception_table.colWidths or []), 6.9 * 72.0)
         self.assertAlmostEqual((exception_table.colWidths or [])[0], (serial_table.colWidths or [])[0])
@@ -4189,6 +4379,152 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         scope_rows = {row[0]: row[1] for row in _table_text(scope_table)[1:]}
         self.assertEqual(scope_rows["Serial disposition"], "CERTIFIED 1 | WATCH 0 | REQUIRES EVAL 0")
         self.assertEqual(scope_rows["Graded items"], "PASS 0 | WATCH 0 | REQUIRES EVAL 1")
+
+    def test_build_intro_story_adds_curated_table_of_contents_after_eval_items(self) -> None:
+        plot_navigation = tar._tar_build_plot_navigation(
+            [
+                {
+                    "section": "run_condition_plot_metrics",
+                    "param": "Pressure",
+                    "x_name": "Time",
+                    "stat": "mean",
+                    "run_condition_label": "Condition A",
+                    "page_number": 5,
+                },
+                {
+                    "section": "run_condition_curve_overlays",
+                    "param": "Pressure",
+                    "x_name": "Time",
+                    "run_condition_label": "Condition A",
+                    "page_number": 6,
+                },
+                {
+                    "section": "regrade_pass_plot_metrics",
+                    "param": "Pressure",
+                    "x_name": "Time",
+                    "stat": "mean",
+                    "run_condition_label": "Condition A",
+                    "page_number": 7,
+                },
+                {
+                    "section": "performance_plots",
+                    "name": "ATP Fit",
+                    "x": "Bus Voltage",
+                    "y": "Flow",
+                    "stat": "mean",
+                    "page_number": 8,
+                },
+                {
+                    "section": "watch_nonpass_curves",
+                    "pair_id": "pair-1",
+                    "param": "Pressure",
+                    "page_number": 9,
+                },
+            ]
+        )
+        ctx = {
+            "print_ctx": tar.PrintContext(
+                printed_at="2026-04-12 09:00 MDT",
+                printed_timezone="MDT",
+                report_title="EIDAT Test Trend Data Analyze Auto Report",
+                report_subtitle="Certification",
+            ),
+            "pair_specs": [{"pair_id": "pair-1", "param": "Pressure", "selection_fields": {"mode": "condition", "display_text": "Condition A"}}],
+            "options": {},
+            "overall_by_sn": {"SN-001": "WATCH"},
+            "nonpass_findings": [],
+            "pair_by_id": {},
+            "hi": ["SN-001"],
+            "params": ["Pressure"],
+            "metric_stats": ["mean"],
+            "include_metrics": False,
+            "meta_note": "",
+            "change_summary": "",
+            "initial_overall_by_sn": {"SN-001": "PASS"},
+            "final_overall_by_sn": {"SN-001": "WATCH"},
+            "comparison_rows": [
+                {
+                    "pair_id": "pair-1",
+                    "run_condition": "Condition A",
+                    "serial": "SN-001",
+                    "sequence_text": "Sequence A",
+                    "parameter": "Pressure",
+                    "units": "psi",
+                    "initial_grade": "PASS",
+                    "final_grade": "FAIL",
+                    "regrade_applied": False,
+                }
+            ],
+            "comparison_page_specs": [
+                {"serial": "SN-001", "report_page_index": 1},
+                {"serial": "SN-001", "report_page_index": 2, "continued": True},
+            ],
+            "meta_by_sn": {"SN-001": {}},
+            "watch_pair_ids": ["pair-1"],
+            "runs": ["Run A"],
+            "all_serials": ["SN-001"],
+            "plot_navigation": plot_navigation,
+            "performance_models": [
+                {
+                    "name": "Run Fit",
+                    "x": {"column": "Pressure"},
+                    "y": {"column": "Flow"},
+                    "stat": "mean",
+                    "master": {"equation": "y = 2*x + 1", "rmse": 0.125},
+                    "highlighted": {},
+                }
+            ],
+            "equation_cards": [],
+            "quick_summary": {
+                "lines": [],
+                "initial_suppression_voltage": "All",
+                "final_suppression_voltage": "5",
+                "initial_valve_voltage": "All",
+                "final_valve_voltage": "28",
+                "p8_suppression_voltage": "5",
+                "p8_valve_voltage": "28",
+            },
+        }
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            story = tar._tar_build_intro_story(ctx)
+
+        toc_table = next(
+            item
+            for item in story
+            if isinstance(item, _FakeTable) and any(row[0] == "Plot Metrics Charts" for row in _table_text(item))
+        )
+        toc_rows = _table_text(toc_table)
+        self.assertEqual(toc_rows[0], ["Run Comparison - SN-001", ""])
+        self.assertIn(["Plot Metrics Charts", tar._TAR_INTRO_TOC_METRICS_DESC], toc_rows)
+        self.assertIn(["Plot Curves Charts", tar._TAR_INTRO_TOC_CURVES_DESC], toc_rows)
+        self.assertTrue(any(row[0].startswith("Metric Chart: Condition A") for row in toc_rows))
+        self.assertTrue(any(row[0].startswith("Curve Chart: Condition A") for row in toc_rows))
+        self.assertIn(["Performance Equations", ""], toc_rows)
+        self.assertIn(["Eval / Pass-Fail Curves", ""], toc_rows)
+        self.assertIn(["Summary", ""], toc_rows)
+        self.assertFalse(any("Final Exact-Condition" in row[0] for row in toc_rows))
+        self.assertFalse(any("Performance Plot" in row[0] for row in toc_rows))
+
+    def test_intro_toc_table_spec_omits_empty_sections(self) -> None:
+        rows, links = tar._tar_intro_toc_table_spec(
+            {
+                "comparison_rows": [],
+                "comparison_page_specs": [],
+                "plot_navigation": [],
+                "performance_models": [],
+                "equation_cards": [],
+            }
+        )
+
+        self.assertEqual(rows, [["Summary", ""]])
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["link_text"], "Summary")
+        self.assertEqual(links[0]["target"]["kind"], "closing_summary")
 
     def test_build_intro_story_exception_table_colors_and_links_grade_cells(self) -> None:
         plot_navigation = tar._tar_build_plot_navigation(
