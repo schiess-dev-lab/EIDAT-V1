@@ -9697,6 +9697,150 @@ def _tar_exec_grading_table_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
     ]
 
 
+def _tar_exec_prepass_settings(ctx: Mapping[str, Any] | None) -> dict[str, float | int]:
+    default_cfg = default_trend_auto_report_config()
+    default_prepass = (
+        (default_cfg.get("grading") or {}).get("prepass")
+        if isinstance(default_cfg.get("grading"), Mapping)
+        else {}
+    )
+    report_cfg = (ctx or {}).get("report_cfg") if isinstance(ctx, Mapping) else {}
+    grading_cfg = (report_cfg or {}).get("grading") if isinstance(report_cfg, Mapping) else {}
+    prepass_cfg = (grading_cfg or {}).get("prepass") if isinstance(grading_cfg, Mapping) else {}
+    noise_score_max = _safe_float((prepass_cfg or {}).get("noise_score_max"))
+    if noise_score_max is None:
+        noise_score_max = _safe_float((default_prepass or {}).get("noise_score_max"))
+    if noise_score_max is None:
+        noise_score_max = 1.25
+    percent_delta_guard_max = _safe_float((prepass_cfg or {}).get("percent_delta_guard_max"))
+    if percent_delta_guard_max is None:
+        percent_delta_guard_max = _safe_float((default_prepass or {}).get("percent_delta_guard_max"))
+    if percent_delta_guard_max is None:
+        percent_delta_guard_max = 8.0
+    sparse_percent_delta_max = _safe_float((prepass_cfg or {}).get("sparse_percent_delta_max"))
+    if sparse_percent_delta_max is None:
+        sparse_percent_delta_max = _safe_float((default_prepass or {}).get("sparse_percent_delta_max"))
+    if sparse_percent_delta_max is None:
+        sparse_percent_delta_max = 4.0
+    try:
+        sparse_min_serials_per_program = int((prepass_cfg or {}).get("sparse_min_serials_per_program") or 0)
+    except Exception:
+        sparse_min_serials_per_program = 0
+    if sparse_min_serials_per_program <= 0:
+        try:
+            sparse_min_serials_per_program = int((default_prepass or {}).get("sparse_min_serials_per_program") or 0)
+        except Exception:
+            sparse_min_serials_per_program = 0
+    if sparse_min_serials_per_program <= 0:
+        sparse_min_serials_per_program = 2
+    return {
+        "noise_score_max": float(noise_score_max),
+        "percent_delta_guard_max": float(percent_delta_guard_max),
+        "sparse_percent_delta_max": float(sparse_percent_delta_max),
+        "sparse_min_serials_per_program": int(sparse_min_serials_per_program),
+    }
+
+
+def _tar_serial_count_enumeration_text(max_serial_count: int) -> str:
+    upper = max(0, int(max_serial_count))
+    if upper <= 0:
+        return "0 serials"
+    if upper == 1:
+        return "0 or 1 serials"
+    values = [str(idx) for idx in range(0, upper + 1)]
+    return ", ".join(values[:-1]) + f", or {values[-1]} serials"
+
+
+def _tar_exec_process_flow_lines(ctx: Mapping[str, Any]) -> list[str]:
+    prepass = _tar_exec_prepass_settings(ctx)
+    noise_score_text = _fmt_num(prepass["noise_score_max"], sig=4)
+    mean_delta_guard_text = f"{float(prepass['percent_delta_guard_max']):.1f}%"
+    sparse_percent_delta_text = f"{float(prepass['sparse_percent_delta_max']):.1f}%"
+    sparse_serial_text = _tar_serial_count_enumeration_text(int(prepass["sparse_min_serials_per_program"]) - 1)
+    return [
+        (
+            "1. Show the measured evidence: The opening metric and curve sections show the measured data for the "
+            "selected run scope before the report asks the reader to interpret scores."
+        ),
+        (
+            "2. Build the comparison pool: Data is grouped by base run condition, parameter, and X axis. The report "
+            "builds a program-level comparison between each candidate program and the certifying/reference program. "
+            f"A program is admitted only when noise_score <= {noise_score_text} and mean_delta_pct <= {mean_delta_guard_text}. "
+            f"Sparse means the reference program contributes only {sparse_serial_text} to the current cohort, or the "
+            f"candidate program contributes only {sparse_serial_text} to that same cohort. When that happens, the report "
+            f"does not use the noise-based gate and instead falls back to mean_delta_pct <= {sparse_percent_delta_text}. "
+            "The admitted programs become the comparison pool used for grading."
+        ),
+        (
+            "3. Score each certification serial: The report removes the target serial from its own comparison pool and "
+            "compares that serial to the target-excluded baseline. Deviation Score measures whole-curve agreement, while "
+            "Max Band captures the worst local excursion."
+        ),
+        (
+            "4. Surface the results: The summary tables identify which serials, parameters, and run conditions need "
+            "attention first, while the later sections preserve the trace-level evidence."
+        ),
+    ]
+
+
+def _tar_exec_deviation_score_summary_text() -> str:
+    return (
+        "Deviation Score is a whole-curve agreement score rather than a single-point difference. The report compares "
+        "the certification serial to the target-excluded baseline point by point, normalizes those differences against "
+        "the allowed comparison band, and then collapses the full-curve behavior into one score. Lower Deviation Scores "
+        "indicate closer agreement. See end of report for technical logic and formulas."
+    )
+
+
+def _tar_technical_appendix_cards(ctx: Mapping[str, Any]) -> list[tuple[str, list[str]]]:
+    prepass = _tar_exec_prepass_settings(ctx)
+    noise_score_text = _fmt_num(prepass["noise_score_max"], sig=4)
+    mean_delta_guard_text = f"{float(prepass['percent_delta_guard_max']):.1f}%"
+    sparse_percent_delta_text = f"{float(prepass['sparse_percent_delta_max']):.1f}%"
+    sparse_serial_text = _tar_serial_count_enumeration_text(int(prepass["sparse_min_serials_per_program"]) - 1)
+    return [
+        (
+            "Program-Level Pre-Pass Compatibility",
+            [
+                "Data is first grouped by base run condition, parameter, and X axis.",
+                "program_center_trace = mean(trace_i for the serials belonging to one program)",
+                "program_noise = median(RMS(trace_i - program_center_trace))",
+                "between_rms = RMS(candidate_center_trace - reference_center_trace)",
+                "mean_delta_pct = 100 * abs(candidate_mean - reference_mean) / max(abs(candidate_mean), abs(reference_mean), 1e-12)",
+                "pooled_noise = sqrt((reference_noise^2 + candidate_noise^2) / 2)",
+                "noise_floor = baseline_scale * noise_floor_pct / 100",
+                "effective_noise = max(pooled_noise, noise_floor)",
+                "noise_score = between_rms / effective_noise",
+                f"Admit the candidate program when noise_score <= {noise_score_text} and mean_delta_pct <= {mean_delta_guard_text}.",
+                f"Sparse means the reference program contributes only {sparse_serial_text} to the current cohort, or the candidate program contributes only {sparse_serial_text} to that cohort.",
+                f"When sparse, skip the noise-based gate and instead require mean_delta_pct <= {sparse_percent_delta_text}.",
+                "The reference/certifying program is always retained in the pool.",
+            ],
+        ),
+        (
+            "Deviation Score Technical Logic",
+            [
+                "official_baseline(x) = the comparison-pool baseline rebuilt after removing the target serial from its own pool",
+                "effective_sigma_band(x) = the larger of the local comparison band and the minimum band floor used by the report",
+                "local_sigma_multiple(x) = |actual(x) - baseline(x)| / effective_sigma_band(x)",
+                "RMS_component = RMS(local_sigma_multiple(x))",
+                "P90_component = P90(local_sigma_multiple(x))",
+                "Deviation Score = max(RMS_component, P90_component)",
+                "Max Band = max(local_sigma_multiple(x))",
+                "Lower Deviation Scores indicate closer whole-curve agreement.",
+                "PASS if Deviation Score <= 1 and Max Band does not exceed 3 sigma | WATCH if 1 < Deviation Score <= 3 | Requires Eval if Deviation Score > 3 or Max Band exceeds 3 sigma",
+            ],
+        ),
+        (
+            "Current Active Report Behavior",
+            [
+                "The current active report grades from the initial admitted-program comparison pool after target exclusion.",
+                "Exact-condition regrade logic exists in code, but it is not the active official grading path in the current implementation.",
+            ],
+        ),
+    ]
+
+
 def _tar_exec_serial_table_rows(
     ctx: Mapping[str, Any],
     comparison_rows_by_serial: Mapping[str, list[Mapping[str, Any]]] | None,
@@ -14559,10 +14703,25 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
     story.append(
+        _portrait_card(
+            "How This Report Works",
+            _tar_exec_process_flow_lines(ctx),
+            styles=styles,
+            rl=rl,
+        )
+    )
+    story.append(Spacer(1, 0.08 * inch))
+    story.append(
         _portrait_paragraph(
             "The official graded mean is the comparison-pool baseline after the target serial is removed from its own pool. "
-            "Each certification serial is then compared to that baseline in two ways: Deviation Score measures overall curve agreement across the full trace, "
-            "while Max Band reports the worst single-point excursion as a local sigma bucket.",
+            "The current active report grades each certification serial against that admitted comparison pool and then surfaces the scored items that matter first.",
+            styles["body"],
+            rl,
+        )
+    )
+    story.append(
+        _portrait_paragraph(
+            _tar_exec_deviation_score_summary_text(),
             styles["body"],
             rl,
         )
@@ -14571,8 +14730,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         _portrait_paragraph(
             f"A row passes when the Deviation Score is at or below {_fmt_num(z_pass, sig=4)} and Max Band does not exceed 3 sigma. "
             f"It becomes WATCH when the Deviation Score is over {_fmt_num(z_pass, sig=4)} but not over {_fmt_num(z_watch, sig=4)}. "
-            f"It requires eval when the Deviation Score exceeds {_fmt_num(z_watch, sig=4)} or when Max Band exceeds 3 sigma. "
-            "If an exact-condition regrade exists, that regrade replaces the initial selected-pool result as the official score, Max Band, and grade shown here.",
+            f"It requires eval when the Deviation Score exceeds {_fmt_num(z_watch, sig=4)} or when Max Band exceeds 3 sigma.",
             styles["body"],
             rl,
         )
@@ -16047,6 +16205,19 @@ def _tar_build_closing_story(ctx: Mapping[str, Any], *, counts: Mapping[str, int
             rl=rl,
         )
     )
+    story.append(Spacer(1, 0.14 * inch))
+    story.append(_portrait_paragraph("Technical Details", styles["section"], rl))
+    story.append(
+        _portrait_paragraph(
+            "This appendix records the active code-level logic for the comparison gate and Deviation Score. "
+            "The executive summary keeps the same ideas in plain language; this section is here for readers who want the technical details.",
+            styles["body"],
+            rl,
+        )
+    )
+    for title, body_lines in _tar_technical_appendix_cards(ctx):
+        story.append(_portrait_card(title, body_lines, styles=styles, rl=rl))
+        story.append(Spacer(1, 0.10 * inch))
     return story
 
 

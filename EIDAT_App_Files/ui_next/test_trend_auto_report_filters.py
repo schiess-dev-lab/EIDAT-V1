@@ -4312,6 +4312,12 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for idx, item in enumerate(story)
             if isinstance(item, _FakeParagraph) and item.text == "Executive Summary"
         )
+        how_it_works_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "How This Report Works"
+        )
+        how_it_works_card = story[how_it_works_idx]
         scope_idx = next(
             idx
             for idx, item in enumerate(story)
@@ -4353,6 +4359,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 for item in story
             )
         )
+        self.assertLess(exec_idx, how_it_works_idx)
+        self.assertLess(how_it_works_idx, scope_idx)
         self.assertLess(scope_idx, grading_idx)
         self.assertLess(grading_idx, serial_break_idx)
         self.assertLess(serial_break_idx, serial_table_idx)
@@ -4362,12 +4370,26 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertLess(exec_idx, scope_idx)
         self.assertIsInstance(serial_table, _FakeTable)
         self.assertIsInstance(exception_table, _FakeTable)
+        self.assertIsInstance(how_it_works_card, _FakeTable)
         self.assertEqual(_table_text(toc_table)[0][0], "Run Comparison - SN-001")
         self.assertEqual(_table_text(serial_table)[1][1], "1")
         self.assertAlmostEqual(sum(exception_table.colWidths or []), 6.9 * 72.0)
         self.assertAlmostEqual((exception_table.colWidths or [])[0], (serial_table.colWidths or [])[0])
         self.assertEqual(_table_text(exception_table)[0][-1], "Grading")
         self.assertEqual(len(_table_text(exception_table)[0]), 8)
+        how_it_works_text = _table_text(how_it_works_card)[1][0]
+        self.assertIn("noise_score &lt;= 1.25", how_it_works_text)
+        self.assertIn("mean_delta_pct &lt;= 8.0%", how_it_works_text)
+        self.assertIn("0 or 1 serials", how_it_works_text)
+        self.assertIn("mean_delta_pct &lt;= 4.0%", how_it_works_text)
+        self.assertIn("The admitted programs become the comparison pool used for grading.", how_it_works_text)
+        body_text = "\n".join(
+            item.text
+            for item in story
+            if isinstance(item, _FakeParagraph)
+        )
+        self.assertIn("whole-curve agreement score rather than a single-point difference", body_text)
+        self.assertIn("See end of report for technical logic and formulas.", body_text)
         exception_style_cmds = [
             command
             for style in exception_table.table_styles
@@ -4723,6 +4745,93 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         self.assertEqual(
             final_row[2],
             "PASS if Deviation Score <= 1 and Max Band does not exceed 3 sigma | WATCH if 1 < Deviation Score <= 3 | Requires Eval if Deviation Score > 3 or Max Band exceeds 3 sigma",
+        )
+
+    def test_build_closing_story_adds_technical_details_appendix(self) -> None:
+        ctx = {
+            "print_ctx": tar.PrintContext(
+                printed_at="2026-04-12 09:00 MDT",
+                printed_timezone="MDT",
+                report_title="EIDAT Test Trend Data Analyze Auto Report",
+                report_subtitle="Certification",
+            ),
+            "overall_by_sn": {
+                "SN-001": "CERTIFIED",
+                "SN-002": "WATCH",
+                "SN-003": "FAILED",
+            },
+            "hi": ["SN-001", "SN-002"],
+            "meta_by_sn": {
+                "SN-001": {
+                    "program_title": "Program A",
+                    "similarity_group": "SG-1",
+                    "acceptance_test_plan_number": "ATP-1",
+                },
+                "SN-002": {
+                    "program_title": "Program A",
+                    "similarity_group": "SG-1",
+                    "acceptance_test_plan_number": "ATP-1",
+                },
+            },
+            "options": {"run_selection_labels": ["Condition A"]},
+            "report_cfg": tar.default_trend_auto_report_config(),
+        }
+        counts = {
+            "run_condition_metric_plot_count": 1,
+            "run_condition_curve_plot_count": 2,
+            "regrade_metric_plot_count": 0,
+            "regrade_curve_plot_count": 0,
+            "equation_page_count": 1,
+            "performance_plot_count": 1,
+            "watch_plot_count": 1,
+        }
+
+        with mock.patch.object(tar, "_reportlab_imports", return_value=_fake_reportlab()), mock.patch.object(
+            tar,
+            "_build_portrait_styles",
+            return_value=_fake_styles(),
+        ):
+            story = tar._tar_build_closing_story(ctx, counts=counts)
+
+        headings = [item.text for item in story if isinstance(item, _FakeParagraph)]
+        self.assertIn("Closing Summary", headings)
+        self.assertIn("Technical Details", headings)
+        technical_heading_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeParagraph) and item.text == "Technical Details"
+        )
+        family_summary_idx = next(
+            idx
+            for idx, item in enumerate(story)
+            if isinstance(item, _FakeTable) and _table_text(item)[0][0] == "Family Data Summary"
+        )
+        self.assertLess(family_summary_idx, technical_heading_idx)
+
+        cards = {
+            _table_text(item)[0][0]: _table_text(item)[1][0]
+            for item in story
+            if isinstance(item, _FakeTable) and len(_table_text(item)) >= 2
+        }
+        self.assertIn("Program-Level Pre-Pass Compatibility", cards)
+        self.assertIn("Deviation Score Technical Logic", cards)
+        self.assertIn("Current Active Report Behavior", cards)
+        self.assertIn("noise_score &lt;= 1.25", cards["Program-Level Pre-Pass Compatibility"])
+        self.assertIn("mean_delta_pct &lt;= 8.0%", cards["Program-Level Pre-Pass Compatibility"])
+        self.assertIn("0 or 1 serials", cards["Program-Level Pre-Pass Compatibility"])
+        self.assertIn("mean_delta_pct &lt;= 4.0%", cards["Program-Level Pre-Pass Compatibility"])
+        self.assertIn(
+            "local_sigma_multiple(x) = |actual(x) - baseline(x)| / effective_sigma_band(x)",
+            cards["Deviation Score Technical Logic"],
+        )
+        self.assertIn(
+            "Deviation Score = max(RMS_component, P90_component)",
+            cards["Deviation Score Technical Logic"],
+        )
+        self.assertIn("Max Band = max(local_sigma_multiple(x))", cards["Deviation Score Technical Logic"])
+        self.assertIn(
+            "Exact-condition regrade logic exists in code, but it is not the active official grading path in the current implementation.",
+            cards["Current Active Report Behavior"],
         )
 
     def test_build_plot_toc_story_uses_side_by_side_columns_without_navigator(self) -> None:
