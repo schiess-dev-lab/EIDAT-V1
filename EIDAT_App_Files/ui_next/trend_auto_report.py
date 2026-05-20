@@ -14273,8 +14273,9 @@ def _tar_prepare_performance_models(ctx: dict[str, Any]) -> None:
     ctx["equation_cards"] = equation_cards
 
 
-_TAR_INTRO_TOC_METRICS_DESC = "Metrics charts show performance mean across all serial numbers for all programs"
+_TAR_INTRO_TOC_METRICS_DESC = "Mean Performance parameters plotted against serial numbers for all programs"
 _TAR_INTRO_TOC_CURVES_DESC = "Curves charts show the parameter versus time"
+_TAR_INTRO_TOC_CHILD_LEFT_PADDING = 18
 
 
 def _tar_filter_plot_navigation_entries(
@@ -14292,36 +14293,38 @@ def _tar_intro_toc_metric_entry_label(entry: Mapping[str, Any] | None) -> str:
     spec = dict(entry or {})
     condition_label = str(spec.get("run_condition_label") or _tar_plot_toc_condition_label(spec)).strip()
     param_name = str(spec.get("param_display") or spec.get("param") or "").strip()
-    x_name = str(spec.get("x_name") or "").strip()
-    metric_stat = str(spec.get("stat") or "").strip()
     label = " | ".join(
         value
         for value in [
             f"Metric Chart: {condition_label}" if condition_label else "Metric Chart",
             f"Parameter: {param_name}" if param_name else "",
-            f"X: {x_name}" if x_name else "",
-            f"Stat: {metric_stat}" if metric_stat else "",
         ]
         if value
     )
-    return textwrap.shorten(label, width=108, placeholder="...")
+    return textwrap.shorten(label, width=128, placeholder="...")
 
 
 def _tar_intro_toc_curve_entry_label(entry: Mapping[str, Any] | None) -> str:
     spec = dict(entry or {})
     condition_label = str(spec.get("run_condition_label") or _tar_plot_toc_condition_label(spec)).strip()
     param_name = str(spec.get("param_display") or spec.get("param") or "").strip()
-    x_name = str(spec.get("x_name") or "").strip()
     label = " | ".join(
         value
         for value in [
             f"Curve Chart: {condition_label}" if condition_label else "Curve Chart",
             f"Parameter: {param_name}" if param_name else "",
-            f"X: {x_name}" if x_name else "",
         ]
         if value
     )
-    return textwrap.shorten(label, width=108, placeholder="...")
+    return textwrap.shorten(label, width=128, placeholder="...")
+
+
+def _tar_intro_toc_parent_label(title: str, description: str = "") -> str:
+    title_text = str(title or "").strip()
+    description_text = str(description or "").strip()
+    if title_text and description_text:
+        return f"{title_text} - {description_text}"
+    return title_text or description_text
 
 
 def _tar_has_equation_section(ctx: Mapping[str, Any]) -> bool:
@@ -14351,7 +14354,7 @@ def _tar_intro_toc_table_spec(ctx: Mapping[str, Any]) -> tuple[list[list[str]], 
             continue
         seen_serials.add(serial)
         label = f"Run Comparison - {_tar_display_serial(ctx, serial) or serial}"
-        rows.append([label, ""])
+        rows.append([label])
         links.append(
             {
                 "link_text": label,
@@ -14365,7 +14368,7 @@ def _tar_intro_toc_table_spec(ctx: Mapping[str, Any]) -> tuple[list[list[str]], 
                 continue
             seen_serials.add(serial)
             label = f"Run Comparison - {_tar_display_serial(ctx, serial) or serial}"
-            rows.append([label, ""])
+            rows.append([label])
             links.append(
                 {
                     "link_text": label,
@@ -14374,16 +14377,17 @@ def _tar_intro_toc_table_spec(ctx: Mapping[str, Any]) -> tuple[list[list[str]], 
             )
 
     if metric_entries:
-        rows.append(["Plot Metrics Charts", _TAR_INTRO_TOC_METRICS_DESC])
+        label = _tar_intro_toc_parent_label("Plot Metrics Charts", _TAR_INTRO_TOC_METRICS_DESC)
+        rows.append([label])
         links.append(
             {
-                "link_text": "Plot Metrics Charts",
+                "link_text": label,
                 "target": {"kind": "plot_section", "section_key": "run_condition_plot_metrics"},
             }
         )
         for entry in metric_entries:
             label = _tar_intro_toc_metric_entry_label(entry)
-            rows.append([label, ""])
+            rows.append([label])
             links.append(
                 {
                     "link_text": label,
@@ -14396,16 +14400,17 @@ def _tar_intro_toc_table_spec(ctx: Mapping[str, Any]) -> tuple[list[list[str]], 
             )
 
     if curve_entries:
-        rows.append(["Plot Curves Charts", _TAR_INTRO_TOC_CURVES_DESC])
+        label = _tar_intro_toc_parent_label("Plot Curves Charts", _TAR_INTRO_TOC_CURVES_DESC)
+        rows.append([label])
         links.append(
             {
-                "link_text": "Plot Curves Charts",
+                "link_text": label,
                 "target": {"kind": "plot_section", "section_key": "run_condition_curve_overlays"},
             }
         )
         for entry in curve_entries:
             label = _tar_intro_toc_curve_entry_label(entry)
-            rows.append([label, ""])
+            rows.append([label])
             links.append(
                 {
                     "link_text": label,
@@ -14418,11 +14423,11 @@ def _tar_intro_toc_table_spec(ctx: Mapping[str, Any]) -> tuple[list[list[str]], 
             )
 
     if _tar_has_equation_section(ctx):
-        rows.append(["Performance Equations", ""])
+        rows.append(["Performance Equations"])
         links.append({"link_text": "Performance Equations", "target": {"kind": "equations_start"}})
 
     if watch_entries:
-        rows.append(["Eval / Pass-Fail Curves", ""])
+        rows.append(["Eval / Pass-Fail Curves"])
         links.append(
             {
                 "link_text": "Eval / Pass-Fail Curves",
@@ -14430,7 +14435,7 @@ def _tar_intro_toc_table_spec(ctx: Mapping[str, Any]) -> tuple[list[list[str]], 
             }
         )
 
-    rows.append(["Summary", ""])
+    rows.append(["Summary"])
     links.append({"link_text": "Summary", "target": {"kind": "closing_summary"}})
     return rows, links
 
@@ -14642,15 +14647,21 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     intro_toc_rows, intro_toc_links = _tar_intro_toc_table_spec(ctx)
     ctx["intro_toc_links"] = list(intro_toc_links)
     if intro_toc_rows:
+        intro_toc_style_cmds = [
+            ("LEFTPADDING", (0, row_index), (0, row_index), _TAR_INTRO_TOC_CHILD_LEFT_PADDING)
+            for row_index, row in enumerate(intro_toc_rows)
+            if row and str(row[0] or "").startswith(("Metric Chart", "Curve Chart"))
+        ]
         story.append(
             _portrait_box_table(
                 intro_toc_rows,
-                col_widths=[2.35 * inch, 4.55 * inch],
+                col_widths=[6.9 * inch],
                 styles=styles,
                 rl=rl,
                 repeat_rows=0,
                 compact=True,
                 header_rows=0,
+                extra_style_commands=intro_toc_style_cmds,
                 cell_style_overrides={
                     (row_index, 0): styles.get("small_link") or styles["small"]
                     for row_index, _row in enumerate(intro_toc_rows)

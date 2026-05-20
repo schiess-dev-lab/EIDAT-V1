@@ -3412,9 +3412,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             ),
             "intro_toc_links": [
                 {"link_text": "Run Comparison - SN-001", "target": {"kind": "comparison_serial", "serial": "SN-001"}},
-                {"link_text": "Plot Metrics Charts", "target": {"kind": "plot_section", "section_key": "run_condition_plot_metrics"}},
-                {"link_text": "Metric Chart: Pressure", "target": {"kind": "plot_entry", "section_key": "run_condition_plot_metrics", "nav_index": 1}},
-                {"link_text": "Plot Curves Charts", "target": {"kind": "plot_section", "section_key": "run_condition_curve_overlays"}},
+                {
+                    "link_text": tar._tar_intro_toc_parent_label("Plot Metrics Charts", tar._TAR_INTRO_TOC_METRICS_DESC),
+                    "target": {"kind": "plot_section", "section_key": "run_condition_plot_metrics"},
+                },
+                {
+                    "link_text": "Metric Chart | Parameter: Pressure",
+                    "target": {"kind": "plot_entry", "section_key": "run_condition_plot_metrics", "nav_index": 1},
+                },
+                {
+                    "link_text": tar._tar_intro_toc_parent_label("Plot Curves Charts", tar._TAR_INTRO_TOC_CURVES_DESC),
+                    "target": {"kind": "plot_section", "section_key": "run_condition_curve_overlays"},
+                },
                 {"link_text": "Performance Equations", "target": {"kind": "equations_start"}},
                 {"link_text": "Eval / Pass-Fail Curves", "target": {"kind": "plot_section", "section_key": "watch_nonpass_curves"}},
                 {"link_text": "Summary", "target": {"kind": "closing_summary"}},
@@ -3429,11 +3438,18 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             equation_page_count=2,
         )
 
+        metric_entry_label = tar._tar_intro_toc_metric_entry_label(ctx["plot_navigation"][0])
         resolved_by_text = {str(link.get("link_text") or ""): int(link.get("destination_page_index")) for link in resolved}
         self.assertEqual(resolved_by_text["Run Comparison - SN-001"], 3)
-        self.assertEqual(resolved_by_text["Plot Metrics Charts"], 5)
-        self.assertEqual(resolved_by_text["Metric Chart: Pressure"], 5)
-        self.assertEqual(resolved_by_text["Plot Curves Charts"], 6)
+        self.assertEqual(
+            resolved_by_text[tar._tar_intro_toc_parent_label("Plot Metrics Charts", tar._TAR_INTRO_TOC_METRICS_DESC)],
+            5,
+        )
+        self.assertEqual(resolved_by_text[metric_entry_label], 5)
+        self.assertEqual(
+            resolved_by_text[tar._tar_intro_toc_parent_label("Plot Curves Charts", tar._TAR_INTRO_TOC_CURVES_DESC)],
+            6,
+        )
         self.assertEqual(resolved_by_text["Performance Equations"], 9)
         self.assertEqual(resolved_by_text["Eval / Pass-Fail Curves"], 7)
         self.assertEqual(resolved_by_text["Summary"], 11)
@@ -3445,8 +3461,8 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             doc = fitz.open()
             intro_page = doc.new_page()
             intro_page.insert_text((72, 96), "Run Comparison - SN-001")
-            intro_page.insert_text((72, 126), "Plot Metrics Charts")
-            intro_page.insert_text((72, 156), "Plot Curves Charts")
+            intro_page.insert_text((72, 126), tar._tar_intro_toc_parent_label("Plot Metrics Charts", tar._TAR_INTRO_TOC_METRICS_DESC))
+            intro_page.insert_text((72, 156), tar._tar_intro_toc_parent_label("Plot Curves Charts", tar._TAR_INTRO_TOC_CURVES_DESC))
             intro_page.insert_text((72, 186), "Performance Equations")
             intro_page.insert_text((72, 216), "Eval / Pass-Fail Curves")
             intro_page.insert_text((72, 246), "Summary")
@@ -3460,8 +3476,14 @@ class TestTrendAutoReportFilters(unittest.TestCase):
                 plot_navigation=[],
                 intro_toc_links=[
                     {"link_text": "Run Comparison - SN-001", "destination_page_index": 1},
-                    {"link_text": "Plot Metrics Charts", "destination_page_index": 2},
-                    {"link_text": "Plot Curves Charts", "destination_page_index": 3},
+                    {
+                        "link_text": tar._tar_intro_toc_parent_label("Plot Metrics Charts", tar._TAR_INTRO_TOC_METRICS_DESC),
+                        "destination_page_index": 2,
+                    },
+                    {
+                        "link_text": tar._tar_intro_toc_parent_label("Plot Curves Charts", tar._TAR_INTRO_TOC_CURVES_DESC),
+                        "destination_page_index": 3,
+                    },
                     {"link_text": "Performance Equations", "destination_page_index": 4},
                     {"link_text": "Eval / Pass-Fail Curves", "destination_page_index": 5},
                     {"link_text": "Summary", "destination_page_index": 6},
@@ -4323,7 +4345,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         toc_table = next(
             item
             for item in story
-            if isinstance(item, _FakeTable) and any(row[0] == "Plot Metrics Charts" for row in _table_text(item))
+            if isinstance(item, _FakeTable) and any("Plot Metrics Charts" in row[0] for row in _table_text(item))
         )
         self.assertFalse(
             any(
@@ -4493,20 +4515,32 @@ class TestTrendAutoReportFilters(unittest.TestCase):
         ):
             story = tar._tar_build_intro_story(ctx)
 
+        metric_entry_label = tar._tar_intro_toc_metric_entry_label(plot_navigation[0])
+        curve_entry_label = tar._tar_intro_toc_curve_entry_label(plot_navigation[1])
         toc_table = next(
             item
             for item in story
-            if isinstance(item, _FakeTable) and any(row[0] == "Plot Metrics Charts" for row in _table_text(item))
+            if isinstance(item, _FakeTable) and any("Plot Metrics Charts" in row[0] for row in _table_text(item))
         )
         toc_rows = _table_text(toc_table)
-        self.assertEqual(toc_rows[0], ["Run Comparison - SN-001", ""])
-        self.assertIn(["Plot Metrics Charts", tar._TAR_INTRO_TOC_METRICS_DESC], toc_rows)
-        self.assertIn(["Plot Curves Charts", tar._TAR_INTRO_TOC_CURVES_DESC], toc_rows)
-        self.assertTrue(any(row[0].startswith("Metric Chart: Condition A") for row in toc_rows))
-        self.assertTrue(any(row[0].startswith("Curve Chart: Condition A") for row in toc_rows))
-        self.assertIn(["Performance Equations", ""], toc_rows)
-        self.assertIn(["Eval / Pass-Fail Curves", ""], toc_rows)
-        self.assertIn(["Summary", ""], toc_rows)
+        self.assertEqual(toc_rows[0], ["Run Comparison - SN-001"])
+        self.assertIn([tar._tar_intro_toc_parent_label("Plot Metrics Charts", tar._TAR_INTRO_TOC_METRICS_DESC)], toc_rows)
+        self.assertIn([tar._tar_intro_toc_parent_label("Plot Curves Charts", tar._TAR_INTRO_TOC_CURVES_DESC)], toc_rows)
+        self.assertIn([metric_entry_label], toc_rows)
+        self.assertIn([curve_entry_label], toc_rows)
+        self.assertIn("Parameter: Pressure", metric_entry_label)
+        self.assertIn("Parameter: Pressure", curve_entry_label)
+        self.assertNotIn("Stat:", metric_entry_label)
+        self.assertNotIn("X:", metric_entry_label)
+        self.assertNotIn("X:", curve_entry_label)
+        style_commands = []
+        for table_style in toc_table.table_styles:
+            style_commands.extend(list(getattr(table_style, "commands", [])))
+        self.assertIn(("LEFTPADDING", (0, 2), (0, 2), tar._TAR_INTRO_TOC_CHILD_LEFT_PADDING), style_commands)
+        self.assertIn(("LEFTPADDING", (0, 4), (0, 4), tar._TAR_INTRO_TOC_CHILD_LEFT_PADDING), style_commands)
+        self.assertIn(["Performance Equations"], toc_rows)
+        self.assertIn(["Eval / Pass-Fail Curves"], toc_rows)
+        self.assertIn(["Summary"], toc_rows)
         self.assertFalse(any("Final Exact-Condition" in row[0] for row in toc_rows))
         self.assertFalse(any("Performance Plot" in row[0] for row in toc_rows))
 
@@ -4521,7 +4555,7 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             }
         )
 
-        self.assertEqual(rows, [["Summary", ""]])
+        self.assertEqual(rows, [["Summary"]])
         self.assertEqual(len(links), 1)
         self.assertEqual(links[0]["link_text"], "Summary")
         self.assertEqual(links[0]["target"]["kind"], "closing_summary")
