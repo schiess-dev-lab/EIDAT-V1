@@ -9769,6 +9769,7 @@ def _tar_exec_process_flow_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
     sparse_serial_text = _tar_serial_count_enumeration_text(int(prepass["sparse_min_serials_per_program"]) - 1)
     return [
         ["How This Report Works", "", "", ""],
+        ["Review Flow", "Raw evidence -> Analysis -> Score -> Watch / Non-PASS curves", "", ""],
         ["Part 1 - Show As-Tested Data", "", "Part 2 - Analyze, Score, and Surface Results", ""],
         [
             "Metric Sections",
@@ -9777,7 +9778,7 @@ def _tar_exec_process_flow_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             (
                 "Group by base run condition, parameter, and X axis.\n"
                 "- Compare candidate programs to the certifying/reference program.\n"
-                "- Admit compatible programs using the current gate."
+                "- Admit compatible programs using the Compatibility Gate."
             ),
         ],
         [
@@ -9787,38 +9788,45 @@ def _tar_exec_process_flow_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             (
                 f"- noise_score <= {noise_score_text}\n"
                 f"- mean_delta_pct <= {mean_delta_guard_text}\n"
-                f"- Sparse means the reference or candidate program contributes only {sparse_serial_text}.\n"
-                f"- Sparse fallback uses mean_delta_pct <= {sparse_percent_delta_text}."
-            ),
-        ],
-        [
-            "Reader Goal",
-            "Review what was measured before interpreting scored outcomes.",
-            "Score Certification Serials",
-            (
-                "- Remove the target serial from its own baseline.\n"
-                "- Compare to the target-excluded baseline.\n"
-                "- Calculate Deviation Score and Max Band."
-            ),
-        ],
-        [
-            "Review Flow",
-            "Raw evidence -> Analysis -> Score -> Watch / Non-PASS curves",
-            "Outcome Strip",
-            (
-                "PASS - close agreement; no scored concern surfaced.\n"
-                "WATCH - elevated score; review recommended.\n"
-                "REQUIRES EVAL - Deviation Score or Max Band crossed the evaluation threshold."
+                f"- Sparse means the reference or candidate program contributes only {sparse_serial_text}; "
+                f"sparse fallback uses mean_delta_pct <= {sparse_percent_delta_text}."
             ),
         ],
         [
             "",
             "",
-            "Show Results in Watch / Non-PASS Curves",
+            "Score Certification Serial Numbers",
+            (
+                "- Score by two metrics: Deviation Score and Max Band.\n"
+                "- Deviation Score measures whole-curve agreement against the comparison band, showing whether the serial behaves like the compatible population across the full trace.\n"
+                "- Max Band is the worst local sigma excursion, catching a single point or region that exceeds the allowed band even when the overall curve is mostly close."
+            ),
+        ],
+        [
+            "",
+            "",
+            "Analysis Results",
+            (
+                "PASS - Deviation Score is within the pass threshold and Max Band does not exceed the sigma limit.\n"
+                "WATCH - Deviation Score is elevated but still below the requires-eval threshold.\n"
+                "REQUIRES EVAL - Deviation Score exceeds the eval threshold or Max Band exceeds the sigma limit."
+            ),
+        ],
+        [
+            "",
+            "",
+            "View Results in Watch / Non-PASS Curves",
             (
                 "- Summary tables identify what matters first.\n"
                 "- Watch/non-pass curves show scored traces and comparison bands for review."
             ),
+        ],
+        ["Reader Goals", "", "", ""],
+        [
+            "Part 1 Reader Goal",
+            "Review what was measured before interpreting scored outcomes.",
+            "Part 2 Reader Goal",
+            "Review detected outliers for specific parameters and run conditions that flagged the system.",
         ],
     ]
 
@@ -9838,27 +9846,36 @@ def _tar_build_exec_process_flow_table(
     }
     cell_style_overrides.update(
         {
-            (1, col_index): styles.get("small_bold") or styles["small"]
+            (2, col_index): styles.get("small_bold") or styles["small"]
             for col_index in range(4)
         }
     )
-    for row_index in range(2, len(rows)):
+    cell_style_overrides[(1, 0)] = styles.get("small_bold") or styles["small"]
+    for col_index in range(4):
+        cell_style_overrides[(8, col_index)] = styles.get("small_bold") or styles["small"]
+    for row_index in range(3, len(rows)):
         for col_index in (0, 2):
             cell_style_overrides[(row_index, col_index)] = styles.get("small_bold") or styles["small"]
     style_cmds = [
         ("SPAN", (0, 0), (3, 0)),
-        ("SPAN", (0, 1), (1, 1)),
-        ("SPAN", (2, 1), (3, 1)),
+        ("SPAN", (1, 1), (3, 1)),
+        ("SPAN", (0, 2), (1, 2)),
+        ("SPAN", (2, 2), (3, 2)),
+        ("SPAN", (0, 8), (3, 8)),
         ("BACKGROUND", (0, 0), (3, 0), colors.HexColor("#dbeafe")),
-        ("BACKGROUND", (0, 1), (1, 1), colors.HexColor("#e0f2fe")),
-        ("BACKGROUND", (2, 1), (3, 1), colors.HexColor("#eef2ff")),
-        ("BACKGROUND", (0, 2), (1, -1), colors.HexColor("#f8fafc")),
-        ("BACKGROUND", (2, 2), (3, -1), colors.HexColor("#f8fafc")),
-        ("BACKGROUND", (0, 5), (3, 5), colors.HexColor("#f1f5f9")),
+        ("BACKGROUND", (0, 1), (3, 1), colors.HexColor("#f1f5f9")),
+        ("BACKGROUND", (0, 2), (1, 2), colors.HexColor("#e0f2fe")),
+        ("BACKGROUND", (2, 2), (3, 2), colors.HexColor("#eef2ff")),
+        ("BACKGROUND", (0, 3), (1, 7), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (2, 3), (3, 7), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (2, 6), (3, 6), colors.HexColor("#f1f5f9")),
+        ("BACKGROUND", (0, 8), (3, 8), colors.HexColor("#e2e8f0")),
+        ("BACKGROUND", (0, 9), (3, 9), colors.HexColor("#f8fafc")),
         ("LINEBELOW", (0, 0), (3, 0), 1, colors.HexColor("#60a5fa")),
-        ("LINEBELOW", (0, 1), (3, 1), 0.8, colors.HexColor("#94a3b8")),
-        ("LINEBEFORE", (2, 1), (2, -1), 1, colors.HexColor("#94a3b8")),
-        ("SPAN", (0, 6), (1, 6)),
+        ("LINEBELOW", (0, 1), (3, 1), 0.8, colors.HexColor("#cbd5e1")),
+        ("LINEBELOW", (0, 2), (3, 2), 0.8, colors.HexColor("#94a3b8")),
+        ("LINEBEFORE", (2, 2), (2, 9), 1, colors.HexColor("#94a3b8")),
+        ("LINEABOVE", (0, 8), (3, 8), 1, colors.HexColor("#94a3b8")),
     ]
     return _portrait_box_table(
         rows,
