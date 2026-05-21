@@ -9766,7 +9766,6 @@ def _tar_exec_process_flow_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
     noise_score_text = _fmt_num(prepass["noise_score_max"], sig=4)
     mean_delta_guard_text = f"{float(prepass['percent_delta_guard_max']):.1f}%"
     sparse_percent_delta_text = f"{float(prepass['sparse_percent_delta_max']):.1f}%"
-    sparse_serial_text = _tar_serial_count_enumeration_text(int(prepass["sparse_min_serials_per_program"]) - 1)
     return [
         ["How This Report Works", "", "", ""],
         ["Review Flow", "Raw evidence -> Analysis -> Score -> Watch / Non-PASS curves", "", ""],
@@ -9788,8 +9787,8 @@ def _tar_exec_process_flow_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             (
                 f"- noise_score <= {noise_score_text}\n"
                 f"- mean_delta_pct <= {mean_delta_guard_text}\n"
-                f"- Sparse means the reference or candidate program contributes only {sparse_serial_text}; "
-                f"sparse fallback uses mean_delta_pct <= {sparse_percent_delta_text}."
+                f"- Sparse fallback uses mean_delta_pct <= {sparse_percent_delta_text} "
+                f"(sparse = fewer than {int(prepass['sparse_min_serials_per_program'])} SNs per certification dataset)."
             ),
         ],
         [
@@ -9828,6 +9827,7 @@ def _tar_exec_process_flow_rows(ctx: Mapping[str, Any]) -> list[list[str]]:
             "Part 2 Reader Goal",
             "Review detected outliers for specific parameters and run conditions that flagged the system.",
         ],
+        ["Technical Details", "See end of report for more technical details and clarifications.", "", ""],
     ]
 
 
@@ -9840,6 +9840,8 @@ def _tar_build_exec_process_flow_table(
     inch = rl["inch"]
     colors = rl["colors"]
     rows = _tar_exec_process_flow_rows(ctx)
+    reader_goals_header_row = len(rows) - 3
+    footnote_row = len(rows) - 1
     cell_style_overrides: dict[tuple[int, int], Any] = {
         (0, col_index): styles.get("card_title") or styles["small_bold"]
         for col_index in range(4)
@@ -9852,7 +9854,7 @@ def _tar_build_exec_process_flow_table(
     )
     cell_style_overrides[(1, 0)] = styles.get("small_bold") or styles["small"]
     for col_index in range(4):
-        cell_style_overrides[(8, col_index)] = styles.get("small_bold") or styles["small"]
+        cell_style_overrides[(reader_goals_header_row, col_index)] = styles.get("small_bold") or styles["small"]
     for row_index in range(3, len(rows)):
         for col_index in (0, 2):
             cell_style_overrides[(row_index, col_index)] = styles.get("small_bold") or styles["small"]
@@ -9861,7 +9863,8 @@ def _tar_build_exec_process_flow_table(
         ("SPAN", (1, 1), (3, 1)),
         ("SPAN", (0, 2), (1, 2)),
         ("SPAN", (2, 2), (3, 2)),
-        ("SPAN", (0, 8), (3, 8)),
+        ("SPAN", (0, reader_goals_header_row), (3, reader_goals_header_row)),
+        ("SPAN", (1, footnote_row), (3, footnote_row)),
         ("BACKGROUND", (0, 0), (3, 0), colors.HexColor("#dbeafe")),
         ("BACKGROUND", (0, 1), (3, 1), colors.HexColor("#f1f5f9")),
         ("BACKGROUND", (0, 2), (1, 2), colors.HexColor("#e0f2fe")),
@@ -9869,13 +9872,15 @@ def _tar_build_exec_process_flow_table(
         ("BACKGROUND", (0, 3), (1, 7), colors.HexColor("#f8fafc")),
         ("BACKGROUND", (2, 3), (3, 7), colors.HexColor("#f8fafc")),
         ("BACKGROUND", (2, 6), (3, 6), colors.HexColor("#f1f5f9")),
-        ("BACKGROUND", (0, 8), (3, 8), colors.HexColor("#e2e8f0")),
-        ("BACKGROUND", (0, 9), (3, 9), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (0, reader_goals_header_row), (3, reader_goals_header_row), colors.HexColor("#e2e8f0")),
+        ("BACKGROUND", (0, reader_goals_header_row + 1), (3, reader_goals_header_row + 1), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (0, footnote_row), (3, footnote_row), colors.HexColor("#eff6ff")),
         ("LINEBELOW", (0, 0), (3, 0), 1, colors.HexColor("#60a5fa")),
         ("LINEBELOW", (0, 1), (3, 1), 0.8, colors.HexColor("#cbd5e1")),
         ("LINEBELOW", (0, 2), (3, 2), 0.8, colors.HexColor("#94a3b8")),
-        ("LINEBEFORE", (2, 2), (2, 9), 1, colors.HexColor("#94a3b8")),
-        ("LINEABOVE", (0, 8), (3, 8), 1, colors.HexColor("#94a3b8")),
+        ("LINEBEFORE", (2, 2), (2, reader_goals_header_row + 1), 1, colors.HexColor("#94a3b8")),
+        ("LINEABOVE", (0, reader_goals_header_row), (3, reader_goals_header_row), 1, colors.HexColor("#94a3b8")),
+        ("LINEABOVE", (0, footnote_row), (3, footnote_row), 1, colors.HexColor("#bfdbfe")),
     ]
     return _portrait_box_table(
         rows,
@@ -14857,14 +14862,14 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(_portrait_paragraph(print_ctx.report_subtitle, styles["cover_subtitle"], rl))
     story.append(
         _portrait_paragraph(
-            "This report was generated to plot and compare the given program's serial number's as-tested ATP data. "
-            "Data supplied by the vendor is processed and plotted against similar family data for this hardware - "
-            "which were selected for comparison by the creator of the EDIN project file. The purpose of this report "
-            "is to present these trends to the viewer.\n\n"
-            "This report has a secondary goal of analyzing the datasets and outputing any detected abnormalities and "
-            "watch items for the certification serial number. The goal of this analysis is to filter and mathematically "
-            "grade the datasets effectively and to their appropriate counterparts - thus remaining agonstic to variations "
-            "in voltage or build configuration as they effect the data.",
+            "This report was generated to evaluate the certification serial number (SN) as-tested ATP data. Data supplied "
+            "by the vendor is processed and plotted against historical family data for this hardware; comparison programs "
+            "were selected by the creator of the EDIN project file. The purpose of this report is to present these trends "
+            "to the viewer.\n\n"
+            "This report has a secondary goal of analyzing the individual SN datasets and outputting any detected "
+            "abnormalities / watch items to facilitate certification. The backend processor filters and mathematically "
+            "grades the SN's data to its appropriate aggregate counterparts, thus remaining agnostic to variations in "
+            "voltage or build configuration as they affect the data.",
             styles["body"],
             rl,
         )
@@ -14924,7 +14929,7 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
         )
     )
     story.append(Spacer(1, 0.08 * inch))
-    story.append(_portrait_paragraph("Grading Logic", styles["card_title"], rl))
+    story.append(_portrait_paragraph("Current Grading Logic", styles["card_title"], rl))
     story.append(
         _portrait_box_table(
             _tar_exec_grading_table_rows(ctx),
