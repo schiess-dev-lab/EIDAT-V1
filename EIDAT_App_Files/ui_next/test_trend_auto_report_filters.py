@@ -4413,6 +4413,9 @@ class TestTrendAutoReportFilters(unittest.TestCase):
             for item in story
             if isinstance(item, _FakeParagraph)
         )
+        self.assertIn("plot and compare the given program", body_text)
+        self.assertIn("secondary goal of analyzing the datasets", body_text)
+        self.assertIn("remaining agonstic to variations in voltage or build configuration", body_text)
         self.assertIn("whole-curve agreement score rather than a single-point difference", body_text)
         self.assertIn("See end of report for technical logic and formulas.", body_text)
         exception_style_cmds = [

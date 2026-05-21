@@ -14857,10 +14857,14 @@ def _tar_build_intro_story(ctx: Mapping[str, Any]) -> list[Any]:
     story.append(_portrait_paragraph(print_ctx.report_subtitle, styles["cover_subtitle"], rl))
     story.append(
         _portrait_paragraph(
-            "This report validates ATP run criteria against family data and compares the selected certification serials "
-            "to a selected program-pool baseline for the chosen run scope. The pre-pass selects compatible programs "
-            "within each base run condition, parameter, and X axis. Official grading excludes the target serial from "
-            "its own baseline and reports both an overall deviation score and a worst-point max-band result.",
+            "This report was generated to plot and compare the given program's serial number's as-tested ATP data. "
+            "Data supplied by the vendor is processed and plotted against similar family data for this hardware - "
+            "which were selected for comparison by the creator of the EDIN project file. The purpose of this report "
+            "is to present these trends to the viewer.\n\n"
+            "This report has a secondary goal of analyzing the datasets and outputing any detected abnormalities and "
+            "watch items for the certification serial number. The goal of this analysis is to filter and mathematically "
+            "grade the datasets effectively and to their appropriate counterparts - thus remaining agonstic to variations "
+            "in voltage or build configuration as they effect the data.",
             styles["body"],
             rl,
         )
