@@ -14904,10 +14904,28 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self._populate_stats_table(run, y_col, self._highlight_sn)
 
     def _smart_solver_available_column_names(self) -> list[str]:
+        """Return raw cached Y names, which are the solver backend's input keys.
+
+        Performance selectors now store normalized parameter options using
+        ``value`` / ``display_name`` rather than the former ``name`` field.
+        Smart Solver must not use those selector records: its backend resolves
+        metric series by the raw ``td_columns_calc.name`` value.
+        """
+        runs = [
+            str(item.get("run_name") or "").strip()
+            for item in (getattr(self, "_runs_ex", []) or [])
+            if isinstance(item, Mapping) and str(item.get("run_name") or "").strip()
+        ]
+        if not runs and getattr(self, "_db_path", None):
+            try:
+                runs = [str(run).strip() for run in (be.td_list_runs(self._db_path) or []) if str(run).strip()]
+            except Exception:
+                runs = []
+
         seen: set[str] = set()
         names: list[str] = []
-        for col in (getattr(self, "_perf_available_columns", []) or []):
-            if not isinstance(col, dict):
+        for col in self._td_y_raw_columns_for_runs(runs):
+            if not isinstance(col, Mapping):
                 continue
             name = str(col.get("name") or "").strip()
             key = self._perf_norm_name(name)

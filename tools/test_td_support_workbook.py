@@ -1504,6 +1504,37 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         finally:
             dlg.close()
 
+    def test_smart_solver_uses_raw_cached_y_names_not_parameter_selector_records(self) -> None:
+        dlg = _build_test_data_dialog()
+        try:
+            dlg._db_path = Path("C:/tmp/fake.sqlite3")
+            dlg._runs_ex = [
+                {"run_name": "RunA", "display_name": "Run A"},
+                {"run_name": "RunB", "display_name": "Run B"},
+            ]
+            dlg._calc_y_columns_by_run = {
+                "RunA": [
+                    {"name": "Output", "units": "arb"},
+                    {"name": "Input 1", "units": "arb"},
+                ],
+                "RunB": [
+                    {"name": "input 1", "units": "arb"},
+                    {"name": "Input 2", "units": "arb"},
+                ],
+            }
+            # Parameter normalization replaced the old ``name`` selector field.
+            dlg._perf_available_columns = [
+                {"value": "canonical:output", "display_name": "Output"},
+                {"value": "canonical:input_1", "display_name": "Input 1"},
+            ]
+
+            self.assertEqual(
+                dlg._smart_solver_available_column_names(),
+                ["Output", "Input 1", "Input 2"],
+            )
+        finally:
+            dlg.close()
+
     def test_generate_debug_excel_files_uses_manual_export_only(self) -> None:
         _qt_app()
         from pathlib import Path
