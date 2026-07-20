@@ -1504,7 +1504,7 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
         finally:
             dlg.close()
 
-    def test_smart_solver_uses_raw_cached_y_names_not_parameter_selector_records(self) -> None:
+    def test_smart_solver_uses_project_parameter_options(self) -> None:
         dlg = _build_test_data_dialog()
         try:
             dlg._db_path = Path("C:/tmp/fake.sqlite3")
@@ -1522,16 +1522,43 @@ class TestTDTrendDialogCacheLoading(unittest.TestCase):
                     {"name": "Input 2", "units": "arb"},
                 ],
             }
-            # Parameter normalization replaced the old ``name`` selector field.
-            dlg._perf_available_columns = [
-                {"value": "canonical:output", "display_name": "Output"},
-                {"value": "canonical:input_1", "display_name": "Input 1"},
-            ]
+            captured: dict[str, object] = {}
+
+            def _parameter_options(**kwargs):
+                captured.update(kwargs)
+                return [
+                    {
+                        "value": "canonical:normalized_output",
+                        "label": "Normalized Output (arb)",
+                        "display_name": "Normalized Output",
+                        "raw_names": ["Output"],
+                    },
+                    {
+                        "value": "canonical:normalized_input_1",
+                        "label": "Normalized Input 1 (arb)",
+                        "display_name": "Normalized Input 1",
+                        "raw_names": ["Input 1", "input 1"],
+                    },
+                    {
+                        "value": "canonical:normalized_input_2",
+                        "label": "Normalized Input 2 (arb)",
+                        "display_name": "Normalized Input 2",
+                        "raw_names": ["Input 2"],
+                    },
+                ]
+
+            dlg._parameter_selector_options = _parameter_options
 
             self.assertEqual(
-                dlg._smart_solver_available_column_names(),
-                ["Output", "Input 1", "Input 2"],
+                [option["value"] for option in dlg._smart_solver_available_column_options()],
+                [
+                    "canonical:normalized_output",
+                    "canonical:normalized_input_1",
+                    "canonical:normalized_input_2",
+                ],
             )
+            self.assertEqual(captured["surface"], "performance")
+            self.assertEqual(captured["run_names"], ["RunA", "RunB"])
         finally:
             dlg.close()
 

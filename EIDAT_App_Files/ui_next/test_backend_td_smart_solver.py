@@ -236,6 +236,9 @@ def _run_solver_with_captures(
     runs: list[str],
     serials: list[str],
     program_filters: list[str] | None = None,
+    output_target: str = "Output",
+    input1_target: str = "Input1",
+    parameter_context: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], dict[str, list[float]]]:
     captured: dict[str, list[float]] = {}
 
@@ -307,13 +310,14 @@ def _run_solver_with_captures(
     ):
         result = backend.td_smart_solver_run(
             db_path,
-            output_target="Output",
-            input1_target="Input1",
+            output_target=output_target,
+            input1_target=input1_target,
             run_type_mode=run_type_mode,
             keep_first_sequences_per_serial=keep_first_sequences_per_serial,
             runs=runs,
             serials=serials,
             program_filters=program_filters,
+            parameter_context=parameter_context,
         )
     return result, captured
 
@@ -480,6 +484,58 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertEqual(result["sample_count"], 8)
         self.assertEqual(sorted(set(captured["fit_xs"])), [1.0, 2.0])
         self.assertNotIn(10.0, captured["fit_xs"])
+
+    def test_solver_resolves_project_parameter_selections_to_cached_columns(self) -> None:
+        rows = [
+            {
+                "observation_id": f"SN-001-{control_period}-{x_value}",
+                "serial": "SN-001",
+                "run_name": "CondA",
+                "program_title": "Program Alpha",
+                "source_run_name": f"Seq-{control_period}-{x_value}",
+                "control_period": control_period,
+                "input_1": x_value,
+                "output": (10.0 * x_value) + control_period,
+            }
+            for control_period in (10.0, 20.0)
+            for x_value in (1.0, 2.0)
+        ]
+        parameter_context = {
+            "normalization": {
+                "groups": [
+                    {"id": "normalized_output", "display_name": "Normalized Output"},
+                    {"id": "normalized_input_1", "display_name": "Normalized Input 1"},
+                ],
+                "mappings": [
+                    {"canonical_id": "normalized_output", "raw_name": "Output"},
+                    {"canonical_id": "normalized_input_1", "raw_name": "Input1"},
+                ],
+            },
+            "canonical_groups": {
+                "normalized_output": {
+                    "display_name": "Normalized Output",
+                    "raw_names": ["Output"],
+                },
+                "normalized_input_1": {
+                    "display_name": "Normalized Input 1",
+                    "raw_names": ["Input1"],
+                },
+            }
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            db_path = _create_smart_solver_db(tmpdir, rows)
+            result, captured = _run_solver_with_captures(
+                db_path,
+                runs=["CondA"],
+                serials=["SN-001"],
+                output_target=backend.td_parameter_selector_value("normalized_output"),
+                input1_target=backend.td_parameter_selector_value("normalized_input_1"),
+                parameter_context=parameter_context,
+            )
+
+        self.assertEqual(result["output_target"], "Normalized Output")
+        self.assertEqual(result["input1_target"], "Normalized Input 1")
+        self.assertEqual(sorted(captured["fit_xs"]), [1.0, 1.0, 2.0, 2.0])
 
     def test_sequence_cap_keeps_all_run_bucket_points_for_a_retained_sequence(self) -> None:
         rows = [

@@ -31317,6 +31317,115 @@ def _td_smart_solver_sequence_sort_key(value: object) -> tuple[tuple[int, object
     return tuple(key or [(1, text)])
 
 
+def _td_smart_solver_selection_raw_candidates(
+    parameter_context: Mapping[str, object] | None,
+    selection_value: object,
+    run_name: str,
+) -> list[str]:
+    selected = str(selection_value or "").strip()
+    if not selected:
+        return []
+    raw_candidates = td_parameter_selection_raw_names(
+        parameter_context,
+        selected,
+        run_names=[run_name],
+        surface="performance",
+    )
+    if not raw_candidates and selected:
+        raw_candidates = [selected]
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in raw_candidates:
+        raw_name = str(value).strip()
+        key = _td_param_norm_name(raw_name)
+        if not raw_name or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(raw_name)
+    return out
+
+
+def _td_smart_solver_resolve_y_col_units(
+    db_path: Path,
+    run_name: str,
+    selection_value: object,
+    parameter_context: Mapping[str, object] | None = None,
+) -> tuple[str, str]:
+    """Resolve a project-parameter selection to this run's cached Y column."""
+    raw_candidates = _td_smart_solver_selection_raw_candidates(
+        parameter_context, selection_value, run_name
+    )
+    if not raw_candidates:
+        return "", ""
+    try:
+        columns = td_list_y_columns(db_path, run_name)
+    except Exception:
+        columns = []
+    by_norm = {
+        _td_param_norm_name(column.get("name")): {
+            "name": str(column.get("name") or "").strip(),
+            "units": str(column.get("units") or "").strip(),
+        }
+        for column in columns
+        if isinstance(column, Mapping) and str(column.get("name") or "").strip()
+    }
+    for raw_name in raw_candidates:
+        match = by_norm.get(_td_param_norm_name(raw_name))
+        if match:
+            return str(match["name"]), str(match["units"])
+    return "", ""
+
+
+def _td_smart_solver_load_metric_series_for_selection(
+    db_path: Path,
+    run_name: str,
+    selection_value: object,
+    *,
+    parameter_context: Mapping[str, object] | None = None,
+    run_type_filter: object = None,
+) -> list[dict]:
+    """Load all raw metrics represented by a project-parameter selection."""
+    rows_by_observation: dict[str, dict] = {}
+    for raw_name in _td_smart_solver_selection_raw_candidates(
+        parameter_context, selection_value, run_name
+    ):
+        for row in td_load_metric_series(
+            db_path,
+            run_name,
+            raw_name,
+            "mean",
+            run_type_filter=run_type_filter,
+            metric_source=TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES,
+        ):
+            if not isinstance(row, Mapping) or not td_parameter_selection_matches(
+                parameter_context,
+                selection_value,
+                raw_name,
+                row.get("program_title"),
+                row.get("asset_type"),
+                row.get("asset_specific_type"),
+            ):
+                continue
+            observation_id = str(row.get("observation_id") or "").strip()
+            if observation_id and observation_id not in rows_by_observation:
+                tagged = dict(row)
+                tagged["parameter_name"] = raw_name
+                rows_by_observation[observation_id] = tagged
+    return [rows_by_observation[key] for key in sorted(rows_by_observation)]
+
+
+def _td_smart_solver_selection_display_name(
+    parameter_context: Mapping[str, object] | None,
+    selection_value: object,
+) -> str:
+    selected = str(selection_value or "").strip()
+    if not selected:
+        return ""
+    return str(
+        td_parameter_value_display_name(parameter_context, selected, fallback=selected) or selected
+    ).strip()
+
+
 def _td_smart_solver_apply_sequence_cap(
     points: Sequence[Mapping[str, object]],
     keep_first_sequences_per_serial: object,
@@ -31376,6 +31485,7 @@ def td_smart_solver_run(
     program_filters: Sequence[object] | None = None,
     suppression_voltage_filters: Sequence[object] | None = None,
     control_period_filters: Sequence[object] | None = None,
+    parameter_context: Mapping[str, object] | None = None,
     progress_cb: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     path = Path(db_path).expanduser()
@@ -31387,14 +31497,18 @@ def td_smart_solver_run(
             "Run 'Update Project' first."
         )
 
-    output_name = str(output_target or "").strip()
-    input1_name = str(input1_target or "").strip()
-    input2_name = str(input2_target or "").strip()
-    input3_name = str(input3_target or "").strip()
-    if not output_name or not input1_name:
+    output_selection = str(output_target or "").strip()
+    input1_selection = str(input1_target or "").strip()
+    input2_selection = str(input2_target or "").strip()
+    input3_selection = str(input3_target or "").strip()
+    if not output_selection or not input1_selection:
         raise RuntimeError("Select Output and Input 1 before running Smart Equation Solver.")
-    if input3_name and not input2_name:
+    if input3_selection and not input2_selection:
         raise RuntimeError("Select Input 2 before using Input 3 in Smart Equation Solver.")
+    output_name = _td_smart_solver_selection_display_name(parameter_context, output_selection)
+    input1_name = _td_smart_solver_selection_display_name(parameter_context, input1_selection)
+    input2_name = _td_smart_solver_selection_display_name(parameter_context, input2_selection)
+    input3_name = _td_smart_solver_selection_display_name(parameter_context, input3_selection)
     normalized_run_type_mode = td_perf_normalize_run_type_mode(run_type_mode)
     solver_run_type_mode = "steady_state" if normalized_run_type_mode == "steady_state" else "pulsed_mode"
     uses_control_period = solver_run_type_mode == "pulsed_mode"
@@ -31428,22 +31542,29 @@ def td_smart_solver_run(
     dropped_point_count = 0
     distinct_suppression_voltages: list[str] = []
     seen_suppression_voltages: set[str] = set()
-    sequence_metric_source = TD_METRIC_PLOT_SOURCE_ALL_SEQUENCES
 
     _td_emit_progress(progress_cb, "Loading sequence rows")
 
     for run_name in runs_list:
-        output_col, output_units_candidate = _td_perf_resolve_y_col_units(path, run_name, output_name)
-        input1_col, input1_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input1_name)
+        output_col, output_units_candidate = _td_smart_solver_resolve_y_col_units(
+            path, run_name, output_selection, parameter_context
+        )
+        input1_col, input1_units_candidate = _td_smart_solver_resolve_y_col_units(
+            path, run_name, input1_selection, parameter_context
+        )
         input2_col = ""
         input2_units_candidate = ""
         input3_col = ""
         input3_units_candidate = ""
-        if input2_name:
-            input2_col, input2_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input2_name)
-        if input3_name:
-            input3_col, input3_units_candidate = _td_perf_resolve_y_col_units(path, run_name, input3_name)
-        if not output_col or not input1_col or (input2_name and not input2_col) or (input3_name and not input3_col):
+        if input2_selection:
+            input2_col, input2_units_candidate = _td_smart_solver_resolve_y_col_units(
+                path, run_name, input2_selection, parameter_context
+            )
+        if input3_selection:
+            input3_col, input3_units_candidate = _td_smart_solver_resolve_y_col_units(
+                path, run_name, input3_selection, parameter_context
+            )
+        if not output_col or not input1_col or (input2_selection and not input2_col) or (input3_selection and not input3_col):
             continue
         output_units = output_units or output_units_candidate
         input1_units = input1_units or input1_units_candidate
@@ -31452,45 +31573,41 @@ def td_smart_solver_run(
         if input3_name:
             input3_units = input3_units or input3_units_candidate
 
-        x1_rows = td_load_metric_series(
+        x1_rows = _td_smart_solver_load_metric_series_for_selection(
             path,
             run_name,
-            input1_col,
-            "mean",
+            input1_selection,
+            parameter_context=parameter_context,
             run_type_filter=solver_run_type_mode,
-            metric_source=sequence_metric_source,
         )
         x2_rows = (
-            td_load_metric_series(
+            _td_smart_solver_load_metric_series_for_selection(
                 path,
                 run_name,
-                input2_col,
-                "mean",
+                input2_selection,
+                parameter_context=parameter_context,
                 run_type_filter=solver_run_type_mode,
-                metric_source=sequence_metric_source,
             )
             if input2_name and input2_col
             else []
         )
         x3_rows = (
-            td_load_metric_series(
+            _td_smart_solver_load_metric_series_for_selection(
                 path,
                 run_name,
-                input3_col,
-                "mean",
+                input3_selection,
+                parameter_context=parameter_context,
                 run_type_filter=solver_run_type_mode,
-                metric_source=sequence_metric_source,
             )
             if input3_name and input3_col
             else []
         )
-        y_rows = td_load_metric_series(
+        y_rows = _td_smart_solver_load_metric_series_for_selection(
             path,
             run_name,
-            output_col,
-            "mean",
+            output_selection,
+            parameter_context=parameter_context,
             run_type_filter=solver_run_type_mode,
-            metric_source=sequence_metric_source,
         )
         if not x1_rows or not y_rows or (input2_name and not x2_rows) or (input3_name and not x3_rows):
             continue

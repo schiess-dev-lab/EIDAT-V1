@@ -14903,14 +14903,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             y_col = (raw_names[0] if raw_names else selection_value).strip()
         self._populate_stats_table(run, y_col, self._highlight_sn)
 
-    def _smart_solver_available_column_names(self) -> list[str]:
-        """Return raw cached Y names, which are the solver backend's input keys.
-
-        Performance selectors now store normalized parameter options using
-        ``value`` / ``display_name`` rather than the former ``name`` field.
-        Smart Solver must not use those selector records: its backend resolves
-        metric series by the raw ``td_columns_calc.name`` value.
-        """
+    def _smart_solver_available_column_options(self) -> list[dict[str, object]]:
+        """Return project-normalized performance parameters for Smart Solver."""
         runs = [
             str(item.get("run_name") or "").strip()
             for item in (getattr(self, "_runs_ex", []) or [])
@@ -14922,25 +14916,31 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             except Exception:
                 runs = []
 
-        seen: set[str] = set()
-        names: list[str] = []
-        for col in self._td_y_raw_columns_for_runs(runs):
-            if not isinstance(col, Mapping):
-                continue
-            name = str(col.get("name") or "").strip()
-            key = self._perf_norm_name(name)
-            if not name or not key or key in seen:
-                continue
-            seen.add(key)
-            names.append(name)
-        return names
+        raw_columns = self._td_y_raw_columns_for_runs(runs)
+        return self._parameter_selector_options(
+            surface="performance",
+            run_names=runs,
+            raw_names=[
+                str(column.get("name") or "").strip()
+                for column in raw_columns
+                if isinstance(column, Mapping) and str(column.get("name") or "").strip()
+            ],
+            raw_columns=raw_columns,
+        )
+
+    def _smart_solver_parameter_display_name(self, value: object) -> str:
+        return self._parameter_display_name(
+            value,
+            options=self._smart_solver_available_column_options(),
+            fallback=value,
+        )
 
     def _smart_solver_config_text(self, config: dict[str, object] | None = None) -> str:
         cfg = config if isinstance(config, dict) else (self._smart_solver_config or {})
-        output_name = str(cfg.get("output_target") or "").strip()
-        input1_name = str(cfg.get("input1_target") or "").strip()
-        input2_name = str(cfg.get("input2_target") or "").strip()
-        input3_name = str(cfg.get("input3_target") or "").strip()
+        output_name = self._smart_solver_parameter_display_name(cfg.get("output_target"))
+        input1_name = self._smart_solver_parameter_display_name(cfg.get("input1_target"))
+        input2_name = self._smart_solver_parameter_display_name(cfg.get("input2_target"))
+        input3_name = self._smart_solver_parameter_display_name(cfg.get("input3_target"))
         if not output_name or not input1_name:
             return "Config: -"
         normalize_run_type = getattr(be, "td_perf_normalize_run_type_mode", None)
@@ -15155,11 +15155,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
             return
 
-        column_names = self._smart_solver_available_column_names()
-        if not column_names:
+        column_options = self._smart_solver_available_column_options()
+        if not column_options:
             self._refresh_performance_ui()
-            column_names = self._smart_solver_available_column_names()
-        if not column_names:
+            column_options = self._smart_solver_available_column_options()
+        if not column_options:
             QtWidgets.QMessageBox.information(
                 self,
                 "Smart Equation Solver",
@@ -15197,8 +15197,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         def _build_combo() -> QtWidgets.QComboBox:
             combo = QtWidgets.QComboBox()
             combo.addItem("", "")
-            for name in column_names:
-                combo.addItem(name, name)
+            for option in column_options:
+                value = str(option.get("value") or option.get("name") or "").strip()
+                if not value:
+                    continue
+                label = str(option.get("label") or option.get("display_name") or value).strip() or value
+                combo.addItem(label, value)
             return combo
 
         normalize_run_type = getattr(be, "td_perf_normalize_run_type_mode", None)
@@ -15231,7 +15235,12 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if not wanted:
                 continue
             for idx in range(combo.count()):
-                if self._perf_norm_name(combo.itemText(idx)) == self._perf_norm_name(wanted):
+                option = self._selector_option_by_value(column_options, combo.itemData(idx))
+                raw_names = [str(value).strip() for value in (option.get("raw_names") or []) if str(value).strip()]
+                if (
+                    self._perf_norm_name(combo.itemData(idx)) == self._perf_norm_name(wanted)
+                    or self._perf_norm_name(wanted) in {self._perf_norm_name(raw_name) for raw_name in raw_names}
+                ):
                     combo.setCurrentIndex(idx)
                     break
         form.addRow("Condition Family:", combo_condition_family)
@@ -15376,6 +15385,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                     "Output and selected input columns must be different.",
                 )
                 return
+            conflicting = [
+                self._parameter_display_name(value, options=column_options, fallback=value)
+                for value in chosen_names
+                if bool(self._selector_option_by_value(column_options, value).get("unit_conflict"))
+            ]
+            if conflicting:
+                QtWidgets.QMessageBox.warning(
+                    dlg,
+                    "Smart Equation Solver",
+                    "Resolve unit conflicts in Project Parameters before solving:\n\n" + "\n".join(conflicting),
+                )
+                return
             self._smart_solver_config = {
                 "run_type_mode": run_type_mode if run_type_mode in {"steady_state", "pulsed_mode"} else "pulsed_mode",
                 "output_target": output_name,
@@ -15476,6 +15497,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 program_filters=self._active_program_filter_values(),
                 suppression_voltage_filters=self._active_suppression_voltage_filter_values(),
                 control_period_filters=self._active_control_period_filter_values(),
+                parameter_context=getattr(self, "_parameter_normalization_context", None),
                 progress_cb=report,
             )
 
