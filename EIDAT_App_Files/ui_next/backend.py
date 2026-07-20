@@ -34975,6 +34975,11 @@ def _td_smart_solver_excel_formula_for_model(
     control_period_ref: str,
 ) -> str:
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    pchip_segments = (
+        _td_perf_pchip_segment_rows(model, "mean")
+        if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP
+        else None
+    )
     if (
         family in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES
         and str(model.get("smart_solver_boundary_policy") or "").strip().lower()
@@ -35029,6 +35034,7 @@ def _td_smart_solver_excel_formula_for_model(
             norm_x2_ref=_td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale")) if raw_x2_ref else "",
             raw_cp_ref=str(clamped_cp_ref or ""),
             norm_cp_ref=_td_perf_excel_norm_expr(clamped_cp_ref, model.get("cp_center"), model.get("cp_scale")),
+            pchip_segments=pchip_segments,
         )
     if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
         raw_x1_ref = str(variable_refs.get("input_1") or "")
@@ -35046,6 +35052,7 @@ def _td_smart_solver_excel_formula_for_model(
             norm_x2_ref=_td_perf_excel_norm_expr(raw_x2_ref, model.get("x2_center"), model.get("x2_scale")),
             raw_cp_ref=str(clamped_cp_ref or ""),
             norm_cp_ref=_td_perf_excel_norm_expr(clamped_cp_ref, model.get("cp_center"), model.get("cp_scale")),
+            pchip_segments=pchip_segments,
         )
     return ""
 

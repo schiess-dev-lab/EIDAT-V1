@@ -1675,6 +1675,31 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             backend.td_smart_solver_exportable_model({"master_model": {"fit_family": backend.TD_PERF_FIT_FAMILY_STAGED_MEDIATOR}})
         )
 
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_smart_solver_excel_formula_supports_monotone_pchip_model(self) -> None:
+        result = {
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_MODE_MONOTONE_PCHIP,
+                "params": {
+                    "knots": [0.0, 1.0, 2.0],
+                    "knot_values": [0.0, 1.5, 2.0],
+                    "left_y": 0.0,
+                    "right_y": 2.0,
+                },
+            },
+            "uses_control_period": False,
+        }
+
+        formulas = backend._td_smart_solver_formula_specs(
+            result,
+            variable_refs={"input_1": "B12"},
+            control_period_ref="",
+            pred_mean_ref="C12",
+        )
+
+        self.assertTrue(str(formulas.get("pred_mean") or "").startswith("="))
+        self.assertIn("IF(B12<=", str(formulas.get("pred_mean") or ""))
+
     def test_smart_solver_workbook_omits_control_period_for_steady_state_and_keeps_it_for_pulsed(self) -> None:
         try:
             from openpyxl import load_workbook  # type: ignore
