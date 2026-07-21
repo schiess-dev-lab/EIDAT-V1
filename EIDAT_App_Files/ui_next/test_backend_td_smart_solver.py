@@ -1700,6 +1700,78 @@ class TestBackendTdSmartSolver(unittest.TestCase):
         self.assertTrue(str(formulas.get("pred_mean") or "").startswith("="))
         self.assertIn("IF(B12<=", str(formulas.get("pred_mean") or ""))
 
+    @unittest.skipUnless(_have_scipy(), "scipy not installed")
+    def test_smart_solver_excel_export_keeps_large_pchip_formulas_within_excel_limit(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+
+        knots = [float(index) for index in range(120)]
+        result = {
+            "fit_family": backend.TD_PERF_FIT_MODE_MONOTONE_PCHIP,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_MODE_MONOTONE_PCHIP,
+                "params": {
+                    "knots": knots,
+                    "knot_values": [math.sqrt(value + 1.0) for value in knots],
+                    "left_y": 1.0,
+                    "right_y": math.sqrt(120.0),
+                },
+            },
+            "fit_points": [
+                {
+                    "run_name": "CondA",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "condition_label": "CondA",
+                    "input_1": 5.0,
+                    "actual_mean": 2.5,
+                    "sample_count": 1,
+                }
+            ],
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "output_target": "Output",
+            "output_units": "u",
+            "input1_target": "Input1",
+            "input1_units": "u",
+            "uses_control_period": False,
+            "run_type_mode": "steady_state",
+            "three_sigma_offset": 0.2,
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            tmp_path = Path(tmpdir)
+            output_path = tmp_path / "large_pchip.xlsx"
+            backend.td_smart_solver_export_equation_workbook(
+                tmp_path / "cache.sqlite3",
+                output_path,
+                result=result,
+            )
+            workbook = load_workbook(str(output_path), data_only=False)
+            try:
+                formulas = [
+                    str(cell.value)
+                    for sheet in workbook.worksheets
+                    for row in sheet.iter_rows()
+                    for cell in row
+                    if isinstance(cell.value, str) and cell.value.startswith("=")
+                ]
+                scenario_formula = next(
+                    formula
+                    for formula in formulas
+                    if "SmartSolver_PCHIP_Selected_X0" in formula
+                )
+                support_sheet = workbook["Formula Support"]
+                support_state = support_sheet.sheet_state
+                support_rows = support_sheet.max_row
+            finally:
+                workbook.close()
+
+        self.assertTrue(formulas)
+        self.assertLessEqual(max(len(formula) for formula in formulas), 8192)
+        self.assertIn("MATCH(", scenario_formula)
+        self.assertEqual(support_state, "hidden")
+        self.assertEqual(support_rows, 120)
+
     def test_smart_solver_workbook_omits_control_period_for_steady_state_and_keeps_it_for_pulsed(self) -> None:
         try:
             from openpyxl import load_workbook  # type: ignore
@@ -1934,7 +2006,99 @@ class TestBackendTdSmartSolver(unittest.TestCase):
             finally:
                 wb.close()
 
-        self.assertTrue(any("1E-9" in formula and "MIN(MAX((" in formula for formula in formulas))
+        self.assertTrue(
+            any(
+                "1E-9" in formula
+                and "LET(" in formula
+                and "SmartSolver_CurveCP_Selected_CONTROL_PERIOD" in formula
+                for formula in formulas
+            )
+        )
+
+    def test_smart_solver_excel_export_compacts_large_bounded_curve_and_three_sigma_support(self) -> None:
+        from openpyxl import load_workbook  # type: ignore
+
+        support_rows = []
+        for index in range(80):
+            control_period = float(index + 1)
+            row = {
+                "control_period": control_period,
+                "x_min": 0.0,
+                "x_max": 10.0,
+                "left_x": 0.0,
+                "left_y": control_period,
+                "right_x": 10.0,
+                "right_y": control_period + 10.0,
+            }
+            if index > 0:
+                row["left_partner_control_period"] = float(index)
+            if index < 79:
+                row["right_partner_control_period"] = float(index + 2)
+            support_rows.append(row)
+        result = {
+            "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+            "master_model": {
+                "fit_family": backend.TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
+                "coeff_cp_models": [[0.0], [0.0], [1.0]],
+                "x_center": 0.0,
+                "x_scale": 1.0,
+                "cp_center": 0.0,
+                "cp_scale": 1.0,
+                "fit_domain_control_period": [1.0, 80.0],
+                "curve_cp_global_domain": [0.0, 10.0],
+                "curve_cp_slice_support": support_rows,
+                "smart_solver_boundary_policy": backend.TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1,
+            },
+            "fit_points": [
+                {
+                    "run_name": "CondA",
+                    "serial": "SN-001",
+                    "observation_id": "obs-1",
+                    "condition_label": "CondA",
+                    "control_period": 3.0,
+                    "input_1": 5.0,
+                    "actual_mean": 4.0,
+                    "sample_count": 1,
+                }
+            ],
+            "solver_variables": [
+                {"key": "input_1", "target": "Input1", "units": "u", "role": "Primary"},
+            ],
+            "output_target": "Output",
+            "output_units": "u",
+            "input1_target": "Input1",
+            "input1_units": "u",
+            "uses_control_period": True,
+            "run_type_mode": "pulsed_mode",
+            "three_sigma_support_rows": [
+                {"control_period": float(index + 1), "three_sigma_offset": float(index) / 10.0}
+                for index in range(80)
+            ],
+        }
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+            tmp_path = Path(tmpdir)
+            output_path = tmp_path / "large_bounded_curve_cp.xlsx"
+            backend.td_smart_solver_export_equation_workbook(
+                tmp_path / "cache.sqlite3",
+                output_path,
+                result=result,
+            )
+            workbook = load_workbook(str(output_path), data_only=False)
+            try:
+                formulas = [
+                    str(cell.value)
+                    for sheet in workbook.worksheets
+                    for row in sheet.iter_rows()
+                    for cell in row
+                    if isinstance(cell.value, str) and cell.value.startswith("=")
+                ]
+            finally:
+                workbook.close()
+
+        self.assertTrue(formulas)
+        self.assertLessEqual(max(len(formula) for formula in formulas), 8192)
+        self.assertTrue(any("SmartSolver_CurveCP_Selected_CONTROL_PERIOD" in formula for formula in formulas))
+        self.assertTrue(any("SmartSolver_ThreeSigma_CONTROL_PERIOD" in formula for formula in formulas))
 
     def test_smart_solver_export_equation_matlab_writes_metadata_mode_and_fallout_percent(self) -> None:
         result = {

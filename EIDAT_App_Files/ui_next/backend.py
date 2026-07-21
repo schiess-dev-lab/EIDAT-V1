@@ -34615,6 +34615,25 @@ def _td_smart_solver_excel_three_sigma_offset_expr(
     if len(support_rows) == 1 or not str(control_period_ref or "").strip():
         return _td_perf_excel_num(support_rows[0].get("three_sigma_offset") or 0.0)
 
+    compact_support = result.get("_excel_three_sigma_support") if isinstance(result, Mapping) else None
+    if isinstance(compact_support, Mapping):
+        cp_range = str(compact_support.get("control_period") or "").strip()
+        offset_range = str(compact_support.get("three_sigma_offset") or "").strip()
+        if cp_range and offset_range:
+            return (
+                f"LET(ss_cp,MIN(MAX({control_period_ref},INDEX({cp_range},1)),"
+                f"INDEX({cp_range},ROWS({cp_range}))),"
+                f"ss_i,MATCH(ss_cp,{cp_range},1),"
+                f"ss_j,MIN(ss_i+1,ROWS({cp_range})),"
+                f"ss_cp_i,INDEX({cp_range},ss_i),"
+                f"ss_cp_j,INDEX({cp_range},ss_j),"
+                f"ss_offset_i,INDEX({offset_range},ss_i),"
+                f"ss_offset_j,INDEX({offset_range},ss_j),"
+                f"IF(ABS(ss_cp-ss_cp_i)<=1E-9,ss_offset_i,"
+                f"IF(ABS(ss_cp_j-ss_cp_i)<=1E-12,ss_offset_j,"
+                f"ss_offset_i+((ss_cp-ss_cp_i)*(ss_offset_j-ss_offset_i)/(ss_cp_j-ss_cp_i)))))"
+            )
+
     first_cp = float(support_rows[0].get("control_period") or 0.0)
     last_cp = float(support_rows[-1].get("control_period") or 0.0)
     cp_expr = _td_smart_solver_excel_clamp_expr(control_period_ref, [first_cp, last_cp])
@@ -34670,6 +34689,44 @@ def _td_smart_solver_excel_formula_body(formula: str) -> str:
     if text.startswith("="):
         return text[1:]
     return text
+
+
+def _td_smart_solver_excel_pchip_support_formula(
+    model: Mapping[str, object],
+    *,
+    raw_x_ref: str,
+) -> str:
+    """Build a compact PCHIP formula backed by hidden coefficient ranges.
+
+    Inlining one nested IF for every PCHIP interval can easily exceed Excel's
+    8,192-character formula limit.  Excel then repairs the workbook by
+    removing every affected formula record.  The support ranges are written
+    by ``_td_smart_solver_prepare_excel_formula_support`` for workbook
+    exports; retain an empty result here so non-workbook callers can use the
+    legacy inline formula path below.
+    """
+    support = model.get("_excel_pchip_support") if isinstance(model, Mapping) else None
+    if not isinstance(support, Mapping) or not str(raw_x_ref or "").strip():
+        return ""
+    names = {
+        field: str(support.get(field) or "").strip()
+        for field in ("x0", "x1", "a", "b", "c", "d", "left_y", "right_y")
+    }
+    if not all(names.values()):
+        return ""
+    segment_index = f"MATCH({raw_x_ref},{names['x0']},1)"
+    dx = f"({raw_x_ref}-INDEX({names['x0']},{segment_index}))"
+    polynomial = (
+        f"(INDEX({names['a']},{segment_index})*({dx}^3))"
+        f"+(INDEX({names['b']},{segment_index})*({dx}^2))"
+        f"+(INDEX({names['c']},{segment_index})*{dx})"
+        f"+INDEX({names['d']},{segment_index})"
+    )
+    return (
+        f"=IF({raw_x_ref}<INDEX({names['x0']},1),INDEX({names['left_y']},1),"
+        f"IF({raw_x_ref}>INDEX({names['x1']},ROWS({names['x1']})),"
+        f"INDEX({names['right_y']},ROWS({names['right_y']})),{polynomial}))"
+    )
 
 
 def _td_smart_solver_excel_dynamic_clamp_expr(value_expr: str, lo_expr: str, hi_expr: str) -> str:
@@ -34829,12 +34886,142 @@ def _td_smart_solver_excel_curve_cp_exact_expr(
     )
 
 
+def _td_smart_solver_excel_bounded_curve_cp_support_formula(
+    model: Mapping[str, object],
+    *,
+    x_ref: str,
+    cp_ref: str,
+) -> str:
+    """Build a bounded curve/CP formula without one nested branch per slice."""
+    support = model.get("_excel_curve_cp_support") if isinstance(model, Mapping) else None
+    if not isinstance(support, Mapping) or not x_ref or not cp_ref:
+        return ""
+    names = {
+        field: str(support.get(field) or "").strip()
+        for field in (
+            "control_period",
+            "x_min",
+            "x_max",
+            "left_x",
+            "left_y",
+            "right_x",
+            "right_y",
+            "left_partner_index",
+            "right_partner_index",
+        )
+    }
+    if not all(names.values()):
+        return ""
+
+    x_expr = _td_smart_solver_excel_clamp_expr(
+        x_ref,
+        model.get("curve_cp_global_domain") or model.get("fit_domain") or [],
+    )
+    cp_expr = _td_smart_solver_excel_clamp_expr(cp_ref, model.get("fit_domain_control_period") or [])
+
+    def _raw_curve_body(control_period_expr: str) -> str:
+        return _td_smart_solver_excel_formula_body(
+            _td_perf_excel_formula_for_model(
+                model,
+                raw_x_ref="ss_x",
+                norm_x_ref=_td_perf_excel_norm_expr("ss_x", model.get("x_center"), model.get("x_scale")),
+                raw_x1_ref="ss_x",
+                raw_x2_ref="",
+                norm_x1_ref="",
+                norm_x2_ref="",
+                raw_cp_ref=control_period_expr,
+                norm_cp_ref=_td_perf_excel_norm_expr(
+                    control_period_expr,
+                    model.get("cp_center"),
+                    model.get("cp_scale"),
+                ),
+            )
+        )
+
+    raw_curve = _raw_curve_body("ss_cp")
+    raw_at_lower = _raw_curve_body(f"INDEX({names['control_period']},ss_i)")
+    raw_at_upper = _raw_curve_body(f"INDEX({names['control_period']},ss_j)")
+    if not raw_curve or not raw_at_lower or not raw_at_upper:
+        return ""
+
+    def _bridge(x0: str, y0: str, x1: str, y1: str) -> str:
+        return (
+            f"IF(ABS(({x1})-({x0}))<=1E-12,({y1}),"
+            f"(({y0})+((MIN(MAX(ss_x,MIN(({x0}),({x1}))),MAX(({x0}),({x1})))-({x0}))"
+            f"*(({y1})-({y0}))/(({x1})-({x0})))))"
+        )
+
+    exact_expr = (
+        f"IF(ss_x<ss_ixmin,"
+        f"IF(ss_lpi>0,{_bridge('ss_lpx', 'ss_lpy', 'ss_ilx', 'ss_ily')},ss_ily),"
+        f"IF(ss_x>ss_ixmax,"
+        f"IF(ss_rpi>0,{_bridge('ss_irx', 'ss_iry', 'ss_rpx', 'ss_rpy')},ss_iry),"
+        f"ss_raw_i))"
+    )
+    lower_pair_expr = (
+        f"IF(ss_x<ss_ixmin,"
+        f"IF(ss_jxmin<ss_ixmin,{_bridge('ss_jlx', 'ss_jly', 'ss_ilx', 'ss_ily')},ss_ily),"
+        f"IF(ss_x>ss_ixmax,"
+        f"IF(ss_jxmax>ss_ixmax,{_bridge('ss_irx', 'ss_iry', 'ss_jrx', 'ss_jry')},ss_iry),"
+        f"ss_raw_i))"
+    )
+    upper_pair_expr = (
+        f"IF(ss_x<ss_jxmin,"
+        f"IF(ss_ixmin<ss_jxmin,{_bridge('ss_ilx', 'ss_ily', 'ss_jlx', 'ss_jly')},ss_jly),"
+        f"IF(ss_x>ss_jxmax,"
+        f"IF(ss_ixmax>ss_jxmax,{_bridge('ss_jrx', 'ss_jry', 'ss_irx', 'ss_iry')},ss_jry),"
+        f"ss_raw_j))"
+    )
+    definitions = [
+        ("ss_x", x_expr),
+        ("ss_cp", cp_expr),
+        ("ss_n", f"ROWS({names['control_period']})"),
+        ("ss_i", f"MATCH(ss_cp,{names['control_period']},1)"),
+        ("ss_j", "MIN(ss_i+1,ss_n)"),
+        ("ss_ixmin", f"INDEX({names['x_min']},ss_i)"),
+        ("ss_ixmax", f"INDEX({names['x_max']},ss_i)"),
+        ("ss_ilx", f"INDEX({names['left_x']},ss_i)"),
+        ("ss_ily", f"INDEX({names['left_y']},ss_i)"),
+        ("ss_irx", f"INDEX({names['right_x']},ss_i)"),
+        ("ss_iry", f"INDEX({names['right_y']},ss_i)"),
+        ("ss_jxmin", f"INDEX({names['x_min']},ss_j)"),
+        ("ss_jxmax", f"INDEX({names['x_max']},ss_j)"),
+        ("ss_jlx", f"INDEX({names['left_x']},ss_j)"),
+        ("ss_jly", f"INDEX({names['left_y']},ss_j)"),
+        ("ss_jrx", f"INDEX({names['right_x']},ss_j)"),
+        ("ss_jry", f"INDEX({names['right_y']},ss_j)"),
+        ("ss_lpi", f"INDEX({names['left_partner_index']},ss_i)"),
+        ("ss_rpi", f"INDEX({names['right_partner_index']},ss_i)"),
+        ("ss_lpx", f"INDEX({names['left_x']},MAX(1,ss_lpi))"),
+        ("ss_lpy", f"INDEX({names['left_y']},MAX(1,ss_lpi))"),
+        ("ss_rpx", f"INDEX({names['right_x']},MAX(1,ss_rpi))"),
+        ("ss_rpy", f"INDEX({names['right_y']},MAX(1,ss_rpi))"),
+        ("ss_raw", raw_curve),
+        ("ss_raw_i", raw_at_lower),
+        ("ss_raw_j", raw_at_upper),
+    ]
+    final_expr = (
+        f"IF(ABS(ss_cp-INDEX({names['control_period']},ss_i))<=1E-9,"
+        f"{exact_expr},"
+        f"MIN(MAX(ss_raw,MIN({lower_pair_expr},{upper_pair_expr})),"
+        f"MAX({lower_pair_expr},{upper_pair_expr})))"
+    )
+    return "=LET(" + ",".join(f"{name},{value}" for name, value in definitions) + f",{final_expr})"
+
+
 def _td_smart_solver_excel_formula_for_bounded_curve_cp(
     model: Mapping[str, object],
     *,
     x_ref: str,
     cp_ref: str,
 ) -> str:
+    compact_formula = _td_smart_solver_excel_bounded_curve_cp_support_formula(
+        model,
+        x_ref=x_ref,
+        cp_ref=cp_ref,
+    )
+    if compact_formula:
+        return compact_formula
     support_rows = [
         dict(row)
         for row in (model.get("curve_cp_slice_support") or [])
@@ -34975,6 +35162,14 @@ def _td_smart_solver_excel_formula_for_model(
     control_period_ref: str,
 ) -> str:
     family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    raw_x_ref = str(variable_refs.get("input_1") or "")
+    if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        compact_formula = _td_smart_solver_excel_pchip_support_formula(
+            model,
+            raw_x_ref=raw_x_ref,
+        )
+        if compact_formula:
+            return compact_formula
     pchip_segments = (
         _td_perf_pchip_segment_rows(model, "mean")
         if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP
@@ -35019,7 +35214,6 @@ def _td_smart_solver_excel_formula_for_model(
         TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD,
         TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD,
     }:
-        raw_x_ref = str(variable_refs.get("input_1") or "")
         if not raw_x_ref:
             return ""
         raw_x2_ref = str(variable_refs.get("input_2") or "")
@@ -35389,6 +35583,290 @@ def _td_smart_solver_write_model_detail_sheets(
     return ws_params, ws_support
 
 
+def _td_smart_solver_prepare_excel_formula_support(
+    workbook,
+    result: Mapping[str, object],
+) -> dict[str, object]:
+    """Copy a solver result and attach compact Excel support for PCHIP models.
+
+    The export sheets need a live formula for PCHIP models, but a formula with
+    one nested IF per interval is not safe once a fit contains many knots.
+    Keep the coefficients in a hidden sheet and give each model's formula
+    stable workbook-level names instead.
+    """
+    solver_result = dict(result or {})
+    raw_master_model = result.get("master_model") if isinstance(result, Mapping) else None
+    if not isinstance(raw_master_model, Mapping):
+        return solver_result
+
+    master_model = dict(raw_master_model)
+    solver_result["master_model"] = master_model
+    models: list[tuple[str, dict[str, object]]] = [("selected", master_model)]
+    master_family = td_perf_normalize_fit_mode(master_model.get("fit_family"))
+    if master_family in {
+        TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+        TD_PERF_FIT_FAMILY_STAGED_MEDIATOR,
+    }:
+        for path_key, model_key in (("stage1", "stage1_model"), ("stage2", "stage2_model")):
+            raw_model = master_model.get(model_key)
+            if not isinstance(raw_model, Mapping):
+                continue
+            copied_model = dict(raw_model)
+            master_model[model_key] = copied_model
+            models.append((path_key, copied_model))
+
+    pchip_models: list[tuple[str, dict[str, object], list[dict[str, float | int | str]]]] = []
+    for path_key, model in models:
+        if td_perf_normalize_fit_mode(model.get("fit_family")) != TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+            continue
+        segments = [dict(segment) for segment in _td_perf_pchip_segment_rows(model, "mean")]
+        if segments:
+            pchip_models.append((path_key, model, segments))
+    if not pchip_models:
+        return solver_result
+
+    from openpyxl.styles import Font, PatternFill  # type: ignore
+    from openpyxl.utils import get_column_letter  # type: ignore
+
+    ws_support = workbook.create_sheet("Formula Support")
+    ws_support.sheet_state = "hidden"
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    headers = ["model_path", "x0", "x1", "a", "b", "c", "d", "left_y", "right_y"]
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws_support.cell(1, col_idx)
+        cell.value = header
+        cell.font = header_font
+        cell.fill = header_fill
+
+    field_columns = {
+        "x0": 2,
+        "x1": 3,
+        "a": 4,
+        "b": 5,
+        "c": 6,
+        "d": 7,
+        "left_y": 8,
+        "right_y": 9,
+    }
+    row_idx = 2
+    for path_key, model, segments in pchip_models:
+        start_row = row_idx
+        for segment in segments:
+            ws_support.cell(row_idx, 1).value = path_key
+            for field, col_idx in field_columns.items():
+                ws_support.cell(row_idx, col_idx).value = segment.get(field)
+            row_idx += 1
+        end_row = row_idx - 1
+        prefix = "SmartSolver_PCHIP_" + re.sub(r"[^A-Za-z0-9_]", "_", path_key.title())
+        support_names: dict[str, str] = {}
+        for field, col_idx in field_columns.items():
+            defined_name = f"{prefix}_{field.upper()}"
+            _td_perf_add_defined_name(
+                workbook,
+                name=defined_name,
+                sheet_name=ws_support.title,
+                cell_ref=(
+                    f"{_td_perf_excel_ref(col_idx, start_row, absolute=True)}:"
+                    f"{_td_perf_excel_ref(col_idx, end_row, absolute=True)}"
+                ),
+            )
+            support_names[field] = defined_name
+        model["_excel_pchip_support"] = support_names
+
+    for col_idx, width in enumerate((18, 16, 16, 18, 18, 18, 18, 18, 18), start=1):
+        ws_support.column_dimensions[get_column_letter(col_idx)].width = width
+    return solver_result
+
+
+def _td_smart_solver_prepare_excel_curve_cp_support(
+    workbook,
+    result: Mapping[str, object],
+) -> dict[str, object]:
+    """Attach hidden support ranges for bounded curve/control-period formulas."""
+    solver_result = dict(result or {})
+    raw_master_model = result.get("master_model") if isinstance(result, Mapping) else None
+    if not isinstance(raw_master_model, Mapping):
+        return solver_result
+
+    master_model = dict(raw_master_model)
+    solver_result["master_model"] = master_model
+    models: list[tuple[str, dict[str, object]]] = [("selected", master_model)]
+    master_family = td_perf_normalize_fit_mode(master_model.get("fit_family"))
+    if master_family in {
+        TD_PERF_FIT_FAMILY_STAGED_MEDIATOR_CONTROL_PERIOD,
+        TD_PERF_FIT_FAMILY_STAGED_MEDIATOR,
+    }:
+        for path_key, model_key in (("stage1", "stage1_model"), ("stage2", "stage2_model")):
+            raw_model = master_model.get(model_key)
+            if not isinstance(raw_model, Mapping):
+                continue
+            copied_model = dict(raw_model)
+            master_model[model_key] = copied_model
+            models.append((path_key, copied_model))
+
+    bounded_models: list[tuple[str, dict[str, object], list[dict[str, object]]]] = []
+    for path_key, model in models:
+        family = td_perf_normalize_fit_mode(model.get("fit_family"))
+        if (
+            family not in TD_PERF_CURVE_CONTROL_PERIOD_FAMILIES
+            or str(model.get("smart_solver_boundary_policy") or "").strip().lower()
+            != TD_SMART_SOLVER_BOUNDARY_POLICY_BOUNDED_CURVE_CP_V1
+        ):
+            continue
+        support_rows = [
+            dict(row)
+            for row in (model.get("curve_cp_slice_support") or [])
+            if isinstance(row, Mapping)
+        ]
+        support_rows.sort(key=lambda row: float(row.get("control_period") or 0.0))
+        if support_rows:
+            bounded_models.append((path_key, model, support_rows))
+    if not bounded_models:
+        return solver_result
+
+    from openpyxl.styles import Font, PatternFill  # type: ignore
+    from openpyxl.utils import get_column_letter  # type: ignore
+
+    if "Formula Support" in workbook.sheetnames:
+        ws_support = workbook["Formula Support"]
+        row_idx = max(1, int(ws_support.max_row or 1)) + 2
+    else:
+        ws_support = workbook.create_sheet("Formula Support")
+        ws_support.sheet_state = "hidden"
+        row_idx = 1
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    headers = [
+        "model_path",
+        "control_period",
+        "x_min",
+        "x_max",
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y",
+        "left_partner_index",
+        "right_partner_index",
+    ]
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws_support.cell(row_idx, col_idx)
+        cell.value = header
+        cell.font = header_font
+        cell.fill = header_fill
+    row_idx += 1
+    field_columns = {
+        "control_period": 2,
+        "x_min": 3,
+        "x_max": 4,
+        "left_x": 5,
+        "left_y": 6,
+        "right_x": 7,
+        "right_y": 8,
+        "left_partner_index": 9,
+        "right_partner_index": 10,
+    }
+    for path_key, model, support_rows in bounded_models:
+        start_row = row_idx
+        index_by_cp = {
+            _td_smart_solver_curve_cp_support_key(row.get("control_period")): index
+            for index, row in enumerate(support_rows, start=1)
+            if _td_smart_solver_curve_cp_support_key(row.get("control_period")) is not None
+        }
+        for index, support_row in enumerate(support_rows, start=1):
+            ws_support.cell(row_idx, 1).value = path_key
+            for field, col_idx in field_columns.items():
+                if field == "left_partner_index":
+                    partner = _td_smart_solver_curve_cp_support_key(support_row.get("left_partner_control_period"))
+                    value = int(index_by_cp.get(partner) or 0)
+                elif field == "right_partner_index":
+                    partner = _td_smart_solver_curve_cp_support_key(support_row.get("right_partner_control_period"))
+                    value = int(index_by_cp.get(partner) or 0)
+                else:
+                    value = support_row.get(field)
+                ws_support.cell(row_idx, col_idx).value = value
+            row_idx += 1
+        end_row = row_idx - 1
+        prefix = "SmartSolver_CurveCP_" + re.sub(r"[^A-Za-z0-9_]", "_", path_key.title())
+        support_names: dict[str, str] = {}
+        for field, col_idx in field_columns.items():
+            defined_name = f"{prefix}_{field.upper()}"
+            _td_perf_add_defined_name(
+                workbook,
+                name=defined_name,
+                sheet_name=ws_support.title,
+                cell_ref=(
+                    f"{_td_perf_excel_ref(col_idx, start_row, absolute=True)}:"
+                    f"{_td_perf_excel_ref(col_idx, end_row, absolute=True)}"
+                ),
+            )
+            support_names[field] = defined_name
+        model["_excel_curve_cp_support"] = support_names
+
+    for col_idx, width in enumerate((18, 16, 16, 16, 16, 16, 16, 16, 20, 21), start=1):
+        ws_support.column_dimensions[get_column_letter(col_idx)].width = max(
+            float(ws_support.column_dimensions[get_column_letter(col_idx)].width or 0),
+            float(width),
+        )
+    return solver_result
+
+
+def _td_smart_solver_prepare_excel_three_sigma_support(
+    workbook,
+    result: Mapping[str, object],
+) -> dict[str, object]:
+    """Attach compact lookup ranges for control-period 3-sigma offsets."""
+    solver_result = dict(result or {})
+    support_rows = _td_smart_solver_three_sigma_support_rows(solver_result)
+    if len(support_rows) <= 1:
+        return solver_result
+
+    from openpyxl.styles import Font, PatternFill  # type: ignore
+    from openpyxl.utils import get_column_letter  # type: ignore
+
+    if "Formula Support" in workbook.sheetnames:
+        ws_support = workbook["Formula Support"]
+        row_idx = max(1, int(ws_support.max_row or 1)) + 2
+    else:
+        ws_support = workbook.create_sheet("Formula Support")
+        ws_support.sheet_state = "hidden"
+        row_idx = 1
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    for col_idx, header in enumerate(("control_period", "three_sigma_offset"), start=1):
+        cell = ws_support.cell(row_idx, col_idx)
+        cell.value = header
+        cell.font = header_font
+        cell.fill = header_fill
+    start_row = row_idx + 1
+    for row_idx, support_row in enumerate(support_rows, start=start_row):
+        ws_support.cell(row_idx, 1).value = support_row.get("control_period")
+        ws_support.cell(row_idx, 2).value = support_row.get("three_sigma_offset")
+    end_row = start_row + len(support_rows) - 1
+    support_names: dict[str, str] = {}
+    for field, col_idx in (("control_period", 1), ("three_sigma_offset", 2)):
+        defined_name = "SmartSolver_ThreeSigma_" + (
+            "CONTROL_PERIOD" if field == "control_period" else "OFFSET"
+        )
+        _td_perf_add_defined_name(
+            workbook,
+            name=defined_name,
+            sheet_name=ws_support.title,
+            cell_ref=(
+                f"{_td_perf_excel_ref(col_idx, start_row, absolute=True)}:"
+                f"{_td_perf_excel_ref(col_idx, end_row, absolute=True)}"
+            ),
+        )
+        support_names[field] = defined_name
+    solver_result["_excel_three_sigma_support"] = support_names
+    for col_idx, width in ((1, 18), (2, 20)):
+        ws_support.column_dimensions[get_column_letter(col_idx)].width = max(
+            float(ws_support.column_dimensions[get_column_letter(col_idx)].width or 0),
+            float(width),
+        )
+    return solver_result
+
+
 def td_smart_solver_export_equation_workbook(
     db_path: Path,
     output_path: Path,
@@ -35423,6 +35901,9 @@ def td_smart_solver_export_equation_workbook(
 
     _td_emit_progress(progress_cb, "Building Smart Solver Excel workbook")
     wb = Workbook()
+    solver_result = _td_smart_solver_prepare_excel_formula_support(wb, solver_result)
+    solver_result = _td_smart_solver_prepare_excel_curve_cp_support(wb, solver_result)
+    solver_result = _td_smart_solver_prepare_excel_three_sigma_support(wb, solver_result)
     ws = wb.active
     if ws is None:
         ws = wb.create_sheet("Smart Solver Export")
