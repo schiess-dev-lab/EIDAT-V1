@@ -46271,6 +46271,228 @@ def delete_eidat_project(global_repo: Path, project_dir: Path) -> dict:
     return {"deleted_dir": str(proj_dir), "removed_registry_entries": int(removed)}
 
 
+def _td_tables_with_serial_column(conn: sqlite3.Connection) -> list[str]:
+    """Return every table in this connection that has a `serial` column."""
+    tables: list[str] = []
+    try:
+        names = [
+            str(row[0] or "").strip()
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            if str(row[0] or "").strip()
+        ]
+    except Exception:
+        return tables
+    for name in names:
+        safe = name.replace('"', '""')
+        try:
+            cols = {
+                str(row[1] or "").strip().casefold()
+                for row in conn.execute(f'PRAGMA table_info("{safe}")').fetchall()
+            }
+        except Exception:
+            continue
+        if "serial" in cols:
+            tables.append(name)
+    return tables
+
+
+def list_test_data_project_serial_sources(global_repo: Path, project_dir: Path) -> list[dict]:
+    """List cached serial-number sources for a Test Data Trending project.
+
+    Returns one row per cached source in the project's implementation DB
+    (td_sources joined with td_source_metadata), including program grouping
+    fields and whether the serial's official extraction artifacts folder
+    (under "EIDAT Support/Test Data File Extractions") still exists on disk.
+    """
+    repo = Path(global_repo).expanduser()
+    proj_dir = Path(project_dir).expanduser()
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    out: list[dict] = []
+    if not db_path.exists():
+        return out
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            try:
+                fetched = conn.execute(
+                    """
+                    SELECT s.serial AS serial,
+                           COALESCE(m.source_serial_number, '') AS source_serial_number,
+                           COALESCE(m.program_title, '') AS program_title,
+                           COALESCE(m.asset_type, '') AS asset_type,
+                           COALESCE(m.asset_specific_type, '') AS asset_specific_type,
+                           COALESCE(s.status, '') AS status,
+                           COALESCE(s.sqlite_path, '') AS sqlite_path,
+                           COALESCE(s.last_ingested_epoch_ns, 0) AS last_ingested_epoch_ns
+                    FROM td_sources AS s
+                    LEFT JOIN td_source_metadata AS m ON m.serial = s.serial
+                    ORDER BY program_title COLLATE NOCASE,
+                             source_serial_number COLLATE NOCASE,
+                             s.serial COLLATE NOCASE
+                    """
+                ).fetchall()
+            except Exception:
+                fetched = []
+    except Exception:
+        return out
+    for row in fetched:
+        item = {key: row[key] for key in row.keys()}
+        serial_number = str(item.get("source_serial_number") or "").strip() or str(item.get("serial") or "").strip()
+        source_like = {
+            "serial_number": serial_number,
+            "program_title": item.get("program_title"),
+            "asset_type": item.get("asset_type"),
+            "asset_specific_type": item.get("asset_specific_type"),
+        }
+        try:
+            art_dir = _td_official_artifacts_dir_for_source_like(repo, source_like)
+        except Exception:
+            art_dir = None
+        item["official_artifacts_dir"] = str(art_dir) if art_dir is not None else ""
+        try:
+            item["official_artifacts_exists"] = bool(art_dir is not None and art_dir.exists())
+        except Exception:
+            item["official_artifacts_exists"] = False
+        out.append(item)
+    return out
+
+
+def purge_test_data_project_serials(
+    global_repo: Path,
+    project_dir: Path,
+    serials: Sequence[object],
+    *,
+    delete_official_artifacts: bool = True,
+) -> dict:
+    """Purge selected cached serial sources from a Test Data Trending project.
+
+    Deletes every cached row for the selected serials from the project's
+    implementation DB and raw cache DB (any table with a `serial` column,
+    which covers td_sources/td_source_metadata/td_runs facts, trend
+    serials/term_values, plotter tables, and dynamic td_raw__* tables), and
+    optionally deletes each serial's official extraction artifacts folder
+    under "EIDAT Support/Test Data File Extractions".
+
+    After a purge the next Update Projects run re-creates the serial from
+    scratch from its source document instead of re-using cached data.
+
+    Note: rows are matched by both the cached composite source key and the
+    plain source serial number, so sibling documents that share the same
+    serial number are also refreshed on the next update (they re-ingest
+    cleanly rather than trending against stale rows).
+    """
+    repo = Path(global_repo).expanduser()
+    proj_dir = Path(project_dir).expanduser()
+    selected = sorted({str(value).strip() for value in (serials or []) if str(value).strip()})
+    result: dict = {
+        "requested_serials": list(selected),
+        "delete_keys": [],
+        "impl_rows_deleted": 0,
+        "raw_rows_deleted": 0,
+        "deleted_artifact_dirs": [],
+        "errors": [],
+    }
+    if not selected:
+        return result
+
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    raw_db_path = td_raw_cache_db_path_for(proj_dir)
+
+    # Resolve deletion keys and official artifact dirs from metadata BEFORE
+    # deleting any rows (the metadata rows are among the ones being purged).
+    delete_keys: set[str] = set(selected)
+    artifact_dirs: dict[str, str] = {}
+    if db_path.exists():
+        try:
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                placeholders = ",".join("?" for _ in selected)
+                try:
+                    meta_rows = conn.execute(
+                        f"""
+                        SELECT serial,
+                               COALESCE(source_serial_number, '') AS source_serial_number,
+                               COALESCE(program_title, '') AS program_title,
+                               COALESCE(asset_type, '') AS asset_type,
+                               COALESCE(asset_specific_type, '') AS asset_specific_type
+                        FROM td_source_metadata
+                        WHERE serial IN ({placeholders})
+                        """,
+                        tuple(selected),
+                    ).fetchall()
+                except Exception:
+                    meta_rows = []
+            for row in meta_rows:
+                serial_number = str(row["source_serial_number"] or "").strip()
+                if serial_number:
+                    delete_keys.add(serial_number)
+                source_like = {
+                    "serial_number": serial_number or str(row["serial"] or "").strip(),
+                    "program_title": row["program_title"],
+                    "asset_type": row["asset_type"],
+                    "asset_specific_type": row["asset_specific_type"],
+                }
+                try:
+                    art_dir = _td_official_artifacts_dir_for_source_like(repo, source_like)
+                except Exception:
+                    art_dir = None
+                if art_dir is not None:
+                    artifact_dirs[str(art_dir)] = str(row["serial"] or "").strip()
+        except Exception as exc:
+            result["errors"].append(f"metadata lookup failed: {exc}")
+
+    keys = sorted(delete_keys)
+    result["delete_keys"] = list(keys)
+    placeholders = ",".join("?" for _ in keys)
+
+    def _purge_conn(path: Path) -> int:
+        deleted = 0
+        if not path.exists():
+            return deleted
+        conn = sqlite3.connect(str(path))
+        try:
+            for table_name in _td_tables_with_serial_column(conn):
+                safe = table_name.replace('"', '""')
+                try:
+                    cur = conn.execute(
+                        f'DELETE FROM "{safe}" WHERE serial IN ({placeholders})',
+                        tuple(keys),
+                    )
+                    deleted += int(cur.rowcount or 0)
+                except Exception as exc:
+                    result["errors"].append(f"{path.name}:{table_name}: {exc}")
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return deleted
+
+    result["impl_rows_deleted"] = _purge_conn(db_path)
+    result["raw_rows_deleted"] = _purge_conn(raw_db_path)
+
+    if delete_official_artifacts:
+        support_dir = eidat_support_dir(repo)
+        for art_dir_text in sorted(artifact_dirs.keys()):
+            art_dir = Path(art_dir_text)
+            try:
+                if not art_dir.exists():
+                    continue
+                # Safety: only ever delete inside the official TD extractions tree.
+                if not _path_is_within_root(art_dir, support_dir / TD_SERIAL_SOURCES_DIRNAME):
+                    result["errors"].append(f"skipped artifacts outside TD tree: {art_dir}")
+                    continue
+                shutil.rmtree(art_dir)
+                result["deleted_artifact_dirs"].append(str(art_dir))
+            except Exception as exc:
+                result["errors"].append(f"artifacts delete failed ({art_dir}): {exc}")
+
+    return result
+
+
 def _mirror_project_to_local(project_dir: Path, *, project_name: str) -> Path:
     """Copy project folder (workbook + project.json) into the repo-local mirror."""
     src = Path(project_dir).expanduser()

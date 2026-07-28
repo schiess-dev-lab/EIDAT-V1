@@ -205,6 +205,41 @@ def delete_project(node_root: str | Path | None, *, project_dir: str | Path) -> 
     return dict(be.delete_eidat_project(repo, Path(project_dir).expanduser()) or {})
 
 
+def list_project_serials(node_root: str | Path | None, *, project_dir: str | Path) -> list[dict[str, Any]]:
+    """List cached serial-number sources for a node's Test Data Trending project."""
+    be = _be(node_root)
+    repo = global_repo(node_root)
+    proj_dir = _resolve_node_project_dir(repo, project_dir)
+    return list(be.list_test_data_project_serial_sources(repo, proj_dir) or [])
+
+
+def purge_project_serials(
+    node_root: str | Path | None,
+    *,
+    project_dir: str | Path,
+    serials: list[str],
+    delete_official_artifacts: bool = True,
+) -> dict[str, Any]:
+    """Purge selected serials from a Test Data Trending project's caches.
+
+    Removes the serials' rows from the project implementation DB and raw
+    cache DB and (optionally) deletes their official extraction artifacts so
+    the next Update Projects run re-creates them from scratch.
+    """
+    be = _be(node_root)
+    repo = global_repo(node_root)
+    proj_dir = _resolve_node_project_dir(repo, project_dir)
+    return dict(
+        be.purge_test_data_project_serials(
+            repo,
+            proj_dir,
+            list(serials or []),
+            delete_official_artifacts=bool(delete_official_artifacts),
+        )
+        or {}
+    )
+
+
 def open_path(path: str | Path) -> None:
     be = _be()
     be.open_path(Path(path).expanduser())

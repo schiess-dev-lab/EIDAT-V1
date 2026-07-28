@@ -13,6 +13,13 @@ from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
 from . import admin_db
 from .admin_runner import now_ns, run_pipeline
 
+# Extraction V2 (new pipeline) — optional; the legacy dashboard is fully
+# functional without it. Never wired to the legacy runner.
+try:
+    from extraction_v2 import admin_panel as _v2_panel  # type: ignore
+except Exception:  # pragma: no cover - missing deps (rapidocr/cv2/...)
+    _v2_panel = None
+
 
 def _as_abs(p: str | Path) -> Path:
     path = Path(p).expanduser()
@@ -329,6 +336,213 @@ class _ProjectUpdatePickerDialog(QtWidgets.QDialog):
         return out
 
 
+class _TdSerialManagerDialog(QtWidgets.QDialog):
+    """Browse a Test Data Trending project's cached programs/serials and purge selected serials.
+
+    Purging removes all cached rows for the serial from the project's
+    implementation and raw-cache DBs and (optionally) deletes the serial's
+    official extraction artifacts, so the next Update Projects run re-creates
+    the serial completely from scratch instead of re-using cached data.
+    """
+
+    def __init__(self, *, node_name: str, node_root: str, projects: list[dict[str, object]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Test Data Serials")
+        self.resize(980, 620)
+        self._node_root = str(node_root)
+        self._projects = [dict(item or {}) for item in (projects or []) if isinstance(item, dict)]
+        self.purged_any = False
+        self.last_purged_project: dict[str, object] | None = None
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        heading = QtWidgets.QLabel(f"Test Data serial numbers for {node_name}")
+        heading.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a;")
+        layout.addWidget(heading)
+
+        hint = QtWidgets.QLabel(
+            "Select one or more serial numbers and delete them to purge every cached row and "
+            "extraction artifact for that serial. The next Update Projects run then re-creates "
+            "the serial from scratch from its source document (no cache re-use)."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 12px; color: #475569;")
+        layout.addWidget(hint)
+
+        proj_row = QtWidgets.QHBoxLayout()
+        proj_row.addWidget(QtWidgets.QLabel("Project:"))
+        self.cmb_project = QtWidgets.QComboBox()
+        for project in self._projects:
+            self.cmb_project.addItem(str(project.get("name") or project.get("project_dir") or "?"), dict(project))
+        proj_row.addWidget(self.cmb_project, 1)
+        self.btn_reload = QtWidgets.QPushButton("Refresh List")
+        proj_row.addWidget(self.btn_reload)
+        layout.addLayout(proj_row)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["Program / Serial", "Serial Number", "Asset", "Status", "Cached Artifacts"])
+        self.tree.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tree.setColumnWidth(0, 340)
+        self.tree.setColumnWidth(1, 160)
+        self.tree.setColumnWidth(2, 160)
+        self.tree.setColumnWidth(3, 110)
+        layout.addWidget(self.tree, 1)
+
+        self.cb_delete_artifacts = QtWidgets.QCheckBox(
+            "Also delete extracted serial artifacts (Test Data File Extractions)"
+        )
+        self.cb_delete_artifacts.setChecked(True)
+        self.cb_delete_artifacts.setToolTip(
+            "Deletes the serial's folder under EIDAT Support\\Test Data File Extractions so the "
+            "extraction is rebuilt from the source document, not re-materialized from cache."
+        )
+        layout.addWidget(self.cb_delete_artifacts)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        self.lbl_status = QtWidgets.QLabel("")
+        self.lbl_status.setStyleSheet("color:#475569;")
+        btn_row.addWidget(self.lbl_status, 1)
+        self.btn_delete = QtWidgets.QPushButton("Delete Selected Serials…")
+        self.btn_delete.setEnabled(False)
+        self.btn_close = QtWidgets.QPushButton("Close")
+        btn_row.addWidget(self.btn_delete)
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+        self.btn_close.clicked.connect(self.accept)
+        self.btn_reload.clicked.connect(self.reload_serials)
+        self.cmb_project.currentIndexChanged.connect(lambda _=0: self.reload_serials())
+        self.tree.itemSelectionChanged.connect(self._refresh_buttons)
+        self.btn_delete.clicked.connect(self._act_delete_selected)
+
+        self.reload_serials()
+
+    def current_project(self) -> dict[str, object]:
+        payload = self.cmb_project.currentData()
+        return dict(payload or {}) if isinstance(payload, dict) else {}
+
+    def reload_serials(self) -> None:
+        from . import node_backend
+
+        self.tree.clear()
+        project = self.current_project()
+        project_dir = str(project.get("project_dir") or "").strip()
+        if not project_dir:
+            self.lbl_status.setText("No project selected.")
+            self._refresh_buttons()
+            return
+        try:
+            rows = list(node_backend.list_project_serials(self._node_root, project_dir=project_dir) or [])
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Test Data Serials", str(exc))
+            rows = []
+        groups: dict[str, QtWidgets.QTreeWidgetItem] = {}
+        for row in rows:
+            program = str(row.get("program_title") or "").strip() or "(Unknown Program)"
+            parent = groups.get(program)
+            if parent is None:
+                parent = QtWidgets.QTreeWidgetItem([program, "", "", "", ""])
+                parent.setFlags(parent.flags() & ~QtCore.Qt.ItemFlag.ItemIsSelectable)
+                self.tree.addTopLevelItem(parent)
+                parent.setFirstColumnSpanned(True)
+                groups[program] = parent
+            asset = " / ".join(
+                part
+                for part in (
+                    str(row.get("asset_type") or "").strip(),
+                    str(row.get("asset_specific_type") or "").strip(),
+                )
+                if part
+            )
+            artifacts = "on disk" if row.get("official_artifacts_exists") else "missing"
+            item = QtWidgets.QTreeWidgetItem(
+                [
+                    str(row.get("serial") or "").strip(),
+                    str(row.get("source_serial_number") or "").strip(),
+                    asset,
+                    str(row.get("status") or "").strip(),
+                    artifacts,
+                ]
+            )
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, dict(row))
+            item.setToolTip(0, str(row.get("serial") or "").strip())
+            item.setToolTip(4, str(row.get("official_artifacts_dir") or "").strip())
+            parent.addChild(item)
+        self.tree.expandAll()
+        count = sum(parent.childCount() for parent in groups.values())
+        self.lbl_status.setText(f"{count} cached serial source(s) in {len(groups)} program(s).")
+        self._refresh_buttons()
+
+    def selected_serials(self) -> list[str]:
+        out: list[str] = []
+        for item in self.tree.selectedItems():
+            payload = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(payload, dict):
+                serial = str(payload.get("serial") or "").strip()
+                if serial and serial not in out:
+                    out.append(serial)
+        return out
+
+    def _refresh_buttons(self) -> None:
+        self.btn_delete.setEnabled(bool(self.selected_serials()))
+
+    def _act_delete_selected(self) -> None:
+        from . import node_backend
+
+        project = self.current_project()
+        project_dir = str(project.get("project_dir") or "").strip()
+        serials = self.selected_serials()
+        if not project_dir or not serials:
+            return
+        preview = "\n".join(f"  {serial}" for serial in serials[:20])
+        if len(serials) > 20:
+            preview += f"\n  … and {len(serials) - 20} more"
+        artifacts_note = (
+            "Their extracted serial artifacts (Test Data File Extractions) will also be deleted.\n\n"
+            if self.cb_delete_artifacts.isChecked()
+            else "Extracted serial artifacts are kept (cache rows only).\n\n"
+        )
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Serials",
+            (
+                f"Delete {len(serials)} serial(s) and ALL of their cached data from "
+                f"project '{project.get('name')}'?\n\n{preview}\n\n"
+                + artifacts_note
+                + "Source documents (EIDPs / TD reports) are NOT deleted. The next "
+                "Update Projects run re-creates these serials from scratch.\n\nContinue?"
+            ),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = node_backend.purge_project_serials(
+                self._node_root,
+                project_dir=project_dir,
+                serials=serials,
+                delete_official_artifacts=bool(self.cb_delete_artifacts.isChecked()),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Delete Serials", str(exc))
+            return
+        self.purged_any = True
+        self.last_purged_project = dict(project)
+        impl_rows = int(result.get("impl_rows_deleted") or 0)
+        raw_rows = int(result.get("raw_rows_deleted") or 0)
+        art_dirs = list(result.get("deleted_artifact_dirs") or [])
+        errors = [str(e) for e in (result.get("errors") or [])]
+        summary = (
+            f"Purged {len(serials)} serial(s): {impl_rows} project cache row(s), "
+            f"{raw_rows} raw cache row(s), {len(art_dirs)} artifact folder(s) deleted."
+        )
+        if errors:
+            summary += "\n\nWarnings:\n" + "\n".join(f"  {e}" for e in errors[:10])
+        QtWidgets.QMessageBox.information(self, "Delete Serials", summary)
+        self.reload_serials()
+
+
 class AdminWindow(QtWidgets.QMainWindow):
     def __init__(self, *, runtime_root: Path, registry_path: Path):
         super().__init__()
@@ -368,8 +582,8 @@ class AdminWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.lbl_proc_cfg, 1)
         layout.addLayout(actions)
 
-        self.tbl = QtWidgets.QTableWidget(0, 6)
-        self.tbl.setHorizontalHeaderLabels(["Enabled", "Node Root", "Status", "Last Run", "Env", "Actions"])
+        self.tbl = QtWidgets.QTableWidget(0, 7)
+        self.tbl.setHorizontalHeaderLabels(["Enabled", "Node Root", "Status", "Last Run", "Env", "Actions", "Extraction V2"])
         hdr = self.tbl.horizontalHeader()
         hdr.setSectionsMovable(True)
         hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
@@ -586,6 +800,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                 b_update = QtWidgets.QPushButton("Update Proc")
                 b_update_projects = QtWidgets.QPushButton("Update Projects")
                 b_force_file = QtWidgets.QPushButton("Force File")
+                b_td_serials = QtWidgets.QPushButton("TD Serials")
                 b_update.setToolTip(
                     "Refresh node runtime and node UI venv packages against the current runtime code "
                     "without deleting node caches/artifacts."
@@ -597,7 +812,11 @@ class AdminWindow(QtWidgets.QMainWindow):
                     "Select one PDF, Excel, or MAT source file in this node and rebuild only that file's "
                     "EIDAT Support artifacts, metadata, source pointer when applicable, and index entries."
                 )
-                for b in (b_open, b_deploy, b_reset, b_proc, b_update, b_update_projects, b_force_file):
+                b_td_serials.setToolTip(
+                    "View a Test Data Trending project's programs/serial numbers and delete a serial "
+                    "with ALL of its cached data, so the next Update Projects run re-creates it from scratch."
+                )
+                for b in (b_open, b_deploy, b_reset, b_proc, b_update, b_update_projects, b_force_file, b_td_serials):
                     b.setMinimumHeight(30)
                     b.setMinimumWidth(130)
                     b.setMaximumWidth(145)
@@ -608,6 +827,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                 b_update.clicked.connect(lambda _=False, nid=n.node_id: self._update_processor(nid))
                 b_update_projects.clicked.connect(lambda _=False, nid=n.node_id: self._act_update_projects(nid))
                 b_force_file.clicked.connect(lambda _=False, nid=n.node_id: self._act_force_single_file(nid))
+                b_td_serials.clicked.connect(lambda _=False, nid=n.node_id: self._act_manage_td_serials(nid))
                 row1.addWidget(b_open)
                 row1.addWidget(b_deploy)
                 row1.addWidget(b_reset)
@@ -615,12 +835,34 @@ class AdminWindow(QtWidgets.QMainWindow):
                 row2.addWidget(b_update)
                 row2.addWidget(b_update_projects)
                 row2.addWidget(b_force_file)
+                row2.addWidget(b_td_serials)
                 row1.addStretch(1)
                 row2.addStretch(1)
                 outer.addLayout(row1)
                 outer.addLayout(row2)
                 btns.setMinimumHeight(72)
                 self.tbl.setCellWidget(r, 5, btns)
+
+                # --- Extraction V2 column (independent of legacy runner) ---
+                if _v2_panel is not None:
+                    try:
+                        v2_cell = _v2_panel.make_v2_cell(
+                            self, n.node_id, n.node_root, str(self._runtime_root)
+                        )
+                        self.tbl.setCellWidget(r, 6, v2_cell)
+                    except Exception as exc:
+                        it_v2 = QtWidgets.QTableWidgetItem(f"v2 error: {exc}")
+                        it_v2.setFlags(it_v2.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                        self.tbl.setItem(r, 6, it_v2)
+                else:
+                    it_v2 = QtWidgets.QTableWidgetItem("v2 not installed")
+                    it_v2.setToolTip(
+                        "Extraction V2 needs: pip install rapidocr onnxruntime "
+                        "opencv-python-headless pypdfium2 pdfplumber"
+                    )
+                    it_v2.setFlags(it_v2.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    self.tbl.setItem(r, 6, it_v2)
+
                 self.tbl.setRowHeight(r, 88)
         finally:
             self.tbl.blockSignals(False)
@@ -818,6 +1060,75 @@ class AdminWindow(QtWidgets.QMainWindow):
             self.worker.start()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Update Projects", str(exc))
+
+    def _act_manage_td_serials(self, node_id: str) -> None:
+        nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}
+        n = nodes.get(node_id)
+        if not n:
+            return
+        if self.worker.isRunning():
+            QtWidgets.QMessageBox.information(self, "Busy", "Processing is already running.")
+            return
+        try:
+            from . import node_backend
+
+            td_type = "Test Data Trending"
+            projects = [
+                p
+                for p in (node_backend.list_projects(n.node_root) or [])
+                if str(p.get("type") or "").strip() == td_type
+            ]
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Test Data Serials", str(exc))
+            return
+        if not projects:
+            QtWidgets.QMessageBox.information(
+                self, "Test Data Serials", "This node has no Test Data Trending projects."
+            )
+            return
+        dlg = _TdSerialManagerDialog(
+            node_name=Path(n.node_root).name, node_root=n.node_root, projects=projects, parent=self
+        )
+        try:
+            dlg.exec()
+            purged_project = dict(dlg.last_purged_project or {}) if dlg.purged_any else {}
+        finally:
+            dlg.deleteLater()
+        if not purged_project:
+            return
+        self._append_log(
+            f"[TD SERIALS] Purged serial cache in project '{purged_project.get('name')}' ({n.node_root})"
+        )
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Re-process Project",
+            (
+                f"Run Update Projects now for '{purged_project.get('name')}' to re-create the "
+                "deleted serial number(s) from scratch?"
+            ),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._ensure_node_env_file(n.node_root)
+        self.worker.set_tasks(
+            [
+                (
+                    n.node_id,
+                    n.node_root,
+                    n.runtime_root,
+                    True,
+                    "update_projects",
+                    {
+                        "projects": [purged_project],
+                        "overwrite": False,
+                        "force_project_rebuild": False,
+                    },
+                )
+            ]
+        )
+        self._run_status.begin(f"Update Projects: {Path(n.node_root).name} (1 selected)")
+        self.worker.start()
 
     def _act_scan_force_candidates(self, node_id: str) -> None:
         nodes = {n.node_id: n for n in admin_db.list_nodes(self._conn)}

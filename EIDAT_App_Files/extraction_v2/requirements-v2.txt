@@ -1,0 +1,9 @@
+# Extraction V2 dependencies — all pip-installable, no standalone EXEs.
+# Install into the runtime venv:  EIDAT_App_Files\.venv\Scripts\pip install -r extraction_v2\requirements-v2.txt
+pypdfium2>=4.0
+opencv-python-headless>=4.8
+numpy>=1.24
+pdfplumber>=0.11
+# OCR (production default): RapidOCR on Microsoft's ONNX Runtime; models ship inside the wheel.
+rapidocr>=2.0
+onnxruntime>=1.17
