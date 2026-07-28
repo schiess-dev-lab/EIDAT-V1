@@ -30437,7 +30437,11 @@ TD_SMART_SOLVER_VARIABLE_DESCRIPTORS = {
     "input1": "Primary driver. Always required.",
     "input2": "Secondary direct driver for the 3D solve.",
     "input3": "Correlation helper. Use when a third metric improves the solve, especially in edge cases.",
-    "control_period": "Control-period behavior remains unchanged in this solver pass.",
+    "control_period": (
+        "Hard input: fits control-period-aware models (per-CP slices). "
+        "Swept input: pools data across control periods and fits a single "
+        "control-period-independent equation."
+    ),
 }
 
 TD_SMART_SOLVER_STAGE1_SURFACE_MIN_POINTS = 8
@@ -31511,7 +31515,12 @@ def td_smart_solver_run(
     input3_name = _td_smart_solver_selection_display_name(parameter_context, input3_selection)
     normalized_run_type_mode = td_perf_normalize_run_type_mode(run_type_mode)
     solver_run_type_mode = "steady_state" if normalized_run_type_mode == "steady_state" else "pulsed_mode"
-    uses_control_period = solver_run_type_mode == "pulsed_mode"
+    pulsed_mode_active = solver_run_type_mode == "pulsed_mode"
+    # Control period is only a model dimension when the user keeps the
+    # "hard input" option enabled. When disabled (swept input), pulsed-mode
+    # rows are pooled across control periods and the solver fits
+    # control-period-independent models (same fitting path as steady-state).
+    uses_control_period = pulsed_mode_active and bool(control_period_hard_input)
 
     runs_list = [str(value or "").strip() for value in (runs or []) if str(value or "").strip()]
     serial_set = {str(value or "").strip() for value in (serials or []) if str(value or "").strip()}
@@ -31530,7 +31539,7 @@ def td_smart_solver_run(
         _td_smart_solver_compact_value(value)
         for value in (control_period_filters or [])
         if _td_smart_solver_compact_value(value)
-    } if uses_control_period else set()
+    } if pulsed_mode_active else set()
 
     output_units = ""
     input1_units = ""
@@ -31665,13 +31674,13 @@ def td_smart_solver_run(
                 "control_period",
                 row_x1.get("control_period", row_x2.get("control_period", row_x3.get("control_period"))),
             )
-            if uses_control_period and not _td_smart_solver_match_filter_value(control_period, control_period_allowed):
+            if pulsed_mode_active and not _td_smart_solver_match_filter_value(control_period, control_period_allowed):
                 continue
             x1_value = _td_finite_float(row_x1.get("value_num"))
             x2_value = _td_finite_float(row_x2.get("value_num")) if input2_name else None
             x3_value = _td_finite_float(row_x3.get("value_num")) if input3_name else None
             y_value = _td_finite_float(row_y.get("value_num"))
-            cp_value = _td_finite_float(control_period) if uses_control_period else None
+            cp_value = _td_finite_float(control_period) if pulsed_mode_active else None
             if (
                 x1_value is None
                 or y_value is None
@@ -31697,7 +31706,7 @@ def td_smart_solver_run(
                         or ""
                     ).strip(),
                     "condition_label": _td_perf_export_condition_label(base_row, display_name=str(run_name or "").strip()),
-                    "control_period": (float(cp_value) if uses_control_period and cp_value is not None else None),
+                    "control_period": (float(cp_value) if pulsed_mode_active and cp_value is not None else None),
                     "suppression_voltage": suppression_voltage,
                     "input_1": float(x1_value),
                     "input_2": (float(x2_value) if input2_name and x2_value is not None else None),
@@ -32214,7 +32223,10 @@ def td_smart_solver_run(
         eligible_control_period_values = [float(value) for value in (support.get("eligible_control_period_values") or [])]
         slice_rows = _cp_slice_rows(support.get("slice_rows") or [])
     else:
-        _td_emit_progress(progress_cb, "Fitting steady-state model")
+        _td_emit_progress(
+            progress_cb,
+            "Fitting pooled model (control period swept)" if pulsed_mode_active else "Fitting steady-state model",
+        )
         if input2_name:
             model = td_perf_fit_surface_model(
                 x1_values,
@@ -46269,6 +46281,7 @@ def delete_eidat_project(global_repo: Path, project_dir: Path) -> dict:
         pass
 
     return {"deleted_dir": str(proj_dir), "removed_registry_entries": int(removed)}
+
 
 
 def _td_tables_with_serial_column(conn: sqlite3.Connection) -> list[str]:

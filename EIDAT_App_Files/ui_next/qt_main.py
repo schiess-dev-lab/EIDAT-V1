@@ -15274,7 +15274,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         cb_cp_hard_input = QtWidgets.QCheckBox("Treat Control Period as hard input")
         cb_cp_hard_input.setChecked(bool((self._smart_solver_config or {}).get("control_period_hard_input", True)))
         form.addRow(lbl_cp_field, cb_cp_hard_input)
-        lbl_cp_help = QtWidgets.QLabel("Control-period behavior remains unchanged in this solver pass.")
+        lbl_cp_help = QtWidgets.QLabel(
+            "Checked: control period is a model dimension (per-control-period fits; requires 2+ distinct "
+            "control periods). Unchecked (swept): data is pooled across control periods and the solved "
+            "equation is independent of control period."
+        )
         lbl_cp_help.setObjectName("smart_solver_help_control_period")
         lbl_cp_help.setWordWrap(True)
         lbl_cp_help.setStyleSheet("color: #64748b; font-size: 10px;")
