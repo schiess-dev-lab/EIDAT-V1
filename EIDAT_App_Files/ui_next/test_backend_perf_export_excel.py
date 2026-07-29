@@ -350,7 +350,10 @@ class TestBackendPerfExportExcel(unittest.TestCase):
             self.assertEqual(exported, out_path)
             wb = load_workbook(str(out_path), data_only=False)
             try:
-                self.assertEqual(wb.sheetnames, ["Interactive Calculator", "Mean Regression Checker"])
+                self.assertEqual(
+                    wb.sheetnames,
+                    ["Interactive Calculator", "Mean Regression Checker", "Model Parameters"],
+                )
                 self.assertIsNotNone(wb.defined_names.get("Input_1"))
 
                 ws = wb["Interactive Calculator"]
@@ -381,6 +384,73 @@ class TestBackendPerfExportExcel(unittest.TestCase):
                 self.assertIn("IFERROR", pred_formula)
                 pct_formula = str(checker.cell(header_row + 1, checker_headers["pct_delta_mean"]).value or "")
                 self.assertIn("/", pct_formula)
+            finally:
+                wb.close()
+
+    def test_export_interactive_equation_workbook_writes_compact_named_formulas(self) -> None:
+        try:
+            import scipy  # noqa: F401
+        except Exception:
+            self.skipTest("scipy not installed")
+        import math
+
+        db_path = _create_perf_export_db()
+        knots = [float(index) * 3.7 for index in range(40)]
+        knot_values = sorted(math.sqrt(value + 1.0) for value in knots)
+        results = {
+            "mean": {
+                "master_model": {
+                    "fit_family": backend.TD_PERF_FIT_MODE_MONOTONE_PCHIP,
+                    "params": {
+                        "knots": knots,
+                        "knot_values": knot_values,
+                        "left_y": knot_values[0],
+                        "right_y": knot_values[-1],
+                    },
+                }
+            },
+            "std": {
+                "master_model": {
+                    "fit_family": "polynomial",
+                    "coeffs": [0.001234567890123, 0.123456789012345],
+                    "normalize_x": False,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "interactive_named.xlsx"
+            backend.td_perf_export_interactive_equation_workbook(
+                db_path,
+                out_path,
+                plot_metadata={"plot_dimension": "2d", "output_target": "Out", "input1_target": "In1"},
+                results_by_stat=results,
+                run_specs=[],
+                regression_checker_rows=[
+                    {"run_name": "r1", "input_1": 5.0, "actual_mean": 2.3, "sample_count": 3}
+                ],
+                include_regression_checker=True,
+            )
+            wb = load_workbook(str(out_path), data_only=False)
+            try:
+                self.assertIn("Model Parameters", wb.sheetnames)
+                iw_names = [name for name in wb.defined_names.keys() if name.startswith("IW_")]
+                self.assertTrue(iw_names)
+                formulas = [
+                    str(cell.value)
+                    for sheet in wb.worksheets
+                    for row in sheet.iter_rows()
+                    for cell in row
+                    if isinstance(cell.value, str) and cell.value.startswith("=")
+                ]
+                self.assertTrue(formulas)
+                # Every formula (incl. the 3-sigma ones over the 40-knot PCHIP)
+                # must stay far below Excel's 8192-character formula limit.
+                self.assertLessEqual(max(len(formula) for formula in formulas), 2048)
+                pchip_formula = next(formula for formula in formulas if "IW_mean_kx" in formula)
+                self.assertIn("LET(", pchip_formula)
+                self.assertIn("MATCH(", pchip_formula)
+                three_sigma_formulas = [f for f in formulas if "IW_std_" in f and "IW_mean_" in f]
+                self.assertTrue(three_sigma_formulas)
             finally:
                 wb.close()
 
@@ -741,7 +811,7 @@ class TestBackendPerfExportExcel(unittest.TestCase):
 
             wb = load_workbook(str(out_path), data_only=False)
             try:
-                self.assertEqual(wb.sheetnames, ["Interactive Calculator"])
+                self.assertEqual(wb.sheetnames, ["Interactive Calculator", "Model Parameters"])
                 self.assertIsNotNone(wb.defined_names.get("Input_2"))
                 self.assertIsNone(wb.defined_names.get("Control_Period"))
 

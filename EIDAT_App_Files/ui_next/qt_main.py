@@ -5690,11 +5690,18 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         self.btn_solver_export_matlab = QtWidgets.QPushButton("Export Equation to MATLAB")
         self.btn_solver_export_matlab.setEnabled(False)
         self.btn_solver_export_matlab.clicked.connect(self._export_smart_solver_equations_to_matlab)
+        self.btn_solver_save_equation = QtWidgets.QPushButton("Save Equation")
+        self.btn_solver_save_equation.setEnabled(False)
+        self.btn_solver_save_equation.clicked.connect(self._save_current_smart_solver_equation)
+        self.btn_solver_saved_equations = QtWidgets.QPushButton("Saved Equations...")
+        self.btn_solver_saved_equations.clicked.connect(self._open_saved_smart_solver_equations_popup)
         smart_solver_action_row.addWidget(self.btn_solver_config)
         smart_solver_action_row.addWidget(self.btn_solver_run)
         smart_solver_action_row.addWidget(self.btn_solver_resolve)
         smart_solver_action_row.addWidget(self.btn_solver_export_equations)
         smart_solver_action_row.addWidget(self.btn_solver_export_matlab)
+        smart_solver_action_row.addWidget(self.btn_solver_save_equation)
+        smart_solver_action_row.addWidget(self.btn_solver_saved_equations)
         smart_solver_action_row.addStretch(1)
         smart_solver_layout.addLayout(smart_solver_action_row)
 
@@ -14976,6 +14983,14 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             parts.append(f"Input 3 = {input3_name} (helper)")
         parts.append(f"Control Period = {cp_mode}")
         parts.append(f"Seq cap = {seq_cap_text}")
+        if bool(cfg.get("initial_band_enabled")):
+            try:
+                band_pct = float(cfg.get("initial_band_percent") or 0.0)
+            except Exception:
+                band_pct = 0.0
+            parts.append(f"Initial band = ±{band_pct:g}% / condition" if band_pct > 0.0 else "Initial band = Off")
+        else:
+            parts.append("Initial band = Off")
         return "Config: " + " | ".join(parts)
 
     def _smart_solver_has_exportable_model(self) -> bool:
@@ -15117,6 +15132,10 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             self.btn_solver_export_equations.setEnabled(self._smart_solver_has_exportable_model() and not busy and not export_busy)
         if hasattr(self, "btn_solver_export_matlab"):
             self.btn_solver_export_matlab.setEnabled(self._smart_solver_has_exportable_model() and not busy and not export_busy)
+        if hasattr(self, "btn_solver_save_equation"):
+            self.btn_solver_save_equation.setEnabled(self._smart_solver_has_exportable_model() and not busy and not export_busy)
+        if hasattr(self, "btn_solver_saved_equations"):
+            self.btn_solver_saved_equations.setEnabled(not busy and not export_busy)
         if hasattr(self, "btn_plot"):
             if is_solver:
                 self.btn_plot.setEnabled(bool(getattr(self, "_db_path", None)) and not busy)
@@ -15297,6 +15316,42 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         )
         sp_keep_sequences.setValue(int(seq_cap_value))
         form.addRow("Keep first N sequences / serial:", sp_keep_sequences)
+        cb_initial_band = QtWidgets.QCheckBox("Keep only measurements within ±N% of initial")
+        cb_initial_band.setChecked(bool((self._smart_solver_config or {}).get("initial_band_enabled")))
+        cb_initial_band.setToolTip(
+            "For each serial and run condition (run, valve voltage, suppression voltage, control period, "
+            "pulse width), the first measurement is the baseline. Measurements whose output or any selected "
+            "input drifts beyond the ±% band of that baseline (hardware decay) are excluded from the fit."
+        )
+        sp_initial_band = QtWidgets.QDoubleSpinBox()
+        sp_initial_band.setRange(0.5, 100.0)
+        sp_initial_band.setDecimals(1)
+        sp_initial_band.setSingleStep(0.5)
+        sp_initial_band.setSuffix(" %")
+        try:
+            _band_pct_saved = float((self._smart_solver_config or {}).get("initial_band_percent") or 20.0)
+        except Exception:
+            _band_pct_saved = 20.0
+        sp_initial_band.setValue(_band_pct_saved if 0.5 <= _band_pct_saved <= 100.0 else 20.0)
+        sp_initial_band.setEnabled(cb_initial_band.isChecked())
+        cb_initial_band.toggled.connect(sp_initial_band.setEnabled)
+        band_row = QtWidgets.QWidget()
+        band_layout = QtWidgets.QHBoxLayout(band_row)
+        band_layout.setContentsMargins(0, 0, 0, 0)
+        band_layout.setSpacing(8)
+        band_layout.addWidget(cb_initial_band)
+        band_layout.addWidget(sp_initial_band)
+        band_layout.addStretch(1)
+        form.addRow("Initial band / run condition:", band_row)
+        lbl_band_help = QtWidgets.QLabel(
+            "Ignores decayed data: per run condition, only measurements within the ±% band of the first "
+            "(initial) measurement are kept. Points are judged individually, so measurements that return "
+            "to the band are kept."
+        )
+        lbl_band_help.setObjectName("smart_solver_help_initial_band")
+        lbl_band_help.setWordWrap(True)
+        lbl_band_help.setStyleSheet("color: #64748b; font-size: 10px;")
+        form.addRow("", lbl_band_help)
         form.addRow("Data Source:", QtWidgets.QLabel("td_metrics_calc_sequences"))
         form.addRow(
             "Program Filters:",
@@ -15409,6 +15464,8 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 "input3_target": input3_name,
                 "control_period_hard_input": bool(cb_cp_hard_input.isChecked()),
                 "keep_first_sequences_per_serial": int(sp_keep_sequences.value()),
+                "initial_band_enabled": bool(cb_initial_band.isChecked()),
+                "initial_band_percent": float(sp_initial_band.value()),
             }
             self._refresh_smart_solver_ui()
             dlg.accept()
@@ -15496,6 +15553,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 run_type_mode=str(config.get("run_type_mode") or "pulsed_mode").strip(),
                 control_period_hard_input=bool(config.get("control_period_hard_input", True)),
                 keep_first_sequences_per_serial=int(config.get("keep_first_sequences_per_serial") or 0),
+                initial_band_percent=(
+                    float(config.get("initial_band_percent") or 0.0)
+                    if bool(config.get("initial_band_enabled"))
+                    else None
+                ),
                 runs=runs,
                 serials=serials,
                 program_filters=self._active_program_filter_values(),
@@ -15583,6 +15645,17 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             if dropped_sequence_count > 0 or dropped_point_count > 0:
                 seq_cap_summary += f" | Dropped: {dropped_sequence_count} seq / {dropped_point_count} pts"
             summary_text = f"{summary_text} | {seq_cap_summary}" if summary_text else seq_cap_summary
+        try:
+            initial_band_pct = float((result or {}).get("initial_band_percent") or 0.0)
+        except Exception:
+            initial_band_pct = 0.0
+        if initial_band_pct > 0.0:
+            band_dropped = int((result or {}).get("initial_band_dropped_point_count") or 0)
+            band_groups_affected = int((result or {}).get("initial_band_groups_affected") or 0)
+            band_summary = f"Initial band: ±{initial_band_pct:g}%"
+            if band_dropped > 0:
+                band_summary += f" | Decayed pts dropped: {band_dropped} ({band_groups_affected} condition(s))"
+            summary_text = f"{summary_text} | {band_summary}" if summary_text else band_summary
         if solver_branch:
             solver_label = getattr(be, "td_perf_fit_family_label", None)
             solver_branch_text = solver_label(solver_branch) if callable(solver_label) else solver_branch
@@ -19745,6 +19818,348 @@ class TestDataTrendDialog(QtWidgets.QDialog):
             )
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Export Equation to MATLAB", str(exc))
+
+    def _smart_solver_current_plot_metadata(self) -> dict:
+        result = dict(getattr(self, "_smart_solver_result", {}) or {})
+        config = dict(getattr(self, "_smart_solver_config", {}) or {})
+        fit_points = [dict(row) for row in (result.get("fit_points") or []) if isinstance(row, dict)]
+        run_names = sorted({str(row.get("run_name") or "").strip() for row in fit_points if str(row.get("run_name") or "").strip()})
+        control_period_filters = list(self._active_control_period_filter_values() or [])
+        uses_control_period = bool(result.get("uses_control_period", True))
+        selected_control_period = (
+            control_period_filters[0]
+            if uses_control_period and len(control_period_filters) == 1
+            else None
+        )
+        plot_metadata = {
+            "output_target": str(result.get("output_target") or config.get("output_target") or "").strip(),
+            "output_units": str(result.get("output_units") or "").strip(),
+            "solver_variables": [dict(item) for item in (result.get("solver_variables") or []) if isinstance(item, dict)],
+            "run_selection_label": "Smart Equation Solver",
+            "member_runs": list(run_names),
+            "selected_control_period": selected_control_period,
+            "run_type_mode": str(result.get("run_type_mode") or config.get("run_type_mode") or "pulsed_mode").strip(),
+            "filter_summary": self._smart_solver_filter_summary_text(),
+            "config_text": self._smart_solver_config_text(),
+            "solver_branch": str(result.get("solver_branch") or ""),
+            "selection_reason": str(result.get("selection_reason") or ""),
+        }
+        try:
+            asset_serials = sorted({str(row.get("serial") or "").strip() for row in fit_points if str(row.get("serial") or "").strip()})
+            asset_metadata = be.td_perf_collect_asset_metadata(self._db_path, asset_serials)
+        except Exception:
+            asset_metadata = {}
+        if isinstance(asset_metadata, dict):
+            plot_metadata["asset_type"] = str(asset_metadata.get("primary_asset_type") or "").strip()
+            plot_metadata["asset_specific_type"] = str(asset_metadata.get("primary_asset_specific_type") or "").strip()
+        return plot_metadata
+
+    def _smart_solver_default_saved_name(self) -> str:
+        result = dict(getattr(self, "_smart_solver_result", {}) or {})
+        output_target = str(result.get("output_target") or "").strip()
+        input_targets = [
+            str(result.get(f"input{index}_target") or "").strip()
+            for index in (1, 2, 3)
+            if str(result.get(f"input{index}_target") or "").strip()
+        ]
+        if output_target and input_targets:
+            return f"{output_target} vs {', '.join(input_targets)}"
+        return output_target or "Smart Equation"
+
+    def _save_current_smart_solver_equation(self) -> None:
+        if not self._smart_solver_has_exportable_model():
+            QtWidgets.QMessageBox.information(
+                self,
+                "Save Smart Equation",
+                "Run Smart Equation Solver before saving its equation.",
+            )
+            return
+        result = dict(getattr(self, "_smart_solver_result", {}) or {})
+        if not [row for row in (result.get("fit_points") or []) if isinstance(row, dict)]:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Save Smart Equation",
+                "No Smart Equation Solver fit points are available to save.",
+            )
+            return
+        store = be.load_td_saved_smart_equations(self._project_dir)
+        entries = [dict(item) for item in (store.get("entries") or []) if isinstance(item, dict)]
+        default_name = self._smart_solver_default_saved_name()
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save Smart Equation", "Saved equation name:", text=default_name)
+        if not ok:
+            return
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            QtWidgets.QMessageBox.information(self, "Save Smart Equation", "Enter a saved equation name.")
+            return
+        existing = next(
+            (item for item in entries if str(item.get("name") or "").strip().casefold() == clean_name.casefold()),
+            None,
+        )
+        if existing:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Overwrite Saved Equation",
+                f"A saved smart equation named '{clean_name}' already exists.\n\nOverwrite it?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        try:
+            entry = be.td_smart_solver_build_saved_equation_entry(
+                self._db_path,
+                name=clean_name,
+                result=result,
+                config=dict(getattr(self, "_smart_solver_config", {}) or {}),
+                plot_metadata=self._smart_solver_current_plot_metadata(),
+                existing_id=(existing or {}).get("id"),
+                existing_saved_at=(existing or {}).get("saved_at"),
+            )
+            be.td_smart_solver_upsert_saved_equation(self._project_dir, entry)
+            self._show_toast("Saved smart equation")
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Save Smart Equation", str(exc))
+
+    def _format_saved_smart_equation_detail(self, entry: dict) -> str:
+        result = dict(entry.get("result") or {}) if isinstance(entry.get("result"), dict) else {}
+        input_selectors = entry.get("input_selectors") if isinstance(entry.get("input_selectors"), dict) else {}
+        lines = [
+            f"Name: {str(entry.get('name') or '').strip()}",
+            f"Saved: {str(entry.get('saved_at') or '').strip()}   Updated: {str(entry.get('updated_at') or '').strip()}",
+            f"Output: {str(entry.get('output_target') or '').strip()}"
+            + (f" ({str(entry.get('output_units') or '').strip()})" if str(entry.get('output_units') or '').strip() else ""),
+        ]
+        for key in ("input_1", "input_2", "input_3"):
+            info = input_selectors.get(key) if isinstance(input_selectors.get(key), dict) else None
+            if not info:
+                continue
+            units = str(info.get("units") or "").strip()
+            lines.append(f"{key}: {str(info.get('target') or '').strip()}" + (f" ({units})" if units else ""))
+        branch = str(result.get("solver_branch") or result.get("fit_family") or "").strip()
+        if branch:
+            lines.append(f"Solver Branch: {branch}")
+        equation = str(result.get("equation") or "").strip()
+        if equation:
+            lines.append(f"Equation: {equation}")
+        for label, key in (
+            ("3-Sigma Min", "pred_min_3sigma_equation"),
+            ("3-Sigma Max", "pred_max_3sigma_equation"),
+        ):
+            text_value = str(result.get(key) or "").strip()
+            if text_value:
+                lines.append(f"{label}: {text_value}")
+        fit_points = result.get("fit_points") or []
+        lines.append(f"Fit Points: {len(fit_points) if isinstance(fit_points, list) else 0}")
+        return "\n".join(lines)
+
+    def _start_smart_solver_master_excel_export(self, output_path: Path, *, entries: list[dict]) -> None:
+        output = Path(output_path).expanduser()
+        entry_count = len(entries)
+
+        def _task(report):
+            return be.td_smart_solver_export_master_workbook(
+                self._db_path,
+                output,
+                entries=entries,
+                progress_cb=report,
+            )
+
+        self._start_perf_export_task(
+            heading="Export Master Smart Equation Workbook",
+            status_text=f"Exporting {entry_count} smart equation(s) to {output.name}",
+            task_factory=_task,
+            on_success=lambda payload: self._handle_perf_excel_export_success(
+                payload,
+                heading="Export Master Smart Equation Workbook",
+            ),
+        )
+
+    def _open_saved_smart_solver_equations_popup(self) -> None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Saved Smart Equations")
+        dlg.resize(1080, 640)
+        layout = QtWidgets.QVBoxLayout(dlg)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        hint = QtWidgets.QLabel(
+            "Check the equations to include, then export one master workbook. Equations whose "
+            "output matches another equation's input are chained automatically in the workbook."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        tbl = QtWidgets.QTableWidget(0, 8)
+        tbl.setHorizontalHeaderLabels(
+            [
+                "export",
+                "name",
+                "output",
+                "input_1",
+                "input_2",
+                "input_3",
+                "fit_family",
+                "updated_at",
+            ]
+        )
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        layout.addWidget(tbl, 2)
+
+        detail = QtWidgets.QPlainTextEdit()
+        detail.setReadOnly(True)
+        detail.setMinimumHeight(180)
+        layout.addWidget(detail, 1)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addStretch(1)
+        btn_export_master = QtWidgets.QPushButton("Export Master Workbook")
+        btn_delete = QtWidgets.QPushButton("Delete Selected")
+        btn_close = QtWidgets.QPushButton("Close")
+        for button in (btn_export_master, btn_delete, btn_close):
+            button_row.addWidget(button)
+        layout.addLayout(button_row)
+
+        def _load_entries() -> list[dict]:
+            store = be.load_td_saved_smart_equations(self._project_dir)
+            return [dict(item) for item in (store.get("entries") or []) if isinstance(item, dict)]
+
+        def _selected_entry() -> dict | None:
+            row = tbl.currentRow()
+            if row < 0:
+                return None
+            item = tbl.item(row, 1)
+            data = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            return dict(data) if isinstance(data, dict) else None
+
+        def _checked_entries() -> list[dict]:
+            entries: list[dict] = []
+            for row_idx in range(tbl.rowCount()):
+                check_item = tbl.item(row_idx, 0)
+                name_item = tbl.item(row_idx, 1)
+                if check_item is None or name_item is None:
+                    continue
+                if check_item.checkState() != QtCore.Qt.CheckState.Checked:
+                    continue
+                data = name_item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(data, dict):
+                    entries.append(dict(data))
+            return entries
+
+        def _refresh_table() -> None:
+            entries = _load_entries()
+            tbl.setRowCount(len(entries))
+            for row_idx, entry in enumerate(entries):
+                result = dict(entry.get("result") or {}) if isinstance(entry.get("result"), dict) else {}
+                input_selectors = entry.get("input_selectors") if isinstance(entry.get("input_selectors"), dict) else {}
+
+                check_item = QtWidgets.QTableWidgetItem("")
+                check_item.setFlags(
+                    (check_item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+                    & ~QtCore.Qt.ItemFlag.ItemIsEditable
+                )
+                check_item.setCheckState(QtCore.Qt.CheckState.Checked)
+                tbl.setItem(row_idx, 0, check_item)
+
+                def _input_text(key: str) -> str:
+                    info = input_selectors.get(key) if isinstance(input_selectors.get(key), dict) else None
+                    return str((info or {}).get("target") or "").strip()
+
+                values = [
+                    str(entry.get("name") or "").strip(),
+                    str(entry.get("output_target") or "").strip(),
+                    _input_text("input_1"),
+                    _input_text("input_2"),
+                    _input_text("input_3"),
+                    str(result.get("solver_branch") or result.get("fit_family") or "").strip(),
+                    str(entry.get("updated_at") or "").strip(),
+                ]
+                for offset, value in enumerate(values, start=1):
+                    item = QtWidgets.QTableWidgetItem(value)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    if offset == 1:
+                        item.setData(QtCore.Qt.ItemDataRole.UserRole, entry)
+                    tbl.setItem(row_idx, offset, item)
+            try:
+                tbl.resizeColumnsToContents()
+            except Exception:
+                pass
+            if entries:
+                tbl.selectRow(0)
+            else:
+                detail.clear()
+            btn_export_master.setEnabled(bool(entries))
+            btn_delete.setEnabled(bool(entries) and tbl.currentRow() >= 0)
+
+        def _sync_detail() -> None:
+            entry = _selected_entry()
+            if entry is None:
+                detail.clear()
+                btn_delete.setEnabled(False)
+                return
+            detail.setPlainText(self._format_saved_smart_equation_detail(entry))
+            btn_delete.setEnabled(True)
+
+        def _export_master() -> None:
+            if not getattr(self, "_db_path", None):
+                QtWidgets.QMessageBox.information(dlg, "Saved Smart Equations", "Build/refresh cache first.")
+                return
+            entries = _checked_entries()
+            if not entries:
+                QtWidgets.QMessageBox.information(dlg, "Saved Smart Equations", "Check at least one equation to export.")
+                return
+            try:
+                chain = be.td_smart_solver_build_equation_chain(entries)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Saved Smart Equations", str(exc))
+                return
+            warnings = list(chain.get("warnings") or [])
+            if warnings:
+                answer = QtWidgets.QMessageBox.question(
+                    dlg,
+                    "Chain Warnings",
+                    "\n".join(warnings) + "\n\nContinue with the export?",
+                )
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                dlg,
+                "Export Master Smart Equation Workbook",
+                str(self._project_dir / f"smart_solver_master_workbook_{timestamp}.xlsx"),
+                "Excel Files (*.xlsx)",
+            )
+            if not out_path:
+                return
+            try:
+                self._start_smart_solver_master_excel_export(Path(out_path), entries=entries)
+                dlg.accept()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Saved Smart Equations", str(exc))
+
+        def _delete_selected() -> None:
+            entry = _selected_entry()
+            if entry is None:
+                return
+            answer = QtWidgets.QMessageBox.question(
+                dlg,
+                "Delete Saved Equation",
+                f"Delete saved smart equation '{str(entry.get('name') or '').strip()}'?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            try:
+                be.td_smart_solver_delete_saved_equation(self._project_dir, entry.get("id"))
+                _refresh_table()
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(dlg, "Delete Saved Equation", str(exc))
+
+        tbl.itemSelectionChanged.connect(_sync_detail)
+        btn_export_master.clicked.connect(_export_master)
+        btn_delete.clicked.connect(_delete_selected)
+        btn_close.clicked.connect(dlg.accept)
+        _refresh_table()
+        dlg.exec()
 
     def _open_performance_equations_popup(self) -> None:
         dlg = getattr(self, "_perf_equations_popup", None)

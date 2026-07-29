@@ -24265,7 +24265,8 @@ def td_load_metric_series(
             COALESCE(o.run_type, ''),
             o.control_period,
             o.suppression_voltage,
-            o.valve_voltage
+            o.valve_voltage,
+            o.pulse_width
         FROM {metrics_table} m
         LEFT JOIN {observations_table} o
           ON o.observation_id = m.observation_id
@@ -24317,6 +24318,7 @@ def td_load_metric_series(
             "control_period": r[8],
             "suppression_voltage": r[9],
             "valve_voltage": r[10],
+            "pulse_width": r[11],
         }
         for r in rows
         if str(r[0] or "").strip() and str(r[1] or "").strip()
@@ -31474,6 +31476,113 @@ def _td_smart_solver_apply_sequence_cap(
     return filtered_points, dropped_sequence_count, dropped_point_count
 
 
+def _td_smart_solver_initial_band_percent_value(value: object) -> float:
+    """Normalize the initial-band percent option; <=0 / invalid disables it."""
+    try:
+        pct = float(value)  # type: ignore[arg-type]
+    except Exception:
+        return 0.0
+    if not math.isfinite(pct) or pct <= 0.0:
+        return 0.0
+    return float(pct)
+
+
+def _td_smart_solver_condition_group_key(point: Mapping[str, object]) -> tuple:
+    """Group key: serial x run condition (run, valve V, suppression V, CP, pulse width)."""
+
+    def _num(value: object) -> object:
+        parsed = _td_finite_float(value)
+        if parsed is not None:
+            return round(float(parsed), 9)
+        return str(value or "").strip().casefold()
+
+    return (
+        str(point.get("serial") or "").strip(),
+        str(point.get("run_name") or "").strip().casefold(),
+        _num(point.get("valve_voltage")),
+        _num(point.get("suppression_voltage")),
+        _num(point.get("control_period")),
+        _num(point.get("pulse_width")),
+    )
+
+
+def _td_smart_solver_apply_initial_band_filter(
+    points: Sequence[Mapping[str, object]],
+    initial_band_percent: object,
+) -> tuple[list[dict[str, object]], int, dict[str, object]]:
+    """Drop measurements that decayed outside +/-N% of the initial measurement.
+
+    Points are grouped per serial x run condition (run name, valve voltage,
+    suppression voltage, control period, pulse width) and ordered by the same
+    natural sequence order used by the keep-first-N cap. The first measurement
+    of each group is the baseline; any later point whose output or any selected
+    input drifts more than +/-N% from its own baseline value is dropped. Points
+    are judged independently, so a later measurement that returns to the band
+    is kept. Variables with a zero baseline cannot be banded by percentage and
+    are skipped (counted in the stats).
+    """
+    pct = _td_smart_solver_initial_band_percent_value(initial_band_percent)
+    materialized = [dict(point) for point in (points or []) if isinstance(point, Mapping)]
+    empty_stats: dict[str, object] = {"groups_total": 0, "groups_affected": 0, "zero_baseline_variables": 0}
+    if pct <= 0.0 or not materialized:
+        return materialized, 0, dict(empty_stats)
+    tolerance = pct / 100.0
+
+    groups: dict[tuple, list[int]] = {}
+    for idx, point in enumerate(materialized):
+        groups.setdefault(_td_smart_solver_condition_group_key(point), []).append(idx)
+
+    def _order_key(idx: int) -> tuple:
+        point = materialized[idx]
+        return (
+            _td_smart_solver_sequence_sort_key(_td_smart_solver_sequence_identity(point)),
+            _td_smart_solver_sequence_sort_key(point.get("observation_id")),
+        )
+
+    keep_indices: set[int] = set()
+    groups_affected = 0
+    zero_baseline_variables = 0
+    watched_fields = ("actual_mean", "input_1", "input_2", "input_3")
+    for indices in groups.values():
+        ordered = sorted(indices, key=_order_key)
+        first_point = materialized[ordered[0]]
+        baseline: dict[str, float] = {}
+        for field in watched_fields:
+            value = _td_finite_float(first_point.get(field))
+            if value is None:
+                continue
+            if float(value) == 0.0:
+                zero_baseline_variables += 1
+                continue
+            baseline[field] = float(value)
+        dropped_here = 0
+        for idx in ordered:
+            point = materialized[idx]
+            in_band = True
+            for field, base in baseline.items():
+                value = _td_finite_float(point.get(field))
+                if value is None:
+                    continue
+                if abs(float(value) - base) > tolerance * abs(base):
+                    in_band = False
+                    break
+            if in_band:
+                keep_indices.add(idx)
+            else:
+                dropped_here += 1
+        if dropped_here:
+            groups_affected += 1
+
+    filtered_points = [materialized[idx] for idx in sorted(keep_indices)]
+    dropped_point_count = max(0, len(materialized) - len(filtered_points))
+    stats: dict[str, object] = {
+        "groups_total": len(groups),
+        "groups_affected": int(groups_affected),
+        "zero_baseline_variables": int(zero_baseline_variables),
+    }
+    return filtered_points, dropped_point_count, stats
+
+
 def td_smart_solver_run(
     db_path: Path,
     *,
@@ -31483,6 +31592,7 @@ def td_smart_solver_run(
     input3_target: str = "",
     control_period_hard_input: bool = True,
     keep_first_sequences_per_serial: int | None = None,
+    initial_band_percent: float | None = None,
     run_type_mode: str = "pulsed_mode",
     runs: Sequence[object],
     serials: Sequence[object],
@@ -31674,6 +31784,14 @@ def td_smart_solver_run(
                 "control_period",
                 row_x1.get("control_period", row_x2.get("control_period", row_x3.get("control_period"))),
             )
+            valve_voltage = base_row.get(
+                "valve_voltage",
+                row_x1.get("valve_voltage", row_x2.get("valve_voltage", row_x3.get("valve_voltage"))),
+            )
+            pulse_width = base_row.get(
+                "pulse_width",
+                row_x1.get("pulse_width", row_x2.get("pulse_width", row_x3.get("pulse_width"))),
+            )
             if pulsed_mode_active and not _td_smart_solver_match_filter_value(control_period, control_period_allowed):
                 continue
             x1_value = _td_finite_float(row_x1.get("value_num"))
@@ -31708,6 +31826,8 @@ def td_smart_solver_run(
                     "condition_label": _td_perf_export_condition_label(base_row, display_name=str(run_name or "").strip()),
                     "control_period": (float(cp_value) if pulsed_mode_active and cp_value is not None else None),
                     "suppression_voltage": suppression_voltage,
+                    "valve_voltage": valve_voltage,
+                    "pulse_width": pulse_width,
                     "input_1": float(x1_value),
                     "input_2": (float(x2_value) if input2_name and x2_value is not None else None),
                     "input_3": (float(x3_value) if input3_name and x3_value is not None else None),
@@ -31723,7 +31843,23 @@ def td_smart_solver_run(
             keep_sequence_limit,
         )
 
+    initial_band_pct = _td_smart_solver_initial_band_percent_value(initial_band_percent)
+    initial_band_dropped_point_count = 0
+    initial_band_stats: dict[str, object] = {}
+    if initial_band_pct > 0.0 and points:
+        _td_emit_progress(progress_cb, f"Applying initial band filter (±{initial_band_pct:g}% per run condition)")
+        points, initial_band_dropped_point_count, initial_band_stats = _td_smart_solver_apply_initial_band_filter(
+            points,
+            initial_band_pct,
+        )
+
     if not points:
+        if initial_band_dropped_point_count > 0:
+            raise RuntimeError(
+                "All qualifying measurements fell outside the ±"
+                f"{initial_band_pct:g}% initial band. Increase the band percentage or disable the "
+                "initial band filter and try again."
+            )
         raise RuntimeError(
             "No qualifying sequence-level mean rows were found for the selected Smart Equation Solver inputs."
         )
@@ -32462,6 +32598,25 @@ def td_smart_solver_run(
             warning_messages.append(
                 f"Sequence cap kept the first {keep_sequence_limit} sequence(s) per serial; no later sequences were present after filtering."
             )
+    if initial_band_pct > 0.0:
+        band_groups_total = int(initial_band_stats.get("groups_total") or 0)
+        band_groups_affected = int(initial_band_stats.get("groups_affected") or 0)
+        if initial_band_dropped_point_count > 0:
+            warning_messages.append(
+                f"Initial band filter (±{initial_band_pct:g}% of the first measurement per run condition) dropped "
+                f"{initial_band_dropped_point_count} decayed point(s) across {band_groups_affected} of "
+                f"{band_groups_total} run condition group(s)."
+            )
+        else:
+            warning_messages.append(
+                f"Initial band filter (±{initial_band_pct:g}%): all measurements stayed within band; no points dropped."
+            )
+        band_zero_baselines = int(initial_band_stats.get("zero_baseline_variables") or 0)
+        if band_zero_baselines > 0:
+            warning_messages.append(
+                f"Initial band filter skipped {band_zero_baselines} variable baseline(s) equal to zero "
+                "(a percentage band of zero is undefined)."
+            )
     if input3_name and not bool(selected_candidate_summary.get("stability_ok")):
         warning_messages.append(
             "Selected 3D branch remained unstable after automatic guardrails; "
@@ -32519,6 +32674,10 @@ def td_smart_solver_run(
         "keep_first_sequences_per_serial": int(keep_sequence_limit),
         "dropped_sequence_count": int(dropped_sequence_count),
         "dropped_point_count": int(dropped_point_count),
+        "initial_band_percent": float(initial_band_pct),
+        "initial_band_dropped_point_count": int(initial_band_dropped_point_count),
+        "initial_band_groups_total": int(initial_band_stats.get("groups_total") or 0),
+        "initial_band_groups_affected": int(initial_band_stats.get("groups_affected") or 0),
         "run_type_mode": solver_run_type_mode,
         "rmse": float(rmse),
         "residual_threshold": float(residual_threshold),
@@ -32571,6 +32730,10 @@ def td_smart_solver_run(
         "input2_units": input2_units,
         "input3_target": input3_name,
         "input3_units": input3_units,
+        "output_selector": output_selection,
+        "input1_selector": input1_selection,
+        "input2_selector": input2_selection,
+        "input3_selector": input3_selection,
         "solver_branch": selected_family,
         "selection_reason": selection_reason,
         "candidate_scores": dict(candidate_scores),
@@ -33177,7 +33340,7 @@ def _td_perf_interactive_summary_rows(
     return rows, unavailable
 
 
-def _td_perf_interactive_formula_map(
+def _td_perf_interactive_inline_formula_map(
     models_by_stat: Mapping[str, Mapping[str, object]],
     *,
     raw_x_ref: str,
@@ -33253,6 +33416,447 @@ def _td_perf_interactive_formula_map(
     }
 
 
+TD_PERF_INTERACTIVE_PARAMS_SHEET = "Model Parameters"
+
+
+def _td_perf_iw_name(stat: str, suffix: str) -> str:
+    safe_stat = re.sub(r"[^A-Za-z0-9_]", "_", str(stat or "").strip()) or "stat"
+    safe_suffix = re.sub(r"[^A-Za-z0-9_]", "_", str(suffix or "").strip()) or "p"
+    return f"IW_{safe_stat}_{safe_suffix}"
+
+
+def _td_perf_iw_float(value: object, default: float) -> float:
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except Exception:
+        return float(default)
+    if not math.isfinite(out):
+        return float(default)
+    return out
+
+
+def _td_perf_iw_horner(coeff_names: Sequence[str], var: str) -> str:
+    """Build a Horner-form polynomial from coefficient *names* (descending powers)."""
+    names = [str(n) for n in coeff_names if str(n)]
+    if not names:
+        return "0"
+    if len(names) == 1:
+        return names[0]
+    expr = names[0]
+    for name in names[1:]:
+        expr = f"({expr}*{var}+{name})"
+    return expr
+
+
+def _td_perf_iw_poly_params(
+    stat: str,
+    label: str,
+    coeffs: Sequence[object],
+) -> tuple[list[str], list[tuple[str, float]]]:
+    """Return (descending coefficient names, params) for a polynomial's coefficients."""
+    values = [_td_perf_iw_float(v, 0.0) for v in (coeffs or [])]
+    degree = len(values) - 1
+    names: list[str] = []
+    params: list[tuple[str, float]] = []
+    for idx, value in enumerate(values):
+        power = degree - idx
+        name = _td_perf_iw_name(stat, f"{label}{power}")
+        names.append(name)
+        params.append((name, value))
+    return names, params
+
+
+def _td_perf_interactive_named_template(
+    stat: str,
+    model: Mapping[str, object],
+    pchip_segments: Sequence[Mapping[str, object]] | None = None,
+) -> tuple[str, tuple[str, ...], list[tuple[str, float]], list[Mapping[str, object]] | None] | None:
+    """Build a compact LET/named-cell formula template for one stat model.
+
+    Returns (template, used placeholders, scalar params, pchip segment rows) or
+    None when the fit family has no named-template support. Templates reference
+    workbook defined names (written by the Model Parameters sheet) and use the
+    placeholders {X}, {X2}, {CP} for the input cell references.
+    """
+    family = td_perf_normalize_fit_mode(model.get("fit_family"))
+    params_map = model.get("params") or {}
+    nm = lambda suffix: _td_perf_iw_name(stat, suffix)  # noqa: E731
+
+    if family == TD_PERF_FIT_MODE_POLYNOMIAL:
+        names, params = _td_perf_iw_poly_params(stat, "c", model.get("coeffs") or [])
+        if not names:
+            return None
+        if bool(model.get("normalize_x")):
+            params.append((nm("xc"), _td_perf_iw_float(model.get("x0"), 0.0)))
+            params.append((nm("xs"), _td_perf_iw_float(model.get("sx"), 1.0)))
+            template = f"LET(x,(({{X}})-{nm('xc')})/{nm('xs')},{_td_perf_iw_horner(names, 'x')})"
+        else:
+            template = f"LET(x,{{X}},{_td_perf_iw_horner(names, 'x')})"
+        return template, ("X",), params, None
+    if family == TD_PERF_FIT_MODE_LOGARITHMIC:
+        params = [
+            (nm("a"), _td_perf_iw_float(params_map.get("a"), 0.0)),
+            (nm("b"), _td_perf_iw_float(params_map.get("b"), 0.0)),
+        ]
+        return f"({nm('a')}+{nm('b')}*LN({{X}}))", ("X",), params, None
+    if family == TD_PERF_FIT_MODE_SATURATING_EXPONENTIAL:
+        params = [
+            (nm("L"), _td_perf_iw_float(params_map.get("L"), 0.0)),
+            (nm("A"), _td_perf_iw_float(params_map.get("A"), 0.0)),
+            (nm("k"), _td_perf_iw_float(params_map.get("k"), 0.0)),
+        ]
+        return f"({nm('L')}-{nm('A')}*EXP(-{nm('k')}*({{X}})))", ("X",), params, None
+    if family == TD_PERF_FIT_MODE_HYBRID_SATURATING_LINEAR:
+        params = [
+            (nm("b"), _td_perf_iw_float(params_map.get("b"), 0.0)),
+            (nm("m"), _td_perf_iw_float(params_map.get("m"), 0.0)),
+            (nm("A"), _td_perf_iw_float(params_map.get("A"), 0.0)),
+            (nm("k"), _td_perf_iw_float(params_map.get("k"), 0.0)),
+        ]
+        return (
+            f"({nm('b')}+{nm('m')}*({{X}})+{nm('A')}*(1-EXP(-{nm('k')}*({{X}}))))",
+            ("X",),
+            params,
+            None,
+        )
+    if family == TD_PERF_FIT_MODE_HYBRID_QUADRATIC_RESIDUAL:
+        base_params = dict(params_map.get("base_params") or {})
+        residual_coeffs = list(params_map.get("residual_coeffs") or [])
+        params = [
+            (nm("bb"), _td_perf_iw_float(base_params.get("b"), 0.0)),
+            (nm("bm"), _td_perf_iw_float(base_params.get("m"), 0.0)),
+            (nm("bA"), _td_perf_iw_float(base_params.get("A"), 0.0)),
+            (nm("bk"), _td_perf_iw_float(base_params.get("k"), 0.0)),
+        ]
+        residual_names, residual_params = _td_perf_iw_poly_params(stat, "r", residual_coeffs)
+        params.extend(residual_params)
+        residual_expr = _td_perf_iw_horner(residual_names, "x") if residual_names else "0"
+        base_expr = f"{nm('bb')}+{nm('bm')}*xr+{nm('bA')}*(1-EXP(-{nm('bk')}*xr))"
+        if bool(params_map.get("normalize_x")):
+            params.append((nm("xc"), _td_perf_iw_float(params_map.get("x0"), 0.0)))
+            params.append((nm("xs"), _td_perf_iw_float(params_map.get("sx"), 1.0)))
+            template = f"LET(xr,{{X}},x,(xr-{nm('xc')})/{nm('xs')},({base_expr})+({residual_expr}))"
+        else:
+            template = f"LET(xr,{{X}},x,xr,({base_expr})+({residual_expr}))"
+        return template, ("X",), params, None
+    if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP:
+        segments = [dict(seg) for seg in (pchip_segments or [])]
+        if not segments:
+            return None
+        params = [
+            (nm("xlo"), _td_perf_iw_float(segments[0].get("x0"), 0.0)),
+            (nm("xhi"), _td_perf_iw_float(segments[-1].get("x1"), 0.0)),
+            (nm("ylo"), _td_perf_iw_float(segments[0].get("left_y"), 0.0)),
+            (nm("yhi"), _td_perf_iw_float(segments[-1].get("right_y"), 0.0)),
+            (nm("n"), float(len(segments))),
+        ]
+        kx, ka, kb, kc, kd = (nm("kx"), nm("ka"), nm("kb"), nm("kc"), nm("kd"))
+        template = (
+            f"LET(xr,{{X}},"
+            f"i,MIN(MATCH(MAX(xr,{nm('xlo')}),{kx},1),{nm('n')}),"
+            f"t,xr-INDEX({kx},i),"
+            f"y,((INDEX({ka},i)*t+INDEX({kb},i))*t+INDEX({kc},i))*t+INDEX({kd},i),"
+            f"IF(xr<{nm('xlo')},{nm('ylo')},IF(xr>{nm('xhi')},{nm('yhi')},y)))"
+        )
+        return template, ("X",), params, segments
+    if family in {TD_PERF_FIT_MODE_PIECEWISE_2, TD_PERF_FIT_MODE_PIECEWISE_3}:
+        coeffs = [_td_perf_iw_float(v, 0.0) for v in (params_map.get("coeffs") or [])]
+        breakpoints = [_td_perf_iw_float(v, 0.0) for v in (params_map.get("breakpoints") or [])]
+        if len(coeffs) < 2:
+            return None
+        params = [
+            (nm("c0"), coeffs[0]),
+            (nm("c1"), coeffs[1]),
+        ]
+        expr = f"{nm('c0')}+{nm('c1')}*({{X}})"
+        for idx, (coeff, bp) in enumerate(zip(coeffs[2:], breakpoints), start=1):
+            params.append((nm(f"h{idx}"), coeff))
+            params.append((nm(f"bp{idx}"), bp))
+            expr += f"+{nm(f'h{idx}')}*MAX(0,({{X}})-{nm(f'bp{idx}')})"
+        return f"({expr})", ("X",), params, None
+    if family == TD_PERF_FIT_FAMILY_PLANE:
+        coeffs = [_td_perf_iw_float(v, 0.0) for v in (model.get("coeffs") or [])]
+        if len(coeffs) != 3:
+            return None
+        params = [
+            (nm("c0"), coeffs[0]),
+            (nm("c1"), coeffs[1]),
+            (nm("c2"), coeffs[2]),
+            (nm("x1c"), _td_perf_iw_float(model.get("x1_center"), 0.0)),
+            (nm("x1s"), _td_perf_iw_float(model.get("x1_scale"), 1.0)),
+            (nm("x2c"), _td_perf_iw_float(model.get("x2_center"), 0.0)),
+            (nm("x2s"), _td_perf_iw_float(model.get("x2_scale"), 1.0)),
+        ]
+        template = (
+            f"LET(u,(({{X}})-{nm('x1c')})/{nm('x1s')},v,(({{X2}})-{nm('x2c')})/{nm('x2s')},"
+            f"{nm('c0')}+{nm('c1')}*u+{nm('c2')}*v)"
+        )
+        return template, ("X", "X2"), params, None
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE:
+        coeffs = [_td_perf_iw_float(v, 0.0) for v in (model.get("coeffs") or [])]
+        if len(coeffs) != 6:
+            return None
+        params = [(nm(f"c{idx}"), value) for idx, value in enumerate(coeffs)]
+        params.extend(
+            [
+                (nm("x1c"), _td_perf_iw_float(model.get("x1_center"), 0.0)),
+                (nm("x1s"), _td_perf_iw_float(model.get("x1_scale"), 1.0)),
+                (nm("x2c"), _td_perf_iw_float(model.get("x2_center"), 0.0)),
+                (nm("x2s"), _td_perf_iw_float(model.get("x2_scale"), 1.0)),
+            ]
+        )
+        template = (
+            f"LET(u,(({{X}})-{nm('x1c')})/{nm('x1s')},v,(({{X2}})-{nm('x2c')})/{nm('x2s')},"
+            f"{nm('c0')}+{nm('c1')}*u+{nm('c2')}*v+{nm('c3')}*u^2+{nm('c4')}*u*v+{nm('c5')}*v^2)"
+        )
+        return template, ("X", "X2"), params, None
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_SURFACE_CONTROL_PERIOD:
+        coeff_cp_models = [list(coeffs or []) for coeffs in (model.get("coeff_cp_models") or [])]
+        if len(coeff_cp_models) != 6:
+            return None
+        params = [
+            (nm("x1c"), _td_perf_iw_float(model.get("x1_center"), 0.0)),
+            (nm("x1s"), _td_perf_iw_float(model.get("x1_scale"), 1.0)),
+            (nm("x2c"), _td_perf_iw_float(model.get("x2_center"), 0.0)),
+            (nm("x2s"), _td_perf_iw_float(model.get("x2_scale"), 1.0)),
+            (nm("cpc"), _td_perf_iw_float(model.get("cp_center"), 0.0)),
+            (nm("cps"), _td_perf_iw_float(model.get("cp_scale"), 1.0)),
+        ]
+        binding_names = ["ca", "cb", "cc", "cd", "ce", "cf"]
+        bindings: list[str] = []
+        for idx, coeffs in enumerate(coeff_cp_models):
+            names, cp_params = _td_perf_iw_poly_params(stat, f"q{idx}_p", coeffs)
+            params.extend(cp_params)
+            bindings.append(f"{binding_names[idx]},{_td_perf_iw_horner(names, 'w')}")
+        template = (
+            f"LET(u,(({{X}})-{nm('x1c')})/{nm('x1s')},v,(({{X2}})-{nm('x2c')})/{nm('x2s')},"
+            f"w,(({{CP}})-{nm('cpc')})/{nm('cps')},"
+            + ",".join(bindings)
+            + ",ca+cb*u+cc*v+cd*u^2+ce*u*v+cf*v^2)"
+        )
+        return template, ("X", "X2", "CP"), params, None
+    if family == TD_PERF_FIT_FAMILY_QUADRATIC_CURVE_CONTROL_PERIOD:
+        coeff_cp_models = [list(coeffs or []) for coeffs in (model.get("coeff_cp_models") or [])]
+        if len(coeff_cp_models) != 3:
+            return None
+        params = [
+            (nm("xc"), _td_perf_iw_float(model.get("x_center"), 0.0)),
+            (nm("xs"), _td_perf_iw_float(model.get("x_scale"), 1.0)),
+            (nm("cpc"), _td_perf_iw_float(model.get("cp_center"), 0.0)),
+            (nm("cps"), _td_perf_iw_float(model.get("cp_scale"), 1.0)),
+        ]
+        binding_names = ["pa", "pb", "pc"]
+        bindings = []
+        for idx, coeffs in enumerate(coeff_cp_models):
+            names, cp_params = _td_perf_iw_poly_params(stat, f"q{idx}_p", coeffs)
+            params.extend(cp_params)
+            bindings.append(f"{binding_names[idx]},{_td_perf_iw_horner(names, 'w')}")
+        template = (
+            f"LET(x,(({{X}})-{nm('xc')})/{nm('xs')},w,(({{CP}})-{nm('cpc')})/{nm('cps')},"
+            + ",".join(bindings)
+            + ",pa*x^2+pb*x+pc)"
+        )
+        return template, ("X", "CP"), params, None
+    if family == TD_PERF_FIT_FAMILY_HYBRID_QUADRATIC_RESIDUAL_CONTROL_PERIOD:
+        residual_cp_models = [
+            list(coeffs or [])
+            for coeffs in (model.get("residual_cp_models") or model.get("coeff_cp_models") or [])
+        ]
+        base_params = dict(model.get("base_params") or params_map.get("base_params") or {})
+        if len(residual_cp_models) != 3:
+            return None
+        params = [
+            (nm("bb"), _td_perf_iw_float(base_params.get("b"), 0.0)),
+            (nm("bm"), _td_perf_iw_float(base_params.get("m"), 0.0)),
+            (nm("bA"), _td_perf_iw_float(base_params.get("A"), 0.0)),
+            (nm("bk"), _td_perf_iw_float(base_params.get("k"), 0.0)),
+            (nm("xc"), _td_perf_iw_float(model.get("x_center"), 0.0)),
+            (nm("xs"), _td_perf_iw_float(model.get("x_scale"), 1.0)),
+            (nm("cpc"), _td_perf_iw_float(model.get("cp_center"), 0.0)),
+            (nm("cps"), _td_perf_iw_float(model.get("cp_scale"), 1.0)),
+        ]
+        binding_names = ["pa", "pb", "pc"]
+        bindings = []
+        for idx, coeffs in enumerate(residual_cp_models):
+            names, cp_params = _td_perf_iw_poly_params(stat, f"q{idx}_p", coeffs)
+            params.extend(cp_params)
+            bindings.append(f"{binding_names[idx]},{_td_perf_iw_horner(names, 'w')}")
+        template = (
+            f"LET(xr,{{X}},x,(xr-{nm('xc')})/{nm('xs')},w,(({{CP}})-{nm('cpc')})/{nm('cps')},"
+            + ",".join(bindings)
+            + f",({nm('bb')}+{nm('bm')}*xr+{nm('bA')}*(1-EXP(-{nm('bk')}*xr)))+(pa*x^2+pb*x+pc))"
+        )
+        return template, ("X", "CP"), params, None
+    return None
+
+
+def _td_perf_build_interactive_param_ctx(
+    models_by_stat: Mapping[str, Mapping[str, object]],
+) -> dict[str, object] | None:
+    """Build named-parameter templates for the interactive workbook export.
+
+    Returns a context with per-stat formula templates that reference defined
+    names on the Model Parameters sheet, keeping cell formulas short/readable.
+    Returns None when no model has named-template support (callers then fall
+    back to the legacy fully inlined formulas).
+    """
+    templates: dict[str, tuple[str, tuple[str, ...]]] = {}
+    params: list[tuple[str, float]] = []
+    pchip_tables: dict[str, list[Mapping[str, object]]] = {}
+    for stat, raw_model in (models_by_stat or {}).items():
+        model = dict(raw_model or {})
+        family = td_perf_normalize_fit_mode(model.get("fit_family"))
+        if not family:
+            continue
+        pchip_segments = (
+            _td_perf_pchip_segment_rows(model, str(stat))
+            if family == TD_PERF_FIT_MODE_MONOTONE_PCHIP
+            else None
+        )
+        try:
+            built = _td_perf_interactive_named_template(str(stat), model, pchip_segments)
+        except Exception:
+            built = None
+        if built is None:
+            continue
+        template, uses, stat_params, segments = built
+        templates[str(stat)] = (template, uses)
+        params.extend(stat_params)
+        if segments:
+            pchip_tables[str(stat)] = segments
+    if not templates:
+        return None
+    mean_spec = templates.get("mean")
+    std_spec = templates.get("std")
+    if mean_spec and std_spec:
+        mean_template, mean_uses = mean_spec
+        std_template, std_uses = std_spec
+        derived_uses = tuple(key for key in ("X", "X2", "CP") if key in set(mean_uses) | set(std_uses))
+        templates["min_3sigma"] = (f"(({mean_template})-3*({std_template}))", derived_uses)
+        templates["max_3sigma"] = (f"(({mean_template})+3*({std_template}))", derived_uses)
+    return {"templates": templates, "params": params, "pchip_tables": pchip_tables}
+
+
+def _td_perf_write_interactive_parameters_sheet(workbook, param_ctx: Mapping[str, object]) -> None:
+    """Write the Model Parameters sheet + defined names backing the templates."""
+    try:
+        from openpyxl.styles import Font, PatternFill  # type: ignore
+    except Exception:  # pragma: no cover - depends on optional dep
+        Font = None  # type: ignore[assignment]
+        PatternFill = None  # type: ignore[assignment]
+
+    params = list(param_ctx.get("params") or [])  # type: ignore[union-attr]
+    pchip_tables = dict(param_ctx.get("pchip_tables") or {})  # type: ignore[union-attr]
+    if not params and not pchip_tables:
+        return
+    ws = workbook.create_sheet(TD_PERF_INTERACTIVE_PARAMS_SHEET)
+    header_font = Font(bold=True) if Font is not None else None
+    header_fill = (
+        PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        if PatternFill is not None
+        else None
+    )
+
+    def _style_header(cell) -> None:
+        if header_font is not None:
+            cell.font = header_font
+        if header_fill is not None:
+            cell.fill = header_fill
+
+    ws.cell(1, 1).value = "Model coefficients and constants used by the workbook formulas."
+    ws.cell(2, 1).value = "Each value is exposed as an Excel defined name (column A)."
+    row_idx = 4
+    _style_header(ws.cell(row_idx, 1))
+    _style_header(ws.cell(row_idx, 2))
+    ws.cell(row_idx, 1).value = "Name"
+    ws.cell(row_idx, 2).value = "Value"
+    row_idx += 1
+    seen_names: set[str] = set()
+    for name, value in params:
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        ws.cell(row_idx, 1).value = name
+        ws.cell(row_idx, 2).value = float(value)
+        _td_perf_add_defined_name(
+            workbook,
+            name=name,
+            sheet_name=ws.title,
+            cell_ref=f"$B${row_idx}",
+        )
+        row_idx += 1
+
+    for stat, segments in pchip_tables.items():
+        row_idx += 2
+        _style_header(ws.cell(row_idx, 1))
+        ws.cell(row_idx, 1).value = f"{stat} PCHIP segments"
+        row_idx += 1
+        for col_idx, header in enumerate(["x0", "a", "b", "c", "d"], start=1):
+            cell = ws.cell(row_idx, col_idx)
+            cell.value = header
+            _style_header(cell)
+        header_row = row_idx
+        for seg_offset, segment in enumerate(segments, start=1):
+            seg_row = header_row + seg_offset
+            ws.cell(seg_row, 1).value = _td_perf_iw_float(segment.get("x0"), 0.0)
+            ws.cell(seg_row, 2).value = _td_perf_iw_float(segment.get("a"), 0.0)
+            ws.cell(seg_row, 3).value = _td_perf_iw_float(segment.get("b"), 0.0)
+            ws.cell(seg_row, 4).value = _td_perf_iw_float(segment.get("c"), 0.0)
+            ws.cell(seg_row, 5).value = _td_perf_iw_float(segment.get("d"), 0.0)
+        first_row = header_row + 1
+        last_row = header_row + len(segments)
+        for col_idx, suffix in enumerate(["kx", "ka", "kb", "kc", "kd"], start=1):
+            col_letter = chr(ord("A") + col_idx - 1)
+            _td_perf_add_defined_name(
+                workbook,
+                name=_td_perf_iw_name(stat, suffix),
+                sheet_name=ws.title,
+                cell_ref=f"${col_letter}${first_row}:${col_letter}${last_row}",
+            )
+        row_idx = last_row
+
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 24
+
+
+def _td_perf_interactive_formula_map(
+    models_by_stat: Mapping[str, Mapping[str, object]],
+    *,
+    raw_x_ref: str,
+    raw_x2_ref: str = "",
+    raw_cp_ref: str = "",
+    param_ctx: Mapping[str, object] | None = None,
+) -> dict[str, str]:
+    templates = dict((param_ctx or {}).get("templates") or {})  # type: ignore[union-attr]
+    out: dict[str, str] = {}
+    ref_by_key = {"X": str(raw_x_ref or ""), "X2": str(raw_x2_ref or ""), "CP": str(raw_cp_ref or "")}
+    for stat, spec in templates.items():
+        try:
+            template, uses = spec
+        except Exception:
+            continue
+        if any(not ref_by_key.get(key) for key in uses):
+            continue
+        body = str(template)
+        for key, ref in ref_by_key.items():
+            body = body.replace("{" + key + "}", ref)
+        refs = [ref_by_key[key] for key in ("X", "X2", "CP") if key in uses]
+        out[stat] = _td_perf_excel_guarded_formula("=" + body, refs)
+    expected = set((models_by_stat or {}).keys())
+    if "mean" in expected and "std" in expected:
+        expected.update({"min_3sigma", "max_3sigma"})
+    if expected - set(out):
+        inline_map = _td_perf_interactive_inline_formula_map(
+            models_by_stat,
+            raw_x_ref=raw_x_ref,
+            raw_x2_ref=raw_x2_ref,
+            raw_cp_ref=raw_cp_ref,
+        )
+        for stat, formula in inline_map.items():
+            out.setdefault(stat, formula)
+    return out
+
+
 def _td_perf_add_defined_name(workbook, *, name: str, sheet_name: str, cell_ref: str) -> None:
     from openpyxl.workbook.defined_name import DefinedName  # type: ignore
 
@@ -33268,6 +33872,7 @@ def _td_perf_write_interactive_calculator_sheet(
     results_by_stat: Mapping[str, Mapping[str, object]],
     control_period_filter: object = None,
     run_type_filter: object = None,
+    param_ctx: Mapping[str, object] | None = None,
 ):
     try:
         from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
@@ -33380,6 +33985,7 @@ def _td_perf_write_interactive_calculator_sheet(
         raw_x_ref="Input_1",
         raw_x2_ref=("Input_2" if is_surface else ""),
         raw_cp_ref=("Control_Period" if uses_control_period_input else ""),
+        param_ctx=param_ctx,
     )
 
     panel_start_row = panel_row + 3
@@ -33443,6 +34049,7 @@ def _td_perf_write_interactive_calculator_sheet(
             raw_x_ref=_td_perf_excel_ref(col_by_name["input_1"], row_idx),
             raw_x2_ref=(_td_perf_excel_ref(col_by_name["input_2"], row_idx) if is_surface else ""),
             raw_cp_ref=(_td_perf_excel_ref(col_by_name["control_period"], row_idx) if uses_control_period_input else ""),
+            param_ctx=param_ctx,
         )
         for stat in TD_PERF_INTERACTIVE_OUTPUT_STATS:
             key = f"pred_{stat}"
@@ -33479,6 +34086,7 @@ def _td_perf_write_interactive_regression_checker_sheet(
     plot_metadata: Mapping[str, object],
     results_by_stat: Mapping[str, Mapping[str, object]],
     export_rows: Sequence[Mapping[str, object]],
+    param_ctx: Mapping[str, object] | None = None,
 ):
     try:
         from openpyxl.styles import Alignment, Font, PatternFill  # type: ignore
@@ -33543,6 +34151,7 @@ def _td_perf_write_interactive_regression_checker_sheet(
             raw_x_ref=_td_perf_excel_ref(col_by_name["input_1"], row_idx),
             raw_x2_ref=(_td_perf_excel_ref(col_by_name["input_2"], row_idx) if is_surface else ""),
             raw_cp_ref=(_td_perf_excel_ref(col_by_name["control_period"], row_idx) if include_control_period else ""),
+            param_ctx=param_ctx,
         )
         ws.cell(row_idx, col_by_name["pred_mean"]).value = formula_map.get("mean") or ""
         ws.cell(row_idx, col_by_name["sample_count"]).value = row.get("sample_count")
@@ -33820,6 +34429,10 @@ def td_perf_export_interactive_equation_workbook(
         raise RuntimeError("No exportable master performance equations are available for the current plot.")
 
     _td_emit_progress(progress_cb, "Building interactive equation workbook")
+    try:
+        param_ctx = _td_perf_build_interactive_param_ctx(models_by_stat)
+    except Exception:
+        param_ctx = None
     wb = Workbook()
     ws = wb.active
     if ws is None:
@@ -33833,6 +34446,7 @@ def td_perf_export_interactive_equation_workbook(
             results_by_stat=results_by_stat,
             control_period_filter=control_period_filter,
             run_type_filter=run_type_filter,
+            param_ctx=param_ctx,
         )
 
         if include_regression_checker and "mean" in models_by_stat:
@@ -33855,7 +34469,12 @@ def td_perf_export_interactive_equation_workbook(
                 plot_metadata=plot_metadata,
                 results_by_stat=results_by_stat,
                 export_rows=export_rows,
+                param_ctx=param_ctx,
             )
+
+        if param_ctx:
+            _td_emit_progress(progress_cb, "Writing model parameters sheet")
+            _td_perf_write_interactive_parameters_sheet(wb, param_ctx)
 
         _td_emit_progress(progress_cb, "Saving interactive workbook")
         wb.save(str(path))
@@ -35502,27 +36121,40 @@ def _td_smart_solver_write_model_detail_sheets(
     workbook,
     result: Mapping[str, object],
     solver_variables: Sequence[Mapping[str, object]],
+    path_prefix: str = "",
 ) -> tuple[object, object]:
     from openpyxl.styles import Font, PatternFill  # type: ignore
     from openpyxl.utils import get_column_letter  # type: ignore
 
     header_font = Font(bold=True)
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    ws_params = workbook.create_sheet("Model Parameters")
-    ws_support = workbook.create_sheet("Model Support")
-    ws_params.sheet_state = "hidden"
-    ws_support.sheet_state = "hidden"
+    if "Model Parameters" in workbook.sheetnames:
+        ws_params = workbook["Model Parameters"]
+        new_params_sheet = False
+    else:
+        ws_params = workbook.create_sheet("Model Parameters")
+        ws_params.sheet_state = "hidden"
+        new_params_sheet = True
+    if "Model Support" in workbook.sheetnames:
+        ws_support = workbook["Model Support"]
+        new_support_sheet = False
+    else:
+        ws_support = workbook.create_sheet("Model Support")
+        ws_support.sheet_state = "hidden"
+        new_support_sheet = True
 
-    for col_idx, value in enumerate(["model_path", "fit_family", "field", "value"], start=1):
-        cell = ws_params.cell(1, col_idx)
-        cell.value = value
-        cell.font = header_font
-        cell.fill = header_fill
-    for col_idx, value in enumerate(["model_path", "fit_family", "basis_index", "cp_min", "cp_max", "v1", "v2", "v3", "v4"], start=1):
-        cell = ws_support.cell(1, col_idx)
-        cell.value = value
-        cell.font = header_font
-        cell.fill = header_fill
+    if new_params_sheet:
+        for col_idx, value in enumerate(["model_path", "fit_family", "field", "value"], start=1):
+            cell = ws_params.cell(1, col_idx)
+            cell.value = value
+            cell.font = header_font
+            cell.fill = header_fill
+    if new_support_sheet:
+        for col_idx, value in enumerate(["model_path", "fit_family", "basis_index", "cp_min", "cp_max", "v1", "v2", "v3", "v4"], start=1):
+            cell = ws_support.cell(1, col_idx)
+            cell.value = value
+            cell.font = header_font
+            cell.fill = header_fill
 
     model_rows: list[tuple[str, dict[str, object]]] = [("selected", dict(result.get("master_model") or {}))]
     selected = model_rows[0][1]
@@ -35537,15 +36169,16 @@ def _td_smart_solver_write_model_detail_sheets(
         if stage2_model:
             model_rows.append(("stage2", stage2_model))
 
-    param_row = 2
-    support_row = 2
-    for model_path, model in model_rows:
+    param_row = (int(ws_params.max_row or 1) + 1) if not new_params_sheet else 2
+    support_row = (int(ws_support.max_row or 1) + 1) if not new_support_sheet else 2
+    for raw_model_path, model in model_rows:
+        model_path = f"{path_prefix}{raw_model_path}"
         family = td_perf_normalize_fit_mode(model.get("fit_family"))
         for field, value in (
             ("equation", model.get("equation")),
             ("x_norm_equation", model.get("x_norm_equation")),
             ("rmse", model.get("rmse")),
-            ("solver_variables", solver_variables if model_path == "selected" else None),
+            ("solver_variables", solver_variables if raw_model_path == "selected" else None),
         ):
             if value in (None, ""):
                 continue
@@ -35598,6 +36231,8 @@ def _td_smart_solver_write_model_detail_sheets(
 def _td_smart_solver_prepare_excel_formula_support(
     workbook,
     result: Mapping[str, object],
+    *,
+    name_prefix: str = "SmartSolver",
 ) -> dict[str, object]:
     """Copy a solver result and attach compact Excel support for PCHIP models.
 
@@ -35640,13 +36275,18 @@ def _td_smart_solver_prepare_excel_formula_support(
     from openpyxl.styles import Font, PatternFill  # type: ignore
     from openpyxl.utils import get_column_letter  # type: ignore
 
-    ws_support = workbook.create_sheet("Formula Support")
-    ws_support.sheet_state = "hidden"
+    if "Formula Support" in workbook.sheetnames:
+        ws_support = workbook["Formula Support"]
+        header_row = max(1, int(ws_support.max_row or 1)) + 2
+    else:
+        ws_support = workbook.create_sheet("Formula Support")
+        ws_support.sheet_state = "hidden"
+        header_row = 1
     header_font = Font(bold=True)
     header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
     headers = ["model_path", "x0", "x1", "a", "b", "c", "d", "left_y", "right_y"]
     for col_idx, header in enumerate(headers, start=1):
-        cell = ws_support.cell(1, col_idx)
+        cell = ws_support.cell(header_row, col_idx)
         cell.value = header
         cell.font = header_font
         cell.fill = header_fill
@@ -35661,7 +36301,7 @@ def _td_smart_solver_prepare_excel_formula_support(
         "left_y": 8,
         "right_y": 9,
     }
-    row_idx = 2
+    row_idx = header_row + 1
     for path_key, model, segments in pchip_models:
         start_row = row_idx
         for segment in segments:
@@ -35670,7 +36310,7 @@ def _td_smart_solver_prepare_excel_formula_support(
                 ws_support.cell(row_idx, col_idx).value = segment.get(field)
             row_idx += 1
         end_row = row_idx - 1
-        prefix = "SmartSolver_PCHIP_" + re.sub(r"[^A-Za-z0-9_]", "_", path_key.title())
+        prefix = f"{name_prefix}_PCHIP_" + re.sub(r"[^A-Za-z0-9_]", "_", path_key.title())
         support_names: dict[str, str] = {}
         for field, col_idx in field_columns.items():
             defined_name = f"{prefix}_{field.upper()}"
@@ -35687,13 +36327,18 @@ def _td_smart_solver_prepare_excel_formula_support(
         model["_excel_pchip_support"] = support_names
 
     for col_idx, width in enumerate((18, 16, 16, 18, 18, 18, 18, 18, 18), start=1):
-        ws_support.column_dimensions[get_column_letter(col_idx)].width = width
+        ws_support.column_dimensions[get_column_letter(col_idx)].width = max(
+            float(ws_support.column_dimensions[get_column_letter(col_idx)].width or 0),
+            float(width),
+        )
     return solver_result
 
 
 def _td_smart_solver_prepare_excel_curve_cp_support(
     workbook,
     result: Mapping[str, object],
+    *,
+    name_prefix: str = "SmartSolver",
 ) -> dict[str, object]:
     """Attach hidden support ranges for bounded curve/control-period formulas."""
     solver_result = dict(result or {})
@@ -35799,7 +36444,7 @@ def _td_smart_solver_prepare_excel_curve_cp_support(
                 ws_support.cell(row_idx, col_idx).value = value
             row_idx += 1
         end_row = row_idx - 1
-        prefix = "SmartSolver_CurveCP_" + re.sub(r"[^A-Za-z0-9_]", "_", path_key.title())
+        prefix = f"{name_prefix}_CurveCP_" + re.sub(r"[^A-Za-z0-9_]", "_", path_key.title())
         support_names: dict[str, str] = {}
         for field, col_idx in field_columns.items():
             defined_name = f"{prefix}_{field.upper()}"
@@ -35826,6 +36471,8 @@ def _td_smart_solver_prepare_excel_curve_cp_support(
 def _td_smart_solver_prepare_excel_three_sigma_support(
     workbook,
     result: Mapping[str, object],
+    *,
+    name_prefix: str = "SmartSolver",
 ) -> dict[str, object]:
     """Attach compact lookup ranges for control-period 3-sigma offsets."""
     solver_result = dict(result or {})
@@ -35857,7 +36504,7 @@ def _td_smart_solver_prepare_excel_three_sigma_support(
     end_row = start_row + len(support_rows) - 1
     support_names: dict[str, str] = {}
     for field, col_idx in (("control_period", 1), ("three_sigma_offset", 2)):
-        defined_name = "SmartSolver_ThreeSigma_" + (
+        defined_name = f"{name_prefix}_ThreeSigma_" + (
             "CONTROL_PERIOD" if field == "control_period" else "OFFSET"
         )
         _td_perf_add_defined_name(
@@ -36192,6 +36839,475 @@ def td_smart_solver_export_equation_workbook(
     wb.save(str(path))
     wb.close()
     _td_emit_progress(progress_cb, f"Excel export ready: {path.name}")
+    return path
+
+
+def _td_smart_solver_entry_output_tokens(entry: Mapping[str, object]) -> tuple[str, str]:
+    result = entry.get("result") if isinstance(entry.get("result"), Mapping) else {}
+    selector = str(entry.get("output_selector") or result.get("output_selector") or "").strip()
+    target = str(entry.get("output_target") or result.get("output_target") or "").strip()
+    return selector, target
+
+
+def _td_smart_solver_entry_input_tokens(entry: Mapping[str, object]) -> dict[str, tuple[str, str]]:
+    result = entry.get("result") if isinstance(entry.get("result"), Mapping) else {}
+    raw_selectors = entry.get("input_selectors")
+    tokens: dict[str, tuple[str, str]] = {}
+    if isinstance(raw_selectors, Mapping) and raw_selectors:
+        for raw_key, raw_value in raw_selectors.items():
+            key = str(raw_key or "").strip()
+            if not key or not isinstance(raw_value, Mapping):
+                continue
+            target = str(raw_value.get("target") or "").strip()
+            if not target:
+                continue
+            tokens[key] = (str(raw_value.get("selector") or "").strip(), target)
+        if tokens:
+            return tokens
+    for index in (1, 2, 3):
+        target = str(result.get(f"input{index}_target") or "").strip()
+        if not target:
+            continue
+        tokens[f"input_{index}"] = (str(result.get(f"input{index}_selector") or "").strip(), target)
+    return tokens
+
+
+def _td_smart_solver_chain_tokens_match(
+    out_selector: str,
+    out_target: str,
+    in_selector: str,
+    in_target: str,
+) -> bool:
+    if out_selector and in_selector:
+        return out_selector == in_selector
+    return bool(out_target) and bool(in_target) and out_target.casefold() == in_target.casefold()
+
+
+def td_smart_solver_build_equation_chain(entries: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Resolve output->input links between saved smart equations.
+
+    Matching prefers canonical selector tokens (exact) and falls back to
+    case-insensitive display-name comparison when either side lacks a selector.
+    Returns a topological ordering (stable by selection order), the resolved
+    links, and any warnings. Raises RuntimeError when the chain has a cycle.
+    """
+    nodes: list[dict[str, object]] = []
+    for index, entry in enumerate(entries or []):
+        if not isinstance(entry, Mapping):
+            continue
+        entry_id = str(entry.get("id") or f"entry_{index + 1}").strip() or f"entry_{index + 1}"
+        nodes.append(
+            {
+                "id": entry_id,
+                "name": str(entry.get("name") or entry_id).strip() or entry_id,
+                "output": _td_smart_solver_entry_output_tokens(entry),
+                "inputs": _td_smart_solver_entry_input_tokens(entry),
+            }
+        )
+    warnings_out: list[str] = []
+    links: list[dict[str, str]] = []
+    for node in nodes:
+        for variable_key, (in_selector, in_target) in node["inputs"].items():  # type: ignore[union-attr]
+            matches: list[dict[str, object]] = []
+            for upstream in nodes:
+                out_selector, out_target = upstream["output"]  # type: ignore[misc]
+                if not _td_smart_solver_chain_tokens_match(out_selector, out_target, in_selector, in_target):
+                    continue
+                if upstream["id"] == node["id"]:
+                    warnings_out.append(
+                        f"Equation '{node['name']}' output feeds its own input '{variable_key}'; self-link ignored."
+                    )
+                    continue
+                matches.append(upstream)
+            if not matches:
+                continue
+            if len(matches) > 1:
+                warnings_out.append(
+                    f"Input '{variable_key}' of '{node['name']}' matches multiple equations "
+                    f"({', '.join(str(m['name']) for m in matches)}); using '{matches[0]['name']}'."
+                )
+            links.append(
+                {
+                    "downstream_id": str(node["id"]),
+                    "variable_key": str(variable_key),
+                    "upstream_id": str(matches[0]["id"]),
+                }
+            )
+
+    indegree: dict[str, int] = {str(node["id"]): 0 for node in nodes}
+    downstreams_by_upstream: dict[str, list[str]] = {str(node["id"]): [] for node in nodes}
+    for link in links:
+        indegree[link["downstream_id"]] = indegree.get(link["downstream_id"], 0) + 1
+        downstreams_by_upstream.setdefault(link["upstream_id"], []).append(link["downstream_id"])
+    order: list[str] = []
+    ready = [str(node["id"]) for node in nodes if indegree.get(str(node["id"]), 0) == 0]
+    while ready:
+        current = ready.pop(0)
+        order.append(current)
+        for downstream in downstreams_by_upstream.get(current, []):
+            indegree[downstream] -= 1
+            if indegree[downstream] == 0:
+                # keep original selection order among newly ready nodes
+                ready.append(downstream)
+                ready.sort(key=lambda entry_id: next(i for i, n in enumerate(nodes) if str(n["id"]) == entry_id))
+    if len(order) < len(nodes):
+        stuck = [str(node["name"]) for node in nodes if str(node["id"]) not in order]
+        raise RuntimeError(
+            "Equation chain contains a cycle involving: "
+            + " -> ".join(stuck)
+            + ". Remove one of these equations or change its inputs."
+        )
+    return {"order": order, "links": links, "warnings": warnings_out}
+
+
+def _td_smart_solver_write_master_block(
+    ws,
+    wb,
+    *,
+    start_row: int,
+    block_index: int,
+    entry: Mapping[str, object],
+    result: Mapping[str, object],
+    solver_variables: Sequence[Mapping[str, object]],
+    chained_inputs: Mapping[str, tuple[str, str]],
+    header_font,
+    header_fill,
+    section_fill,
+    editable_fill,
+) -> dict[str, object]:
+    """Write one equation block on the Master Calculator sheet.
+
+    chained_inputs maps variable key -> (upstream pred_mean absolute ref,
+    upstream label). Returns {"next_row", "pred_mean_ref"}.
+    """
+    from openpyxl.styles import Alignment  # type: ignore
+
+    prefix = f"SmartSolver_E{block_index}"
+    uses_control_period = bool(result.get("uses_control_period", True))
+    export_model = td_smart_solver_exportable_model(result) or {}
+    output_target = str(result.get("output_target") or "").strip()
+    output_units = str(result.get("output_units") or "").strip()
+
+    row_idx = start_row
+    title = f"Equation {block_index}: {str(entry.get('name') or '').strip() or output_target}"
+    if output_target:
+        title += f" — {output_target}" + (f" ({output_units})" if output_units else "")
+    for col_idx in range(1, 7):
+        ws.cell(row_idx, col_idx).fill = section_fill
+    ws.cell(row_idx, 1).value = title
+    ws.cell(row_idx, 1).font = header_font
+    row_idx += 1
+    meta_bits = [
+        f"Branch: {td_perf_fit_family_label(result.get('solver_branch') or export_model.get('fit_family'))}",
+        f"Condition Family: {td_perf_run_type_mode_label(result.get('run_type_mode'))}",
+    ]
+    rmse_value = _td_finite_float(result.get("rmse"))
+    if rmse_value is not None:
+        meta_bits.append(f"RMSE: {rmse_value:.6g}")
+    saved_at = str(entry.get("saved_at") or "").strip()
+    if saved_at:
+        meta_bits.append(f"Saved: {saved_at}")
+    ws.cell(row_idx, 1).value = " | ".join(meta_bits)
+    row_idx += 2
+
+    variable_refs: dict[str, str] = {}
+    for variable in solver_variables:
+        key = str(variable.get("key") or "").strip()
+        if not key:
+            continue
+        target = str(variable.get("target") or key)
+        units = str(variable.get("units") or "")
+        role = str(variable.get("role") or "")
+        ws.cell(row_idx, 1).value = key
+        ws.cell(row_idx, 1).font = header_font
+        input_cell = ws.cell(row_idx, 2)
+        input_cell.fill = editable_fill
+        input_cell.alignment = Alignment(horizontal="center")
+        ws.cell(row_idx, 3).value = " ".join(
+            part for part in [target, f"({units})" if units else "", role] if str(part).strip()
+        ).strip()
+        if key in chained_inputs:
+            upstream_ref, upstream_label = chained_inputs[key]
+            input_cell.value = f"={upstream_ref}"
+            ws.cell(row_idx, 4).value = f"<- {upstream_label}"
+        else:
+            ws.cell(row_idx, 4).value = "manual input"
+        defined_name = f"{prefix}_{key.replace('-', '_')}"
+        _td_perf_add_defined_name(wb, name=defined_name, sheet_name=ws.title, cell_ref=_td_perf_excel_ref(2, row_idx, absolute=True))
+        variable_refs[key] = defined_name
+        row_idx += 1
+
+    control_period_ref = ""
+    if uses_control_period:
+        ws.cell(row_idx, 1).value = "control_period"
+        ws.cell(row_idx, 1).font = header_font
+        control_cell = ws.cell(row_idx, 2)
+        control_cell.fill = editable_fill
+        control_cell.alignment = Alignment(horizontal="center")
+        ws.cell(row_idx, 4).value = "per-equation control period"
+        control_period_ref = f"{prefix}_Control_Period"
+        _td_perf_add_defined_name(wb, name=control_period_ref, sheet_name=ws.title, cell_ref=_td_perf_excel_ref(2, row_idx, absolute=True))
+        row_idx += 1
+
+    row_idx += 1
+    stage_spec = _td_smart_solver_stage_export_spec(result)
+    stage_key = str(stage_spec.get("stage1_output_key") or "").strip()
+    stage_target = str(stage_spec.get("stage1_output_target") or "").strip()
+    stage_units = str(stage_spec.get("stage1_output_units") or "").strip()
+    output_specs: list[tuple[str, str]] = []
+    if bool(result.get("uses_staged_mediator")) and stage_key:
+        output_specs.append(
+            (
+                stage_key,
+                " ".join(part for part in [stage_target, f"({stage_units})" if stage_units else ""] if str(part).strip()).strip(),
+            )
+        )
+    output_specs.extend(
+        [
+            ("pred_mean", output_units),
+            ("pred_min_3sigma", output_units),
+            ("pred_max_3sigma", output_units),
+        ]
+    )
+    output_row_by_name: dict[str, int] = {}
+    for row_offset, (output_name, output_units_text) in enumerate(output_specs):
+        out_row = row_idx + row_offset
+        output_row_by_name[output_name] = out_row
+        ws.cell(out_row, 4).value = output_name
+        ws.cell(out_row, 4).font = header_font
+        ws.cell(out_row, 6).value = output_units_text
+    formula_specs = _td_smart_solver_formula_specs(
+        result,
+        variable_refs=variable_refs,
+        control_period_ref=control_period_ref,
+        stage1_output_ref=(
+            _td_perf_excel_ref(5, output_row_by_name[stage_key])
+            if bool(result.get("uses_staged_mediator")) and stage_key and stage_key in output_row_by_name
+            else ""
+        ),
+        pred_mean_ref=(
+            _td_perf_excel_ref(5, output_row_by_name["pred_mean"])
+            if "pred_mean" in output_row_by_name
+            else ""
+        ),
+    )
+    if stage_key and stage_key in formula_specs:
+        ws.cell(output_row_by_name[stage_key], 5).value = formula_specs[stage_key]
+    for output_name in ("pred_mean", "pred_min_3sigma", "pred_max_3sigma"):
+        if output_name in output_row_by_name:
+            ws.cell(output_row_by_name[output_name], 5).value = formula_specs.get(output_name, "")
+    row_idx += len(output_specs) + 1
+
+    three_sigma_equation_texts = _td_smart_solver_three_sigma_equation_texts(result)
+    for col_idx, value in enumerate(["Branch", "Equation", "Normalization"], start=1):
+        cell = ws.cell(row_idx, col_idx)
+        cell.value = value
+        cell.font = header_font
+        cell.fill = header_fill
+    row_idx += 1
+    equation_rows = [
+        (
+            td_perf_fit_family_label(export_model.get("fit_family")),
+            str(result.get("equation") or ""),
+            str(result.get("x_norm_equation") or ""),
+        )
+    ]
+    for label, text_key in (
+        ("3-Sigma Offset", "offset_equation"),
+        ("3-Sigma Min", "pred_min_3sigma_equation"),
+        ("3-Sigma Max", "pred_max_3sigma_equation"),
+    ):
+        text_value = str(three_sigma_equation_texts.get(text_key) or "").strip()
+        if text_value:
+            equation_rows.append((label, text_value, str(three_sigma_equation_texts.get("normalization_text") or "")))
+    for branch_text, equation_text, normalization_text in equation_rows:
+        ws.cell(row_idx, 1).value = branch_text
+        ws.cell(row_idx, 2).value = equation_text
+        ws.cell(row_idx, 3).value = normalization_text
+        row_idx += 1
+
+    return {
+        "next_row": row_idx + 2,
+        "pred_mean_ref": _td_perf_excel_ref(5, output_row_by_name["pred_mean"], absolute=True),
+    }
+
+
+def td_smart_solver_export_master_workbook(
+    db_path: Path,
+    output_path: Path,
+    *,
+    entries: Sequence[Mapping[str, object]],
+    progress_cb: Callable[[str], None] | None = None,
+) -> Path:
+    """Export one master workbook for several saved smart equations.
+
+    The Master Calculator sheet holds one block per equation, topologically
+    ordered so that any equation whose output matches another's input appears
+    first; chained input cells are pre-filled with a formula referencing the
+    upstream pred_mean cell (overtype the cell to break the chain). Each
+    equation also gets its own Fit Point Checker sheet.
+    """
+    try:
+        from openpyxl import Workbook  # type: ignore
+        from openpyxl.styles import Font, PatternFill  # type: ignore
+        from openpyxl.utils import get_column_letter  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on optional dep
+        raise RuntimeError(
+            "openpyxl is required to export Smart Solver equations to Excel. "
+            "Install it with `py -m pip install openpyxl` within the project environment."
+        ) from exc
+
+    normalized_entries: list[dict[str, object]] = []
+    for index, raw_entry in enumerate(entries or []):
+        normalized = _td_smart_solver_normalize_saved_entry(raw_entry)
+        if normalized is None:
+            entry_label = str((raw_entry or {}).get("name") or f"entry {index + 1}") if isinstance(raw_entry, Mapping) else f"entry {index + 1}"
+            raise RuntimeError(f"Saved smart equation '{entry_label}' is invalid or no longer exportable.")
+        result = dict(normalized.get("result") or {})
+        if not _td_smart_solver_export_rows_from_result(result):
+            raise RuntimeError(f"Saved smart equation '{normalized.get('name')}' has no fit points to export.")
+        normalized_entries.append(normalized)
+    if not normalized_entries:
+        raise RuntimeError("Select at least one saved smart equation to export.")
+
+    chain = td_smart_solver_build_equation_chain(normalized_entries)
+    entry_by_id = {str(entry.get("id")): entry for entry in normalized_entries}
+    ordered_entries = [entry_by_id[entry_id] for entry_id in chain["order"] if entry_id in entry_by_id]
+    links_by_downstream: dict[str, list[dict[str, str]]] = {}
+    for link in chain["links"]:
+        links_by_downstream.setdefault(link["downstream_id"], []).append(link)
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _td_emit_progress(progress_cb, "Building Smart Solver master workbook")
+
+    wb = Workbook()
+    ws = wb.active
+    if ws is None:
+        ws = wb.create_sheet("Master Calculator")
+    ws.title = "Master Calculator"
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    section_fill = PatternFill(start_color="E2F0D9", end_color="E2F0D9", fill_type="solid")
+    editable_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    ws.cell(1, 1).value = "Smart Solver Master Calculator"
+    ws.cell(1, 1).font = header_font
+    ws.cell(2, 1).value = (
+        "Edit the highlighted input cells. Chained inputs contain formulas referencing the "
+        "upstream equation's pred_mean; overtype the cell with a number to break the chain."
+    )
+    ws.cell(3, 1).value = f"Export Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+    row_idx = 5
+    pred_mean_ref_by_id: dict[str, str] = {}
+    block_label_by_id: dict[str, str] = {}
+    block_results: list[tuple[int, dict[str, object], dict[str, object], list[dict[str, object]]]] = []
+    for block_index, entry in enumerate(ordered_entries, start=1):
+        entry_id = str(entry.get("id"))
+        entry_name = str(entry.get("name") or entry_id)
+        _td_emit_progress(progress_cb, f"Writing equation block {block_index}: {entry_name}")
+        prefix = f"SmartSolver_E{block_index}"
+        result = dict(entry.get("result") or {})
+        result = _td_smart_solver_prepare_excel_formula_support(wb, result, name_prefix=prefix)
+        result = _td_smart_solver_prepare_excel_curve_cp_support(wb, result, name_prefix=prefix)
+        result = _td_smart_solver_prepare_excel_three_sigma_support(wb, result, name_prefix=prefix)
+        solver_variables = _td_smart_solver_export_variables_from_result(result)
+        _td_smart_solver_write_model_detail_sheets(
+            workbook=wb,
+            result=result,
+            solver_variables=solver_variables,
+            path_prefix=f"E{block_index}:",
+        )
+        chained_inputs: dict[str, tuple[str, str]] = {}
+        for link in links_by_downstream.get(entry_id, []):
+            upstream_id = link["upstream_id"]
+            upstream_ref = pred_mean_ref_by_id.get(upstream_id)
+            if not upstream_ref:
+                continue
+            chained_inputs[link["variable_key"]] = (
+                upstream_ref,
+                block_label_by_id.get(upstream_id, upstream_id),
+            )
+        block_info = _td_smart_solver_write_master_block(
+            ws,
+            wb,
+            start_row=row_idx,
+            block_index=block_index,
+            entry=entry,
+            result=result,
+            solver_variables=solver_variables,
+            chained_inputs=chained_inputs,
+            header_font=header_font,
+            header_fill=header_fill,
+            section_fill=section_fill,
+            editable_fill=editable_fill,
+        )
+        pred_mean_ref_by_id[entry_id] = str(block_info["pred_mean_ref"])
+        block_label_by_id[entry_id] = f"Equation {block_index}: {entry_name}"
+        row_idx = int(block_info["next_row"])
+        block_results.append((block_index, entry, result, solver_variables))
+
+    # Chain map section
+    row_idx += 1
+    for col_idx in range(1, 6):
+        ws.cell(row_idx, col_idx).fill = section_fill
+    ws.cell(row_idx, 1).value = "Chain Map"
+    ws.cell(row_idx, 1).font = header_font
+    row_idx += 1
+    for col_idx, header in enumerate(
+        ["downstream equation", "input key", "input target", "upstream equation", "upstream pred_mean cell"],
+        start=1,
+    ):
+        cell = ws.cell(row_idx, col_idx)
+        cell.value = header
+        cell.font = header_font
+        cell.fill = header_fill
+    row_idx += 1
+    if chain["links"]:
+        for link in chain["links"]:
+            downstream = entry_by_id.get(link["downstream_id"], {})
+            input_tokens = _td_smart_solver_entry_input_tokens(downstream)
+            _selector, input_target = input_tokens.get(link["variable_key"], ("", ""))
+            ws.cell(row_idx, 1).value = block_label_by_id.get(link["downstream_id"], link["downstream_id"])
+            ws.cell(row_idx, 2).value = link["variable_key"]
+            ws.cell(row_idx, 3).value = input_target
+            ws.cell(row_idx, 4).value = block_label_by_id.get(link["upstream_id"], link["upstream_id"])
+            ws.cell(row_idx, 5).value = pred_mean_ref_by_id.get(link["upstream_id"], "")
+            row_idx += 1
+    else:
+        ws.cell(row_idx, 1).value = "No chained inputs detected; all inputs are manual."
+        row_idx += 1
+    for warning_text in chain["warnings"]:
+        ws.cell(row_idx, 1).value = f"Warning: {warning_text}"
+        row_idx += 1
+
+    for col_idx, width in {1: 34, 2: 22, 3: 34, 4: 34, 5: 24, 6: 16}.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # Per-equation fit point checker sheets
+    used_sheet_names = {name.lower() for name in wb.sheetnames}
+    for block_index, entry, result, solver_variables in block_results:
+        entry_name = str(entry.get("name") or "").strip() or f"Equation {block_index}"
+        sheet_name = _td_perf_unique_sheet_name(f"Fit Points E{block_index} {entry_name}", used_sheet_names)
+        ws_checker = wb.create_sheet(sheet_name)
+        _td_smart_solver_write_prediction_table(
+            ws_checker,
+            start_row=1,
+            result=result,
+            rows=_td_smart_solver_export_rows_from_result(result),
+            solver_variables=solver_variables,
+            include_residual_columns=True,
+            include_stage_diagnostic_columns=True,
+            header_font=header_font,
+            header_fill=header_fill,
+        )
+        ws_checker.freeze_panes = "A2"
+
+    _td_emit_progress(progress_cb, "Saving Smart Solver master workbook")
+    wb.save(str(path))
+    wb.close()
+    _td_emit_progress(progress_cb, f"Master workbook ready: {path.name}")
     return path
 
 
@@ -37053,6 +38169,244 @@ def td_perf_delete_saved_equation(project_dir: Path, entry_id: object) -> bool:
         return False
     store["entries"] = kept
     save_td_saved_performance_equations(project_dir, store)
+    return True
+
+
+TD_SAVED_SMART_EQUATIONS_JSON = "saved_smart_equations.json"
+TD_SAVED_SMART_EQUATIONS_VERSION = 1
+
+TD_SMART_SOLVER_SAVED_FIT_POINT_KEYS = (
+    "observation_id",
+    "run_name",
+    "serial",
+    "program_title",
+    "source_run_name",
+    "condition_label",
+    "display_name",
+    "control_period",
+    "suppression_voltage",
+    "input_1",
+    "input_2",
+    "input_3",
+    "actual_mean",
+    "sample_count",
+)
+
+TD_SMART_SOLVER_SAVED_RESULT_DROP_KEYS = {
+    "candidate_scores",
+    "slice_rows",
+    "_excel_three_sigma_support",
+}
+
+
+def td_saved_smart_equations_path(project_dir: Path) -> Path:
+    return Path(project_dir).expanduser() / TD_SAVED_SMART_EQUATIONS_JSON
+
+
+def _td_smart_solver_serializable_fit_points(result: Mapping[str, object]) -> list[dict[str, object]]:
+    out: list[dict[str, object]] = []
+    for raw_point in (result or {}).get("fit_points") or []:
+        if not isinstance(raw_point, Mapping):
+            continue
+        point = {
+            key: _td_perf_json_safe(raw_point.get(key))
+            for key in TD_SMART_SOLVER_SAVED_FIT_POINT_KEYS
+            if key in raw_point
+        }
+        stage_key = str((result or {}).get("stage1_output_key") or "").strip()
+        if stage_key and stage_key in raw_point:
+            point[stage_key] = _td_perf_json_safe(raw_point.get(stage_key))
+        out.append(point)
+    return out
+
+
+def _td_smart_solver_serializable_result(result: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(result, Mapping):
+        return {}
+    out: dict[str, object] = {}
+    for raw_key, raw_value in result.items():
+        key = str(raw_key)
+        if key in TD_SMART_SOLVER_SAVED_RESULT_DROP_KEYS or key.startswith("_excel"):
+            continue
+        if key == "fit_points":
+            continue
+        if key == "master_model" and isinstance(raw_value, Mapping):
+            model = _td_perf_serializable_model(raw_value)
+            for stage_name in ("stage1_model", "stage2_model"):
+                if isinstance(model.get(stage_name), Mapping):
+                    model[stage_name] = _td_perf_serializable_model(model[stage_name])
+            out[key] = model
+            continue
+        out[key] = _td_perf_json_safe(raw_value)
+    out["fit_points"] = _td_smart_solver_serializable_fit_points(result)
+    return out
+
+
+def _td_smart_solver_entry_input_selectors(result: Mapping[str, object]) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for index in (1, 2, 3):
+        target = str((result or {}).get(f"input{index}_target") or "").strip()
+        if not target:
+            continue
+        out[f"input_{index}"] = {
+            "selector": str((result or {}).get(f"input{index}_selector") or "").strip(),
+            "target": target,
+            "units": str((result or {}).get(f"input{index}_units") or "").strip(),
+        }
+    return out
+
+
+def td_smart_solver_build_saved_equation_entry(
+    db_path: Path,
+    *,
+    name: str,
+    result: Mapping[str, object],
+    config: Mapping[str, object] | None = None,
+    plot_metadata: Mapping[str, object] | None = None,
+    existing_id: object = None,
+    existing_saved_at: object = None,
+) -> dict[str, object]:
+    now_txt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    clean_name = str(name or "").strip() or "Saved Smart Equation"
+    serial_values = sorted(
+        {
+            str(point.get("serial") or "").strip()
+            for point in ((result or {}).get("fit_points") or [])
+            if isinstance(point, Mapping) and str(point.get("serial") or "").strip()
+        }
+    )
+    try:
+        asset_metadata = td_perf_collect_asset_metadata(db_path, serial_values)
+    except Exception:
+        asset_metadata = {}
+    return {
+        "id": str(existing_id or f"{_td_perf_saved_slug(clean_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"),
+        "name": clean_name,
+        "slug": _td_perf_saved_slug(clean_name),
+        "saved_at": str(existing_saved_at or now_txt),
+        "updated_at": now_txt,
+        "config": _td_perf_json_safe(dict(config or {})),
+        "plot_metadata": _td_perf_json_safe(dict(plot_metadata or {})),
+        "result": _td_smart_solver_serializable_result(result),
+        "output_selector": str((result or {}).get("output_selector") or "").strip(),
+        "output_target": str((result or {}).get("output_target") or "").strip(),
+        "output_units": str((result or {}).get("output_units") or "").strip(),
+        "input_selectors": _td_smart_solver_entry_input_selectors(result),
+        "asset_metadata": _td_perf_json_safe(asset_metadata if isinstance(asset_metadata, Mapping) else {}),
+        "refresh_error": "",
+    }
+
+
+def _td_smart_solver_normalize_saved_entry(raw: object) -> dict[str, object] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        return None
+    result = raw.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    if td_smart_solver_exportable_model(result) is None:
+        return None
+    entry_id = str(raw.get("id") or "").strip() or f"{_td_perf_saved_slug(name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    saved_at = str(raw.get("saved_at") or "").strip()
+    updated_at = str(raw.get("updated_at") or saved_at or "").strip()
+    result_out = _td_smart_solver_serializable_result(result)
+    output_selector = str(raw.get("output_selector") or result_out.get("output_selector") or "").strip()
+    output_target = str(raw.get("output_target") or result_out.get("output_target") or "").strip()
+    input_selectors = raw.get("input_selectors")
+    if not isinstance(input_selectors, Mapping) or not input_selectors:
+        input_selectors = _td_smart_solver_entry_input_selectors(result_out)
+    return {
+        "id": entry_id,
+        "name": name,
+        "slug": str(raw.get("slug") or _td_perf_saved_slug(name)).strip() or _td_perf_saved_slug(name),
+        "saved_at": saved_at,
+        "updated_at": updated_at,
+        "config": _td_perf_json_safe(dict(raw.get("config") or {}) if isinstance(raw.get("config"), Mapping) else {}),
+        "plot_metadata": _td_perf_json_safe(
+            dict(raw.get("plot_metadata") or {}) if isinstance(raw.get("plot_metadata"), Mapping) else {}
+        ),
+        "result": result_out,
+        "output_selector": output_selector,
+        "output_target": output_target,
+        "output_units": str(raw.get("output_units") or result_out.get("output_units") or "").strip(),
+        "input_selectors": _td_perf_json_safe(dict(input_selectors)),
+        "asset_metadata": _td_perf_json_safe(
+            dict(raw.get("asset_metadata") or {}) if isinstance(raw.get("asset_metadata"), Mapping) else {}
+        ),
+        "refresh_error": str(raw.get("refresh_error") or "").strip(),
+    }
+
+
+def load_td_saved_smart_equations(project_dir: Path) -> dict[str, object]:
+    path = td_saved_smart_equations_path(project_dir)
+    if not path.exists():
+        return {"version": TD_SAVED_SMART_EQUATIONS_VERSION, "entries": []}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    entries_raw = raw.get("entries") if isinstance(raw, Mapping) else []
+    entries: list[dict[str, object]] = []
+    for item in entries_raw if isinstance(entries_raw, list) else []:
+        normalized = _td_smart_solver_normalize_saved_entry(item)
+        if normalized is not None:
+            entries.append(normalized)
+    return {"version": TD_SAVED_SMART_EQUATIONS_VERSION, "entries": entries}
+
+
+def save_td_saved_smart_equations(project_dir: Path, store: Mapping[str, object]) -> Path:
+    path = td_saved_smart_equations_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries_raw = store.get("entries") if isinstance(store, Mapping) else []
+    entries: list[dict[str, object]] = []
+    for item in entries_raw if isinstance(entries_raw, list) else []:
+        normalized = _td_smart_solver_normalize_saved_entry(item)
+        if normalized is not None:
+            entries.append(normalized)
+    payload = {"version": TD_SAVED_SMART_EQUATIONS_VERSION, "entries": entries}
+    path.write_text(json.dumps(_td_perf_json_safe(payload), indent=2), encoding="utf-8")
+    return path
+
+
+def td_smart_solver_upsert_saved_equation(project_dir: Path, entry: Mapping[str, object]) -> dict[str, object]:
+    normalized = _td_smart_solver_normalize_saved_entry(entry)
+    if normalized is None:
+        raise RuntimeError("Saved smart equation entry is invalid.")
+    store = load_td_saved_smart_equations(project_dir)
+    entries = [dict(item) for item in (store.get("entries") or []) if isinstance(item, Mapping)]
+    replaced = False
+    for idx, existing in enumerate(entries):
+        if str(existing.get("id") or "").strip() == str(normalized.get("id") or "").strip():
+            entries[idx] = normalized
+            replaced = True
+            break
+        if str(existing.get("name") or "").strip().casefold() == str(normalized.get("name") or "").strip().casefold():
+            normalized["id"] = str(existing.get("id") or normalized.get("id") or "").strip() or str(normalized.get("id") or "")
+            normalized["saved_at"] = str(existing.get("saved_at") or normalized.get("saved_at") or "").strip()
+            entries[idx] = normalized
+            replaced = True
+            break
+    if not replaced:
+        entries.append(normalized)
+    entries.sort(key=lambda item: str(item.get("name") or "").lower())
+    store["entries"] = entries
+    save_td_saved_smart_equations(project_dir, store)
+    return normalized
+
+
+def td_smart_solver_delete_saved_equation(project_dir: Path, entry_id: object) -> bool:
+    wanted = str(entry_id or "").strip()
+    if not wanted:
+        return False
+    store = load_td_saved_smart_equations(project_dir)
+    entries = [dict(item) for item in (store.get("entries") or []) if isinstance(item, Mapping)]
+    kept = [item for item in entries if str(item.get("id") or "").strip() != wanted]
+    if len(kept) == len(entries):
+        return False
+    store["entries"] = kept
+    save_td_saved_smart_equations(project_dir, store)
     return True
 
 
