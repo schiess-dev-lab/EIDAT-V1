@@ -14988,7 +14988,7 @@ class TestDataTrendDialog(QtWidgets.QDialog):
                 band_pct = float(cfg.get("initial_band_percent") or 0.0)
             except Exception:
                 band_pct = 0.0
-            parts.append(f"Initial band = ±{band_pct:g}% / condition" if band_pct > 0.0 else "Initial band = Off")
+            parts.append(f"Initial band = ±{band_pct:g}% / serial × condition" if band_pct > 0.0 else "Initial band = Off")
         else:
             parts.append("Initial band = Off")
         return "Config: " + " | ".join(parts)
@@ -15342,11 +15342,11 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         band_layout.addWidget(cb_initial_band)
         band_layout.addWidget(sp_initial_band)
         band_layout.addStretch(1)
-        form.addRow("Initial band / run condition:", band_row)
+        form.addRow("Initial band / serial × condition:", band_row)
         lbl_band_help = QtWidgets.QLabel(
-            "Ignores decayed data: per run condition, only measurements within the ±% band of the first "
-            "(initial) measurement are kept. Points are judged individually, so measurements that return "
-            "to the band are kept."
+            "Ignores decayed data: per serial number × run condition, only measurements within the ±% band "
+            "of that serial's first (initial) measurement are kept. Each serial is banded against its own "
+            "baseline. Points are judged individually, so measurements that return to the band are kept."
         )
         lbl_band_help.setObjectName("smart_solver_help_initial_band")
         lbl_band_help.setWordWrap(True)
@@ -19865,6 +19865,19 @@ class TestDataTrendDialog(QtWidgets.QDialog):
         if output_target and input_targets:
             return f"{output_target} vs {', '.join(input_targets)}"
         return output_target or "Smart Equation"
+
+    def _show_toast(self, message: str, duration: int = 5000) -> None:
+        """Delegate toast notifications to the owning main window when available."""
+        widget = self.parent()
+        while widget is not None:
+            toast = getattr(widget, "_toast", None)
+            if toast is not None:
+                try:
+                    toast.show_message(message, duration)
+                except Exception:
+                    pass
+                return
+            widget = widget.parent()
 
     def _save_current_smart_solver_equation(self) -> None:
         if not self._smart_solver_has_exportable_model():

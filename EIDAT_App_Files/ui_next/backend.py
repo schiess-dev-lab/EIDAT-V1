@@ -31847,7 +31847,7 @@ def td_smart_solver_run(
     initial_band_dropped_point_count = 0
     initial_band_stats: dict[str, object] = {}
     if initial_band_pct > 0.0 and points:
-        _td_emit_progress(progress_cb, f"Applying initial band filter (±{initial_band_pct:g}% per run condition)")
+        _td_emit_progress(progress_cb, f"Applying initial band filter (±{initial_band_pct:g}% per serial × run condition)")
         points, initial_band_dropped_point_count, initial_band_stats = _td_smart_solver_apply_initial_band_filter(
             points,
             initial_band_pct,
@@ -32603,7 +32603,7 @@ def td_smart_solver_run(
         band_groups_affected = int(initial_band_stats.get("groups_affected") or 0)
         if initial_band_dropped_point_count > 0:
             warning_messages.append(
-                f"Initial band filter (±{initial_band_pct:g}% of the first measurement per run condition) dropped "
+                f"Initial band filter (±{initial_band_pct:g}% of the first measurement per serial × run condition) dropped "
                 f"{initial_band_dropped_point_count} decayed point(s) across {band_groups_affected} of "
                 f"{band_groups_total} run condition group(s)."
             )
