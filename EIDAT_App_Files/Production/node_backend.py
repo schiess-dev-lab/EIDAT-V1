@@ -213,6 +213,21 @@ def list_project_serials(node_root: str | Path | None, *, project_dir: str | Pat
     return list(be.list_test_data_project_serial_sources(repo, proj_dir) or [])
 
 
+def list_project_serial_issues(node_root: str | Path | None, *, project_dir: str | Path) -> list[dict[str, Any]]:
+    """Detect broken/invisible serials in a node's Test Data Trending project.
+
+    Wraps backend.find_test_data_project_serial_issues: serials whose cached
+    row is stuck at missing/invalid although artifacts are fine, serials whose
+    extraction sqlite is corrupted or empty, serials extracted on disk but
+    absent from the project cache (never visible in the UI), and serials with
+    no artifacts at all.
+    """
+    be = _be(node_root)
+    repo = global_repo(node_root)
+    proj_dir = _resolve_node_project_dir(repo, project_dir)
+    return list(be.find_test_data_project_serial_issues(repo, proj_dir) or [])
+
+
 def purge_project_serials(
     node_root: str | Path | None,
     *,

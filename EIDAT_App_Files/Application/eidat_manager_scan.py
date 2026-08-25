@@ -213,6 +213,24 @@ def _iter_pdfs(global_repo: Path, *, exclude_dir: Path) -> list[Path]:
     return _iter_data_files(global_repo, exclude_dir=exclude_dir)
 
 
+def _scan_env_flag(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+# When True (default), a file that appears at a new path - including a renamed
+# or moved file whose old path is gone - is treated as a brand-new source and
+# fully re-processed, instead of silently re-using the old tracking row.
+SCAN_RENAMED_FILES_AS_NEW = _scan_env_flag("EIDAT_SCAN_RENAMED_AS_NEW", True)
+
+# When False (default), embedded EIDAT pointer metadata inside a PDF no longer
+# marks a new/changed file as "already processed"; the file is processed clean.
+# Set EIDAT_SCAN_TRUST_EMBEDDED_METADATA=1 to restore the old shortcut.
+SCAN_TRUST_EMBEDDED_METADATA = _scan_env_flag("EIDAT_SCAN_TRUST_EMBEDDED_METADATA", False)
+
+
 def _has_eidat_metadata(file_path: Path) -> bool:
     # Only PDFs can have embedded EIDAT metadata
     if file_path.suffix.lower() not in {".pdf"}:
@@ -468,16 +486,21 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
             metadata_ok = False
             artifacts_ok = _expected_artifacts_exist(paths.support_dir, pdf)
             if row is None:
-                moved = conn.execute(
-                    """
-                    SELECT id, rel_path, last_processed_epoch_ns
-                    FROM files
-                    WHERE file_fingerprint = ?
-                    ORDER BY last_seen_epoch_ns DESC
-                    LIMIT 1
-                    """,
-                    (file_fingerprint,),
-                ).fetchone()
+                if SCAN_RENAMED_FILES_AS_NEW:
+                    # Renamed/moved files are treated as brand-new sources: no
+                    # tracking-row reuse, full clean re-process under the new name.
+                    moved = None
+                else:
+                    moved = conn.execute(
+                        """
+                        SELECT id, rel_path, last_processed_epoch_ns
+                        FROM files
+                        WHERE file_fingerprint = ?
+                        ORDER BY last_seen_epoch_ns DESC
+                        LIMIT 1
+                        """,
+                        (file_fingerprint,),
+                    ).fetchone()
                 # Treat as "moved" only when the prior path no longer exists on disk.
                 # If the prior path still exists, this is a duplicate copy and should be tracked separately.
                 if moved is not None:
@@ -525,15 +548,16 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
                 else:
                     needs_processing = 1
                     reason = "new"
-                    metadata_present = _has_eidat_metadata(pdf)
-                    if metadata_present:
-                        metadata_ok = _pointer_artifacts_exist(global_repo, pdf)
-                        if metadata_ok:
-                            needs_processing = 0
-                            reason = "metadata_present"
-                        else:
-                            needs_processing = 1
-                            reason = "metadata_missing_artifacts"
+                    if SCAN_TRUST_EMBEDDED_METADATA:
+                        metadata_present = _has_eidat_metadata(pdf)
+                        if metadata_present:
+                            metadata_ok = _pointer_artifacts_exist(global_repo, pdf)
+                            if metadata_ok:
+                                needs_processing = 0
+                                reason = "metadata_present"
+                            else:
+                                needs_processing = 1
+                                reason = "metadata_missing_artifacts"
                     if not artifacts_ok:
                         needs_processing = 1
                         reason = reason or "missing_artifacts"
@@ -580,7 +604,7 @@ def scan_global_repo(paths: SupportPaths) -> ScanSummary:
                     needs_processing = 1
                     reason = "new_since_last_scan"
 
-                if needs_processing:
+                if needs_processing and SCAN_TRUST_EMBEDDED_METADATA:
                     metadata_present = _has_eidat_metadata(pdf)
                     if metadata_present:
                         metadata_ok = _pointer_artifacts_exist(global_repo, pdf)

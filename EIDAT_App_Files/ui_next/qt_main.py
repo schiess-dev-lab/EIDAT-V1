@@ -30841,7 +30841,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_manager_force_all.clicked.connect(self._act_manager_force_all)
         scan_row.addWidget(self.btn_manager_force_all)
 
-        self.btn_manager_force_file = QtWidgets.QPushButton("Force Process File")
+        self.btn_manager_force_file = QtWidgets.QPushButton("Force Process Files")
         self.btn_manager_force_file.setMinimumHeight(button_min_h)
         self.btn_manager_force_file.setStyleSheet(
             """
@@ -30860,7 +30860,10 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             """
         )
-        self.btn_manager_force_file.setToolTip("Select one source file and rebuild only that file's generated artifacts and index data.")
+        self.btn_manager_force_file.setToolTip(
+            "Select one or more source files (or a whole folder) and rebuild only those files' "
+            "generated artifacts and index data."
+        )
         self.btn_manager_force_file.clicked.connect(self._act_manager_force_single_file)
         scan_row.addWidget(self.btn_manager_force_file)
         scan_row.addStretch(1)
@@ -36717,22 +36720,84 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Force Process File", str(exc))
             return
 
-        filter_str = "EIDAT source files (*.pdf *.xlsx *.xls *.xlsm *.mat);;All files (*)"
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select Source File to Force Process",
-            str(repo),
-            filter_str,
+        source_exts = {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Force Process Files")
+        box.setText("Force-reprocess which sources?")
+        box.setInformativeText(
+            "Select Files lets you pick one or more source files (Ctrl/Shift-click).\n"
+            "Select Folder reprocesses every source file found under a folder."
         )
-        if not path:
+        btn_files = box.addButton("Select Files…", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        btn_folder = box.addButton("Select Folder…", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+
+        sources: list[Path] = []
+        if clicked is btn_files:
+            filter_str = "EIDAT source files (*.pdf *.xlsx *.xls *.xlsm *.mat);;All files (*)"
+            paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+                self,
+                "Select Source Files to Force Process",
+                str(repo),
+                filter_str,
+            )
+            if not paths:
+                return
+            sources = [Path(p).expanduser() for p in paths]
+        elif clicked is btn_folder:
+            folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Select Folder of Source Files to Force Process",
+                str(repo),
+            )
+            if not folder:
+                return
+            folder_path = Path(folder).expanduser()
+            skip_dirs = {"eidat support", "eidat", "edat support"}
+            try:
+                for p in sorted(folder_path.rglob("*")):
+                    if not p.is_file() or p.suffix.lower() not in source_exts:
+                        continue
+                    rel_parts = {str(part).strip().casefold() for part in p.relative_to(folder_path).parts[:-1]}
+                    if rel_parts & skip_dirs:
+                        continue
+                    if p.name.startswith("~$"):
+                        continue
+                    sources.append(p)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Force Process Files", f"Folder scan failed: {exc}")
+                return
+            if not sources:
+                QtWidgets.QMessageBox.information(
+                    self, "Force Process Files", "No PDF, Excel, or MAT source files found under that folder."
+                )
+                return
+        else:
             return
-        source = Path(path).expanduser()
+
+        if len(sources) > 1:
+            preview = "\n".join(f"  {s.name}" for s in sources[:20])
+            if len(sources) > 20:
+                preview += f"\n  … and {len(sources) - 20} more"
+            resp = QtWidgets.QMessageBox.question(
+                self,
+                "Force Process Files",
+                f"Force-reprocess {len(sources)} source file(s)?\n\n{preview}\n\nContinue?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+        label = sources[0].name if len(sources) == 1 else f"{len(sources)} files"
 
         def _on_success(payload: dict):
             ok = int(payload.get("processed_ok") or 0)
             failed = int(payload.get("processed_failed") or 0)
-            rel = str(payload.get("source_rel_path") or source.name).strip()
-            self._append_log(f"[EDAT MANAGER] Force processed file: {rel}; ok={ok}, failed={failed}")
+            rels = [str(r).strip() for r in (payload.get("source_rel_paths") or []) if str(r).strip()]
+            rel = rels[0] if len(rels) == 1 else f"{len(rels)} files"
+            self._append_log(f"[EDAT MANAGER] Force processed: {rel}; ok={ok}, failed={failed}")
             results = payload.get("results") or []
             for r in results:
                 if not r.get("ok") and r.get("error"):
@@ -36742,12 +36807,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
             self._show_toast(f"Force processed {rel}.")
-            return f"Force file complete - ok={ok}, failed={failed}"
+            return f"Force files complete - ok={ok}, failed={failed}"
 
         self._start_manager_action(
-            heading="Force Process File",
-            status_text=f"Processing {source.name}",
-            task=lambda: be.eidat_manager_force_single_file(repo, source),
+            heading="Force Process Files",
+            status_text=f"Processing {label}",
+            task=lambda: be.eidat_manager_force_files(repo, list(sources)),
             on_success=_on_success,
         )
 

@@ -491,6 +491,7 @@ def run_update_projects(
     projects: list[dict[str, object]] | tuple[dict[str, object], ...],
     overwrite: bool = False,
     force_project_rebuild: bool = False,
+    repair_serials: bool = False,
     on_log: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     node = _as_abs(node_root)
@@ -513,12 +514,89 @@ def run_update_projects(
             on_log(f"[NODE] {node}")
             on_log(
                 "[ACTION] update_projects "
-                f"selected={len(selected)} overwrite={bool(overwrite)} force_rebuild={bool(force_project_rebuild)}"
+                f"selected={len(selected)} overwrite={bool(overwrite)} force_rebuild={bool(force_project_rebuild)} "
+                f"repair_serials={bool(repair_serials)}"
             )
 
         results: list[dict[str, object]] = []
         succeeded = 0
         failed = 0
+
+        def _serial_health_check(project_name: str, project_dir: Path) -> list[dict[str, object]]:
+            """Detect broken/invisible serials for a Test Data Trending project and log them."""
+            try:
+                issues = [dict(item or {}) for item in (node_backend.list_project_serial_issues(node, project_dir=project_dir) or [])]
+            except Exception as exc:
+                if on_log is not None:
+                    on_log(f"[HEALTH] {project_name}: serial health check failed: {exc}")
+                return []
+            if not issues:
+                if on_log is not None:
+                    on_log(f"[HEALTH] {project_name}: no serial issues detected")
+                return []
+            if on_log is not None:
+                on_log(f"[HEALTH] {project_name}: {len(issues)} serial issue(s) detected")
+                for item in issues[:40]:
+                    serial = str(item.get("serial") or item.get("serial_number") or "?").strip()
+                    on_log(f"[HEALTH ISSUE] {item.get('issue')}: {serial} - {item.get('detail')}")
+                if len(issues) > 40:
+                    on_log(f"[HEALTH] (truncated; showing first 40 of {len(issues)} issues)")
+            return issues
+
+        def _serial_repair(project_name: str, project_dir: Path, issues: list[dict[str, object]]) -> dict[str, object]:
+            """Purge broken serials so the subsequent update rebuilds them from scratch.
+
+            source_removed issues are intentionally NOT purged here: the update
+            itself drops those rows from the workbook Sources sheet and purges
+            them in one step (purging first would delete the metadata that
+            proves the source document is gone).
+            """
+            skip_issues = {"orphaned_cache", "source_removed"}
+            repairable = [item for item in issues if str(item.get("issue") or "") not in skip_issues]
+            with_artifacts = sorted(
+                {
+                    str(item.get("serial") or "").strip()
+                    for item in repairable
+                    if bool(item.get("purge_artifacts")) and str(item.get("serial") or "").strip()
+                }
+            )
+            cache_only = sorted(
+                {
+                    str(item.get("serial") or "").strip()
+                    for item in repairable
+                    if not bool(item.get("purge_artifacts")) and str(item.get("serial") or "").strip()
+                }
+                - set(with_artifacts)
+            )
+            summary: dict[str, object] = {
+                "purged_with_artifacts": with_artifacts,
+                "purged_cache_only": cache_only,
+                "errors": [],
+            }
+            for serial_group, delete_artifacts in ((with_artifacts, True), (cache_only, False)):
+                if not serial_group:
+                    continue
+                try:
+                    res = node_backend.purge_project_serials(
+                        node,
+                        project_dir=project_dir,
+                        serials=list(serial_group),
+                        delete_official_artifacts=delete_artifacts,
+                    )
+                    errs = [str(e) for e in (res.get("errors") or [])]
+                    if errs:
+                        summary["errors"] = list(summary.get("errors") or []) + errs
+                    if on_log is not None:
+                        on_log(
+                            f"[HEALTH REPAIR] {project_name}: purged {len(serial_group)} serial(s) "
+                            f"(artifacts_deleted={delete_artifacts} impl_rows={int(res.get('impl_rows_deleted') or 0)} "
+                            f"raw_rows={int(res.get('raw_rows_deleted') or 0)})"
+                        )
+                except Exception as exc:
+                    summary["errors"] = list(summary.get("errors") or []) + [str(exc)]
+                    if on_log is not None:
+                        on_log(f"[HEALTH REPAIR] {project_name}: purge failed: {exc}")
+            return summary
 
         for index, project in enumerate(selected, start=1):
             raw_name = str(project.get("name") or "").strip()
@@ -536,6 +614,14 @@ def run_update_projects(
                     if on_log is not None and s:
                         on_log(f"[PROJECT {name}] {s}")
 
+                serial_health: dict[str, object] = {}
+                is_td_project = raw_type.strip().casefold() == "test data trending"
+                if is_td_project:
+                    issues = _serial_health_check(name, wb.parent)
+                    serial_health["issues_before"] = issues
+                    if issues and repair_serials:
+                        serial_health["repair"] = _serial_repair(name, wb.parent, issues)
+
                 payload = dict(
                     node_backend.update_project(
                         node,
@@ -547,6 +633,15 @@ def run_update_projects(
                     )
                     or {}
                 )
+                if is_td_project and serial_health.get("issues_before"):
+                    remaining = _serial_health_check(f"{name} (after update)", wb.parent)
+                    serial_health["issues_after"] = remaining
+                    if on_log is not None:
+                        before_count = len(list(serial_health.get("issues_before") or []))
+                        on_log(
+                            f"[HEALTH] {name}: {before_count} issue(s) before update, "
+                            f"{len(remaining)} remaining after update"
+                        )
                 results.append(
                     {
                         "name": name,
@@ -554,6 +649,7 @@ def run_update_projects(
                         "workbook": str(wb),
                         "ok": True,
                         "payload": payload,
+                        "serial_health": serial_health,
                     }
                 )
                 succeeded += 1
@@ -592,6 +688,7 @@ def run_update_projects(
             "failed_count": failed,
             "overwrite": bool(overwrite),
             "force_project_rebuild": bool(force_project_rebuild),
+            "repair_serials": bool(repair_serials),
             "projects": results,
             "projects_sample": sample,
         }
@@ -720,21 +817,21 @@ def run_scan_force_candidates(
         return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
 
 
-def run_force_single_file(
+def run_force_files(
     *,
     node_root: str | Path,
     runtime_root: str | Path,
-    file_path: str | Path,
+    file_paths: list[str | Path] | tuple[str | Path, ...],
     py: str | None = None,
     similarity: float = 0.86,
     node_env_enabled: bool = False,
     on_log: Callable[[str], None] | None = None,
 ) -> PipelineResult:
     """
-    Force-process one source file, then refresh the index.
+    Force-process one or more source files, then refresh the index.
 
     The scan step runs first so newly added files are tracked, but the process step
-    is filtered to the selected file only.
+    is filtered to the selected files only.
     """
     node = _as_abs(node_root)
     runtime = _as_abs(runtime_root)
@@ -749,15 +846,36 @@ def run_force_single_file(
         if not (runtime / "EIDAT_App_Files").exists():
             raise RuntimeError(f"Runtime root does not contain EIDAT_App_Files: {runtime}")
 
-        rel_path = _source_rel_path(node, file_path)
-        outputs["source_file"] = {
-            "rel_path": rel_path,
-            "abs_path": str((node / Path(rel_path)).expanduser()),
-        }
+        raw_paths = [p for p in (file_paths or []) if str(p or "").strip()]
+        if not raw_paths:
+            raise RuntimeError("No source files selected.")
+        rel_paths: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_paths:
+            rel = _source_rel_path(node, raw)
+            if rel not in seen:
+                seen.add(rel)
+                rel_paths.append(rel)
+        outputs["source_files"] = [
+            {
+                "rel_path": rel,
+                "abs_path": str((node / Path(rel)).expanduser()),
+            }
+            for rel in rel_paths
+        ]
+        # Back-compat: single-file callers still read outputs["source_file"].
+        outputs["source_file"] = dict(outputs["source_files"][0])
 
         if on_log is not None:
             on_log(f"[NODE] {node}")
-            on_log(f"[FILE] force update: {rel_path}")
+            if len(rel_paths) == 1:
+                on_log(f"[FILE] force update: {rel_paths[0]}")
+            else:
+                on_log(f"[FILES] force update: {len(rel_paths)} file(s)")
+                for rel in rel_paths[:80]:
+                    on_log(f"[FILE] {rel}")
+                if len(rel_paths) > 80:
+                    on_log(f"[FILES] (truncated; showing first 80 of {len(rel_paths)})")
 
         outputs["init"] = _run_manager(python_exe, runtime, node, "init", node_env_enabled=node_env_enabled, on_log=on_log)
         scan = _run_manager(python_exe, runtime, node, "scan", node_env_enabled=node_env_enabled, on_log=on_log)
@@ -772,7 +890,9 @@ def run_force_single_file(
         cfg = _load_node_config(runtime, node, node_env_enabled=node_env_enabled)
         eff_dpi = _env_int(cfg.get("EIDAT_PROCESS_DPI"), 0)
 
-        extra: list[str] = ["--force", "--file", rel_path]
+        extra: list[str] = ["--force"]
+        for rel in rel_paths:
+            extra += ["--file", rel]
         if eff_dpi and eff_dpi > 0:
             extra += ["--dpi", str(int(eff_dpi))]
 
@@ -793,13 +913,18 @@ def run_force_single_file(
             try:
                 for item in list((process_payload or {}).get("results") or []):
                     if not bool((item or {}).get("ok")):
+                        rel = str((item or {}).get("rel_path") or "").strip()
                         err = str((item or {}).get("error") or "").strip()
                         if err:
-                            errors.append(err)
+                            errors.append(f"{rel}: {err}" if rel else err)
             except Exception:
                 pass
             detail = f": {'; '.join(errors[:3])}" if errors else ""
-            raise RuntimeError(f"Single-file force update did not complete for {rel_path}{detail}")
+            label = rel_paths[0] if len(rel_paths) == 1 else f"{len(rel_paths)} file(s)"
+            raise RuntimeError(
+                f"Force update completed with failures for {label} "
+                f"(ok={processed_ok} failed={processed_failed}){detail}"
+            )
 
         outputs["index"] = _run_manager(
             python_exe,
@@ -813,6 +938,28 @@ def run_force_single_file(
         return PipelineResult(ok=True, node_root=node, outputs=outputs)
     except Exception as exc:
         return PipelineResult(ok=False, node_root=node, outputs=outputs, error=str(exc))
+
+
+def run_force_single_file(
+    *,
+    node_root: str | Path,
+    runtime_root: str | Path,
+    file_path: str | Path,
+    py: str | None = None,
+    similarity: float = 0.86,
+    node_env_enabled: bool = False,
+    on_log: Callable[[str], None] | None = None,
+) -> PipelineResult:
+    """Back-compat wrapper: force-process a single source file via run_force_files."""
+    return run_force_files(
+        node_root=node_root,
+        runtime_root=runtime_root,
+        file_paths=[file_path],
+        py=py,
+        similarity=similarity,
+        node_env_enabled=node_env_enabled,
+        on_log=on_log,
+    )
 
 
 def run_excel_to_sqlite(

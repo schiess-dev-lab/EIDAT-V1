@@ -1001,26 +1001,43 @@ def eidat_manager_process(
     return result
 
 
-def eidat_manager_force_single_file(global_repo: Path, file_path: str | Path, *, dpi: int = 0) -> Dict[str, object]:
+def eidat_manager_force_files(
+    global_repo: Path, file_paths: Sequence[str | Path], *, dpi: int = 0
+) -> Dict[str, object]:
     repo = Path(global_repo).expanduser()
-    source = resolve_path_within_global_repo(repo, Path(file_path), "Source file")
-    if not source.exists():
-        raise FileNotFoundError(f"Source file not found: {source}")
-    if not source.is_file():
-        raise RuntimeError(f"Source path is not a file: {source}")
-    if source.suffix.lower() not in ({".pdf"} | set(EXCEL_EXTENSIONS)):
-        raise RuntimeError("Select a PDF, Excel, or MAT source file.")
+    raw_paths = [p for p in (file_paths or []) if str(p or "").strip()]
+    if not raw_paths:
+        raise RuntimeError("No source files selected.")
+    sources: list[Path] = []
+    seen: set[str] = set()
+    for raw in raw_paths:
+        source = resolve_path_within_global_repo(repo, Path(raw), "Source file")
+        if not source.exists():
+            raise FileNotFoundError(f"Source file not found: {source}")
+        if not source.is_file():
+            raise RuntimeError(f"Source path is not a file: {source}")
+        if source.suffix.lower() not in ({".pdf"} | set(EXCEL_EXTENSIONS)):
+            raise RuntimeError(f"Not a PDF, Excel, or MAT source file: {source.name}")
+        key = str(source.resolve()) if source.exists() else str(source)
+        if key not in seen:
+            seen.add(key)
+            sources.append(source)
 
-    try:
-        rel_path = source.resolve().relative_to(repo.resolve()).as_posix()
-    except Exception:
-        rel_path = source.as_posix()
+    rel_paths: list[str] = []
+    for source in sources:
+        try:
+            rel_paths.append(source.resolve().relative_to(repo.resolve()).as_posix())
+        except Exception:
+            rel_paths.append(source.as_posix())
 
     scan_payload = eidat_manager_scan(repo)
-    result = eidat_manager_process(repo, dpi=dpi, force=True, file_paths=[source])
+    result = eidat_manager_process(repo, dpi=dpi, force=True, file_paths=list(sources))
     result["scan"] = scan_payload
-    result["source_file"] = str(source)
-    result["source_rel_path"] = rel_path
+    result["source_files"] = [str(s) for s in sources]
+    result["source_rel_paths"] = list(rel_paths)
+    # Back-compat: single-file callers still read these keys.
+    result["source_file"] = str(sources[0])
+    result["source_rel_path"] = rel_paths[0]
 
     processed_ok = int(result.get("processed_ok") or 0)
     processed_failed = int(result.get("processed_failed") or 0)
@@ -1029,14 +1046,22 @@ def eidat_manager_force_single_file(global_repo: Path, file_path: str | Path, *,
         try:
             for item in list(result.get("results") or []):
                 if not bool((item or {}).get("ok")):
+                    rel = str((item or {}).get("rel_path") or "").strip()
                     err = str((item or {}).get("error") or "").strip()
                     if err:
-                        errors.append(err)
+                        errors.append(f"{rel}: {err}" if rel else err)
         except Exception:
             pass
         detail = f": {'; '.join(errors[:3])}" if errors else ""
-        raise RuntimeError(f"Single-file force update did not complete for {rel_path}{detail}")
+        label = rel_paths[0] if len(rel_paths) == 1 else f"{len(rel_paths)} file(s)"
+        raise RuntimeError(
+            f"Force update completed with failures for {label} (ok={processed_ok} failed={processed_failed}){detail}"
+        )
     return result
+
+
+def eidat_manager_force_single_file(global_repo: Path, file_path: str | Path, *, dpi: int = 0) -> Dict[str, object]:
+    return eidat_manager_force_files(global_repo, [file_path], dpi=dpi)
 
 
 def eidat_manager_index(global_repo: Path, *, similarity: float = 0.86) -> Dict[str, object]:
@@ -40841,6 +40866,62 @@ def update_test_data_trending_project_workbook(
                     row_item["source_key"] = source_key
 
     source_rows = _td_collect_sources_sheet_rows(ws_src, src_headers)
+
+    # Move past removed files: a source whose document was removed from the
+    # repo (and whose extraction can no longer be resolved) is dropped from the
+    # Sources sheet and purged from the caches instead of lingering as a
+    # "missing data" ghost that every update flags again.
+    removed_source_rows: list[dict[str, str]] = []
+    if not dry_run:
+        kept_source_rows: list[dict[str, str]] = []
+        docs_pool_for_removed = list(index_docs_for_td or [])
+        for row_item in source_rows:
+            try:
+                resolution = _resolve_td_source_sqlite_for_workbook(wb_path, row_item)
+                row_status = str(resolution.get("status") or "missing").strip().lower()
+            except Exception:
+                row_status = "missing"
+            if row_status != "ok" and _td_source_document_removed(
+                repo, wb_path, row_item, docs_pool=docs_pool_for_removed
+            ):
+                removed_source_rows.append(dict(row_item))
+                continue
+            kept_source_rows.append(row_item)
+        if removed_source_rows:
+            source_rows = kept_source_rows
+            removed_purge_keys: list[str] = []
+            for row_item in removed_source_rows:
+                for key in (row_item.get("source_key"), row_item.get("serial_number"), row_item.get("serial")):
+                    text = str(key or "").strip()
+                    if text and text not in removed_purge_keys:
+                        removed_purge_keys.append(text)
+            try:
+                removed_purge_result = dict(
+                    purge_test_data_project_serials(
+                        repo,
+                        project_dir,
+                        removed_purge_keys,
+                        delete_official_artifacts=True,
+                    )
+                    or {}
+                )
+            except Exception as exc:
+                removed_purge_result = {"errors": [str(exc)]}
+            source_refresh_payload["removed_sources"] = {
+                "count": len(removed_source_rows),
+                "serials": list(removed_purge_keys),
+                "impl_rows_deleted": int(removed_purge_result.get("impl_rows_deleted") or 0),
+                "raw_rows_deleted": int(removed_purge_result.get("raw_rows_deleted") or 0),
+                "deleted_artifact_dirs": list(removed_purge_result.get("deleted_artifact_dirs") or []),
+                "errors": [str(e) for e in (removed_purge_result.get("errors") or [])],
+            }
+            _td_emit_progress(
+                progress_cb,
+                f"Dropped {len(removed_source_rows)} removed source(s) from the project: "
+                + ", ".join(removed_purge_keys[:10])
+                + ("…" if len(removed_purge_keys) > 10 else ""),
+            )
+
     added_serials: list[str] = []
     if continued_rules and not dry_run:
         try:
@@ -40857,6 +40938,11 @@ def update_test_data_trending_project_workbook(
                     continue
                 sqlite_rel = str(d.get("excel_sqlite_rel") or "").strip()
                 if not sqlite_rel:
+                    continue
+                # Skip stale index docs whose source document was removed from
+                # the repo - do not re-add serials for files that are gone.
+                doc_source_rels = _td_rel_source_paths_from_mapping(d)
+                if doc_source_rels and not _td_any_source_path_exists(repo, doc_source_rels):
                     continue
                 eligible_docs.append(d)
             existing_source_keys = {
@@ -47858,6 +47944,470 @@ def purge_test_data_project_serials(
                 result["errors"].append(f"artifacts delete failed ({art_dir}): {exc}")
 
     return result
+
+
+def _td_rel_source_paths_from_mapping(payload: Mapping[str, object] | None) -> list[str]:
+    """Collect recorded source-document rel paths (source_rel_path/source_rel_paths)."""
+    out: list[str] = []
+    if not isinstance(payload, Mapping):
+        return out
+    single = str(payload.get("source_rel_path") or "").strip()
+    if single:
+        out.append(single)
+    raw_list = payload.get("source_rel_paths")
+    if isinstance(raw_list, (list, tuple)):
+        for value in raw_list:
+            text = str(value or "").strip()
+            if text and text not in out:
+                out.append(text)
+    return out
+
+
+def _td_any_source_path_exists(node_root: Path, rel_paths: Sequence[str]) -> bool:
+    root = Path(node_root).expanduser()
+    for rel in rel_paths:
+        text = str(rel or "").strip()
+        if not text:
+            continue
+        try:
+            candidate = Path(text.replace("\\", "/")).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if candidate.exists():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _td_source_document_removed(
+    node_root: Path,
+    workbook_path: Path,
+    source_row: Mapping[str, object],
+    *,
+    docs_pool: Sequence[Mapping[str, object]] | None = None,
+) -> bool:
+    """True when the serial's source document(s) were removed from the repo.
+
+    Reads the recorded source document path(s) from the serial's official
+    metadata json (falling back to a matching eidat_index doc) and returns
+    True only when at least one source path was recorded and none of them
+    exist on disk any more. Returns False when nothing is recorded (unknown),
+    so callers stay conservative.
+    """
+    rel_paths: list[str] = []
+    try:
+        meta_path = _resolve_td_source_metadata_path(workbook_path, source_row)
+        if meta_path and meta_path.exists() and meta_path.is_file():
+            raw = json.loads(meta_path.read_text(encoding="utf-8"))
+            rel_paths = _td_rel_source_paths_from_mapping(raw if isinstance(raw, Mapping) else None)
+    except Exception:
+        rel_paths = []
+    if not rel_paths and docs_pool:
+        row_keys = {
+            str(source_row.get("metadata_rel") or "").strip().casefold(),
+            str(source_row.get("excel_sqlite_rel") or "").strip().casefold(),
+            str(source_row.get("artifacts_rel") or "").strip().casefold(),
+        }
+        row_keys.discard("")
+        if row_keys:
+            for doc in docs_pool:
+                if not isinstance(doc, Mapping):
+                    continue
+                doc_keys = {
+                    str(doc.get("metadata_rel") or "").strip().casefold(),
+                    str(doc.get("excel_sqlite_rel") or "").strip().casefold(),
+                    str(doc.get("artifacts_rel") or "").strip().casefold(),
+                }
+                doc_keys.discard("")
+                if row_keys & doc_keys:
+                    rel_paths = _td_rel_source_paths_from_mapping(doc)
+                    if rel_paths:
+                        break
+    if not rel_paths:
+        return False
+    return not _td_any_source_path_exists(Path(node_root), rel_paths)
+
+
+def _td_source_sqlite_has_data(sqlite_path: object) -> tuple[bool, str]:
+    """Deep-check a TD source extraction SQLite: readable and contains data rows.
+
+    Returns (ok, detail). ok=False means the file is unreadable/corrupted or
+    holds no data rows at all ("missing data" even though the file exists).
+    """
+    raw = str(sqlite_path or "").strip()
+    if not raw:
+        return False, "no sqlite path recorded"
+    path = Path(raw).expanduser()
+    if not path.exists():
+        return False, "extraction sqlite missing on disk"
+    try:
+        if path.stat().st_size <= 0:
+            return False, "extraction sqlite is empty (0 bytes)"
+    except Exception:
+        pass
+    try:
+        uri = f"file:{path.as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except Exception as exc:
+        return False, f"cannot open extraction sqlite: {exc}"
+    try:
+        try:
+            tables = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+        except sqlite3.DatabaseError as exc:
+            return False, f"extraction sqlite unreadable (corrupted?): {exc}"
+        if not tables:
+            return False, "extraction sqlite has no tables"
+        total_rows = 0
+        for table_name in tables[:50]:
+            safe = table_name.replace('"', '""')
+            try:
+                cur = conn.execute(f'SELECT COUNT(*) FROM "{safe}"')
+                total_rows += int(cur.fetchone()[0] or 0)
+            except sqlite3.DatabaseError as exc:
+                return False, f"table {table_name} unreadable (corrupted?): {exc}"
+            if total_rows > 0:
+                break
+        if total_rows <= 0:
+            return False, "extraction sqlite contains no data rows"
+        return True, ""
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _td_project_workbook_path(project_dir: Path) -> Path | None:
+    """Resolve a project's workbook path from its project.json (best effort)."""
+    proj_dir = Path(project_dir).expanduser()
+    meta_path = proj_dir / EIDAT_PROJECT_META
+    try:
+        raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    text = str((raw or {}).get("workbook") or "").strip() if isinstance(raw, dict) else ""
+    if text:
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            candidate = proj_dir / candidate
+        if candidate.exists():
+            return candidate
+        local = proj_dir / candidate.name
+        if local.exists():
+            return local
+    try:
+        for candidate in sorted(proj_dir.glob("*.xlsx")):
+            if not candidate.name.startswith("~$"):
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def find_test_data_project_serial_issues(global_repo: Path, project_dir: Path) -> list[dict]:
+    """Detect serials that are broken or invisible in a Test Data Trending project.
+
+    Compares the workbook's expected sources (current on-disk runtime state)
+    against the project's cached td_sources rows and deep-checks each
+    extraction sqlite. Returns one row per problem:
+
+      issue values:
+        not_in_project    - extraction artifacts are OK on disk, but the serial has
+                            no td_sources row, so it never shows up in the UI.
+        stale_error_cache - artifacts are OK on disk, but the cached row is stuck
+                            at status missing/invalid ("missing data" in the UI);
+                            the smart refresh will not recover it on its own.
+        corrupt_artifacts - the serial resolves, but its extraction sqlite is
+                            unreadable or holds no data rows.
+        missing_artifacts - no extraction artifacts on disk; the serial needs a
+                            re-extraction from its source document.
+        invalid_source    - the source could not be resolved for another reason.
+        orphaned_cache    - cached row exists but the workbook no longer lists a
+                            matching source.
+
+    Each row: {serial, serial_number, program_title, asset_type,
+    asset_specific_type, issue, detail, status_disk, status_cached,
+    sqlite_path, purge_artifacts (bool: recommended purge should also delete
+    artifacts so the extraction is rebuilt from the source document)}.
+    """
+    repo = Path(global_repo).expanduser()
+    proj_dir = Path(project_dir).expanduser()
+    issues: list[dict] = []
+
+    wb_path = _td_project_workbook_path(proj_dir)
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+
+    cached_sources: dict[str, dict] = {}
+    cached_source_serial_numbers: dict[str, str] = {}
+    cached_meta: dict[str, dict] = {}
+    if db_path.exists():
+        try:
+            with closing(sqlite3.connect(str(db_path))) as conn:
+                conn.row_factory = sqlite3.Row
+                try:
+                    for row in conn.execute(
+                        "SELECT serial, COALESCE(status,'') AS status, COALESCE(sqlite_path,'') AS sqlite_path FROM td_sources"
+                    ).fetchall():
+                        key = str(row["serial"] or "").strip()
+                        if key:
+                            cached_sources[key] = {
+                                "status": str(row["status"] or "").strip().lower(),
+                                "sqlite_path": str(row["sqlite_path"] or "").strip(),
+                            }
+                except Exception:
+                    pass
+                try:
+                    for row in conn.execute(
+                        """
+                        SELECT serial,
+                               COALESCE(source_serial_number,'') AS source_serial_number,
+                               COALESCE(program_title,'') AS program_title,
+                               COALESCE(asset_type,'') AS asset_type,
+                               COALESCE(asset_specific_type,'') AS asset_specific_type
+                        FROM td_source_metadata
+                        """
+                    ).fetchall():
+                        key = str(row["serial"] or "").strip()
+                        if not key:
+                            continue
+                        cached_source_serial_numbers[key] = str(row["source_serial_number"] or "").strip()
+                        cached_meta[key] = {
+                            "source_serial_number": str(row["source_serial_number"] or "").strip(),
+                            "program_title": str(row["program_title"] or "").strip(),
+                            "asset_type": str(row["asset_type"] or "").strip(),
+                            "asset_specific_type": str(row["asset_specific_type"] or "").strip(),
+                        }
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    cached_keys_by_source_serial_number: dict[str, list[str]] = {}
+    for cached_serial, serial_number in cached_source_serial_numbers.items():
+        key = str(serial_number or "").strip()
+        if key:
+            cached_keys_by_source_serial_number.setdefault(key, []).append(cached_serial)
+
+    def _emit(
+        *,
+        serial: str,
+        serial_number: str,
+        issue: str,
+        detail: str,
+        status_disk: str,
+        status_cached: str,
+        sqlite_path: str,
+        purge_artifacts: bool,
+        meta: Mapping[str, object] | None = None,
+    ) -> None:
+        m = dict(meta or {})
+        issues.append(
+            {
+                "serial": serial,
+                "serial_number": serial_number,
+                "program_title": str(m.get("program_title") or "").strip(),
+                "asset_type": str(m.get("asset_type") or "").strip(),
+                "asset_specific_type": str(m.get("asset_specific_type") or "").strip(),
+                "issue": issue,
+                "detail": detail,
+                "status_disk": status_disk,
+                "status_cached": status_cached,
+                "sqlite_path": sqlite_path,
+                "purge_artifacts": bool(purge_artifacts),
+            }
+        )
+
+    matched_cached_serials: set[str] = set()
+    if wb_path is not None:
+        try:
+            project_cfg = _load_project_td_trend_config(wb_path)
+        except Exception:
+            project_cfg = {}
+        current_raw_cols_csv = ",".join(
+            [
+                str(c.get("name") or "").strip()
+                for c in (project_cfg.get("columns") or [])
+                if str(c.get("name") or "").strip()
+            ]
+        )
+        try:
+            project_raw_signature = _td_build_project_raw_signature(
+                wb_path,
+                raw_columns_csv=current_raw_cols_csv,
+            )
+        except Exception:
+            project_raw_signature = ""
+        try:
+            sources = _read_test_data_sources(wb_path)
+        except Exception:
+            sources = []
+
+        _index_docs_state: dict[str, object] = {"loaded": False, "docs": []}
+
+        def _index_docs_pool() -> list:
+            if not _index_docs_state["loaded"]:
+                _index_docs_state["loaded"] = True
+                try:
+                    _index_docs_state["docs"] = list(read_eidat_index_documents(repo) or [])
+                except Exception:
+                    _index_docs_state["docs"] = []
+            return list(_index_docs_state["docs"])  # type: ignore[arg-type]
+
+        for source_row in sources:
+            if not str(source_row.get("serial") or "").strip():
+                continue
+            try:
+                state = _td_source_runtime_state(
+                    wb_path,
+                    dict(source_row),
+                    project_raw_signature=project_raw_signature,
+                )
+            except Exception:
+                continue
+            serial = str(state.get("serial") or "").strip()
+            if not serial:
+                continue
+            serial_number = str(state.get("serial_number") or "").strip()
+            status_disk = str(state.get("status") or "").strip().lower()
+            sqlite_path = str(state.get("sqlite_path") or "").strip()
+
+            cached_serial = serial
+            cached = cached_sources.get(cached_serial)
+            if cached is None and serial_number and serial_number in cached_sources:
+                cached_serial = serial_number
+                cached = cached_sources.get(cached_serial)
+            if cached is None and serial_number:
+                alias_candidates = list(cached_keys_by_source_serial_number.get(serial_number) or [])
+                if len(alias_candidates) == 1:
+                    cached_serial = alias_candidates[0]
+                    cached = cached_sources.get(cached_serial)
+            if cached is not None:
+                matched_cached_serials.add(cached_serial)
+            status_cached = str((cached or {}).get("status") or "").strip().lower()
+            meta = cached_meta.get(cached_serial) or {}
+
+            if status_disk == "ok":
+                data_ok, data_detail = _td_source_sqlite_has_data(sqlite_path)
+                if not data_ok:
+                    _emit(
+                        serial=cached_serial if cached is not None else serial,
+                        serial_number=serial_number,
+                        issue="corrupt_artifacts",
+                        detail=data_detail,
+                        status_disk=status_disk,
+                        status_cached=status_cached,
+                        sqlite_path=sqlite_path,
+                        purge_artifacts=True,
+                        meta=meta,
+                    )
+                elif cached is None:
+                    _emit(
+                        serial=serial,
+                        serial_number=serial_number,
+                        issue="not_in_project",
+                        detail="extraction artifacts are OK on disk, but the project has no cached row for this serial (not visible in the UI)",
+                        status_disk=status_disk,
+                        status_cached="",
+                        sqlite_path=sqlite_path,
+                        purge_artifacts=False,
+                        meta=meta,
+                    )
+                elif status_cached != "ok":
+                    _emit(
+                        serial=cached_serial,
+                        serial_number=serial_number,
+                        issue="stale_error_cache",
+                        detail=(
+                            f"cached status is '{status_cached or 'unknown'}' although artifacts are OK on disk; "
+                            "the smart refresh will not retry it (shows as missing data in the UI)"
+                        ),
+                        status_disk=status_disk,
+                        status_cached=status_cached,
+                        sqlite_path=sqlite_path,
+                        purge_artifacts=False,
+                        meta=meta,
+                    )
+            elif status_disk == "missing":
+                if _td_source_document_removed(
+                    repo, wb_path, source_row, docs_pool=_index_docs_pool()
+                ):
+                    _emit(
+                        serial=cached_serial if cached is not None else serial,
+                        serial_number=serial_number,
+                        issue="source_removed",
+                        detail=(
+                            "source document was removed from the repo; the serial is dropped "
+                            "from the project on the next update (no re-extraction attempted)"
+                        ),
+                        status_disk=status_disk,
+                        status_cached=status_cached,
+                        sqlite_path=sqlite_path,
+                        purge_artifacts=True,
+                        meta=meta,
+                    )
+                else:
+                    _emit(
+                        serial=cached_serial if cached is not None else serial,
+                        serial_number=serial_number,
+                        issue="missing_artifacts",
+                        detail="no extraction artifacts on disk; needs re-extraction from the source document",
+                        status_disk=status_disk,
+                        status_cached=status_cached,
+                        sqlite_path=sqlite_path,
+                        purge_artifacts=True,
+                        meta=meta,
+                    )
+            else:
+                _emit(
+                    serial=cached_serial if cached is not None else serial,
+                    serial_number=serial_number,
+                    issue="invalid_source",
+                    detail=f"source resolution status is '{status_disk or 'unknown'}'",
+                    status_disk=status_disk,
+                    status_cached=status_cached,
+                    sqlite_path=sqlite_path,
+                    purge_artifacts=True,
+                    meta=meta,
+                )
+
+        for cached_serial in sorted(set(cached_sources.keys()) - matched_cached_serials):
+            cached = cached_sources.get(cached_serial) or {}
+            meta = cached_meta.get(cached_serial) or {}
+            _emit(
+                serial=cached_serial,
+                serial_number=str(meta.get("source_serial_number") or "").strip(),
+                issue="orphaned_cache",
+                detail="cached row exists but the workbook no longer lists a matching source",
+                status_disk="",
+                status_cached=str(cached.get("status") or "").strip().lower(),
+                sqlite_path=str(cached.get("sqlite_path") or "").strip(),
+                purge_artifacts=False,
+                meta=meta,
+            )
+    else:
+        # No workbook: still report cached rows that are stuck in an error state.
+        for cached_serial, cached in sorted(cached_sources.items()):
+            status_cached = str(cached.get("status") or "").strip().lower()
+            if status_cached and status_cached != "ok":
+                _emit(
+                    serial=cached_serial,
+                    serial_number=str((cached_meta.get(cached_serial) or {}).get("source_serial_number") or "").strip(),
+                    issue="stale_error_cache",
+                    detail=f"cached status is '{status_cached}' (workbook could not be resolved for a disk check)",
+                    status_disk="",
+                    status_cached=status_cached,
+                    sqlite_path=str(cached.get("sqlite_path") or "").strip(),
+                    purge_artifacts=False,
+                    meta=cached_meta.get(cached_serial),
+                )
+
+    return issues
 
 
 def _mirror_project_to_local(project_dir: Path, *, project_name: str) -> Path:

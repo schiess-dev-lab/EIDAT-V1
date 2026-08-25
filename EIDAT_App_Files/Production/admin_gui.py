@@ -92,14 +92,21 @@ class _Worker(QtCore.QThread):
                     on_log=_emit,
                 )
             elif action == "force_single_file":
-                from .admin_runner import run_force_single_file
+                from .admin_runner import run_force_files
 
-                file_path = str(options.get("file_path") or "").strip()
-                _emit("[ACTION] force update single source file")
-                res = run_force_single_file(
+                raw_paths = options.get("file_paths")
+                if isinstance(raw_paths, (list, tuple)):
+                    file_paths = [str(p or "").strip() for p in raw_paths if str(p or "").strip()]
+                else:
+                    file_paths = []
+                single = str(options.get("file_path") or "").strip()
+                if single and single not in file_paths:
+                    file_paths.append(single)
+                _emit(f"[ACTION] force update {len(file_paths)} source file(s)")
+                res = run_force_files(
                     node_root=node_root,
                     runtime_root=runtime_root,
-                    file_path=file_path,
+                    file_paths=file_paths,
                     node_env_enabled=node_env_enabled,
                     on_log=_emit,
                 )
@@ -120,9 +127,11 @@ class _Worker(QtCore.QThread):
                 projects = [dict(item or {}) for item in projects_raw if isinstance(item, dict)] if isinstance(projects_raw, list) else []
                 overwrite = bool(options.get("overwrite"))
                 force_project_rebuild = bool(options.get("force_project_rebuild"))
+                repair_serials = bool(options.get("repair_serials"))
                 _emit(
                     "[ACTION] update projects via backend processor "
-                    f"(selected={len(projects)} overwrite={overwrite} force_rebuild={force_project_rebuild})"
+                    f"(selected={len(projects)} overwrite={overwrite} force_rebuild={force_project_rebuild} "
+                    f"repair_serials={repair_serials})"
                 )
                 res = run_update_projects(
                     node_root=node_root,
@@ -130,6 +139,7 @@ class _Worker(QtCore.QThread):
                     projects=projects,
                     overwrite=overwrite,
                     force_project_rebuild=force_project_rebuild,
+                    repair_serials=repair_serials,
                     on_log=_emit,
                 )
             else:
@@ -157,18 +167,22 @@ class _Worker(QtCore.QThread):
                     _emit(f"[OK] update_projects selected={selected} succeeded={succeeded} failed={failed}")
                 elif action == "force_single_file":
                     proc = res.outputs.get("process") or {}
-                    source = res.outputs.get("source_file") or {}
+                    sources = res.outputs.get("source_files") or []
                     try:
                         ok = int((proc or {}).get("processed_ok", 0))
                         bad = int((proc or {}).get("processed_failed", 0))
                     except Exception:
                         ok = bad = 0
+                    suffix = ""
                     try:
-                        rel = str((source or {}).get("rel_path") or "").strip()
+                        if isinstance(sources, list) and len(sources) == 1:
+                            rel = str((sources[0] or {}).get("rel_path") or "").strip()
+                            suffix = f" file={rel}" if rel else ""
+                        elif isinstance(sources, list) and sources:
+                            suffix = f" files={len(sources)}"
                     except Exception:
-                        rel = ""
-                    suffix = f" file={rel}" if rel else ""
-                    _emit(f"[OK] force_single_file processed_ok={ok} processed_failed={bad}{suffix}")
+                        suffix = ""
+                    _emit(f"[OK] force_files processed_ok={ok} processed_failed={bad}{suffix}")
                 else:
                     scan = res.outputs.get("scan") or {}
                     proc = res.outputs.get("process") or {}
@@ -287,8 +301,17 @@ class _ProjectUpdatePickerDialog(QtWidgets.QDialog):
         self.cb_overwrite = QtWidgets.QCheckBox("Overwrite existing cells")
         self.cb_force_rebuild = QtWidgets.QCheckBox("Force full rebuild")
         self.cb_force_rebuild.setToolTip("Applies only to Test Data Trending projects.")
+        self.cb_repair_serials = QtWidgets.QCheckBox("Detect && repair broken serials")
+        self.cb_repair_serials.setChecked(True)
+        self.cb_repair_serials.setToolTip(
+            "Test Data Trending projects only: before updating, scan for serials that are "
+            "corrupted, stuck at 'missing data', or extracted on disk but not visible in the UI. "
+            "Broken serials are purged from the project caches so this update re-creates them "
+            "from scratch (corrupted extractions are re-extracted from their source documents)."
+        )
         opts.addWidget(self.cb_overwrite)
         opts.addWidget(self.cb_force_rebuild)
+        opts.addWidget(self.cb_repair_serials)
         opts.addStretch(1)
         layout.addLayout(opts)
 
@@ -403,9 +426,17 @@ class _TdSerialManagerDialog(QtWidgets.QDialog):
         self.lbl_status = QtWidgets.QLabel("")
         self.lbl_status.setStyleSheet("color:#475569;")
         btn_row.addWidget(self.lbl_status, 1)
+        self.btn_select_all = QtWidgets.QPushButton("Select All")
+        self.btn_find_problems = QtWidgets.QPushButton("Find Problem Serials")
+        self.btn_find_problems.setToolTip(
+            "Scan this project for serials that are corrupted, stuck at 'missing data', or "
+            "extracted on disk but not visible in the UI, and select them in the list."
+        )
         self.btn_delete = QtWidgets.QPushButton("Delete Selected Serials…")
         self.btn_delete.setEnabled(False)
         self.btn_close = QtWidgets.QPushButton("Close")
+        btn_row.addWidget(self.btn_select_all)
+        btn_row.addWidget(self.btn_find_problems)
         btn_row.addWidget(self.btn_delete)
         btn_row.addWidget(self.btn_close)
         layout.addLayout(btn_row)
@@ -414,6 +445,8 @@ class _TdSerialManagerDialog(QtWidgets.QDialog):
         self.btn_reload.clicked.connect(self.reload_serials)
         self.cmb_project.currentIndexChanged.connect(lambda _=0: self.reload_serials())
         self.tree.itemSelectionChanged.connect(self._refresh_buttons)
+        self.btn_select_all.clicked.connect(self._act_select_all)
+        self.btn_find_problems.clicked.connect(self._act_find_problems)
         self.btn_delete.clicked.connect(self._act_delete_selected)
 
         self.reload_serials()
@@ -486,6 +519,88 @@ class _TdSerialManagerDialog(QtWidgets.QDialog):
 
     def _refresh_buttons(self) -> None:
         self.btn_delete.setEnabled(bool(self.selected_serials()))
+
+    def _iter_serial_items(self):
+        for top in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(top)
+            if parent is None:
+                continue
+            for child in range(parent.childCount()):
+                item = parent.child(child)
+                if item is not None:
+                    yield item
+
+    def _act_select_all(self) -> None:
+        self.tree.clearSelection()
+        for item in self._iter_serial_items():
+            item.setSelected(True)
+
+    def _act_find_problems(self) -> None:
+        from . import node_backend
+
+        project = self.current_project()
+        project_dir = str(project.get("project_dir") or "").strip()
+        if not project_dir:
+            return
+        try:
+            issues = [dict(i or {}) for i in (node_backend.list_project_serial_issues(self._node_root, project_dir=project_dir) or [])]
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Find Problem Serials", str(exc))
+            return
+        if not issues:
+            self.lbl_status.setText("No problem serials detected.")
+            QtWidgets.QMessageBox.information(
+                self, "Find Problem Serials", "No corrupted, stuck, or invisible serials were detected."
+            )
+            return
+
+        issue_keys: set[str] = set()
+        for item in issues:
+            for key in (item.get("serial"), item.get("serial_number")):
+                text = str(key or "").strip()
+                if text:
+                    issue_keys.add(text)
+
+        self.tree.clearSelection()
+        selected_count = 0
+        for tree_item in self._iter_serial_items():
+            payload = tree_item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            keys = {
+                str(payload.get("serial") or "").strip(),
+                str(payload.get("source_serial_number") or "").strip(),
+            }
+            keys.discard("")
+            if keys & issue_keys:
+                tree_item.setSelected(True)
+                selected_count += 1
+
+        lines: list[str] = []
+        for item in issues[:25]:
+            serial = str(item.get("serial") or item.get("serial_number") or "?").strip()
+            lines.append(f"  [{item.get('issue')}] {serial}: {item.get('detail')}")
+        if len(issues) > 25:
+            lines.append(f"  … and {len(issues) - 25} more")
+        not_listed = len(issues) - selected_count
+        extra = ""
+        if not_listed > 0:
+            extra = (
+                f"\n\n{not_listed} issue(s) have no row in this list (e.g. extracted on disk but never "
+                "cached). Run Update Projects with 'Detect & repair broken serials' enabled to fix them."
+            )
+        self.lbl_status.setText(f"{len(issues)} problem serial(s) found; {selected_count} selected in the list.")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Find Problem Serials",
+            (
+                f"Detected {len(issues)} problem serial(s); selected {selected_count} in the list.\n\n"
+                + "\n".join(lines)
+                + "\n\nDelete the selected serials to purge their caches, then run Update Projects to "
+                "re-create them from scratch."
+                + extra
+            ),
+        )
 
     def _act_delete_selected(self) -> None:
         from . import node_backend
@@ -799,7 +914,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                 b_proc = QtWidgets.QPushButton("Process")
                 b_update = QtWidgets.QPushButton("Update Proc")
                 b_update_projects = QtWidgets.QPushButton("Update Projects")
-                b_force_file = QtWidgets.QPushButton("Force File")
+                b_force_file = QtWidgets.QPushButton("Force Files")
                 b_td_serials = QtWidgets.QPushButton("TD Serials")
                 b_update.setToolTip(
                     "Refresh node runtime and node UI venv packages against the current runtime code "
@@ -809,8 +924,9 @@ class AdminWindow(QtWidgets.QMainWindow):
                     "Select one or more registered node projects and update them from the backend processor path."
                 )
                 b_force_file.setToolTip(
-                    "Select one PDF, Excel, or MAT source file in this node and rebuild only that file's "
-                    "EIDAT Support artifacts, metadata, source pointer when applicable, and index entries."
+                    "Select one or more PDF, Excel, or MAT source files (or a whole folder) in this node and "
+                    "rebuild only those files' EIDAT Support artifacts, metadata, source pointers when "
+                    "applicable, and index entries."
                 )
                 b_td_serials.setToolTip(
                     "View a Test Data Trending project's programs/serial numbers and delete a serial "
@@ -1011,7 +1127,7 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._run_status.begin(f"Update Processor Envs/Runtime: {Path(n.node_root).name}")
         self.worker.start()
 
-    def _choose_projects_for_update(self, node_root: str | Path) -> tuple[list[dict[str, object]], bool, bool] | None:
+    def _choose_projects_for_update(self, node_root: str | Path) -> tuple[list[dict[str, object]], bool, bool, bool] | None:
         from . import node_backend
 
         projects = list(node_backend.list_projects(node_root) or [])
@@ -1019,7 +1135,12 @@ class AdminWindow(QtWidgets.QMainWindow):
         try:
             if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 return None
-            return (dlg.selected_projects(), bool(dlg.cb_overwrite.isChecked()), bool(dlg.cb_force_rebuild.isChecked()))
+            return (
+                dlg.selected_projects(),
+                bool(dlg.cb_overwrite.isChecked()),
+                bool(dlg.cb_force_rebuild.isChecked()),
+                bool(dlg.cb_repair_serials.isChecked()),
+            )
         finally:
             dlg.deleteLater()
 
@@ -1035,7 +1156,7 @@ class AdminWindow(QtWidgets.QMainWindow):
             picked = self._choose_projects_for_update(n.node_root)
             if not picked:
                 return
-            projects, overwrite, force_project_rebuild = picked
+            projects, overwrite, force_project_rebuild, repair_serials = picked
             if not projects:
                 QtWidgets.QMessageBox.information(self, "Update Projects", "Select at least one project to update.")
                 return
@@ -1052,6 +1173,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                             "projects": projects,
                             "overwrite": bool(overwrite),
                             "force_project_rebuild": bool(force_project_rebuild),
+                            "repair_serials": bool(repair_serials),
                         },
                     )
                 ]
@@ -1123,6 +1245,7 @@ class AdminWindow(QtWidgets.QMainWindow):
                         "projects": [purged_project],
                         "overwrite": False,
                         "force_project_rebuild": False,
+                        "repair_serials": True,
                     },
                 )
             ]
@@ -1154,30 +1277,131 @@ class AdminWindow(QtWidgets.QMainWindow):
             return
 
         node_root = _as_abs(n.node_root)
-        filter_str = "EIDAT source files (*.pdf *.xlsx *.xls *.xlsm *.mat);;All files (*)"
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select Source File to Force Update",
-            str(node_root),
-            filter_str,
+        source_exts = {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}
+
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Force Files")
+        box.setText("Force-reprocess which sources?")
+        box.setInformativeText(
+            "Select Files lets you pick one or more source files (Ctrl/Shift-click).\n"
+            "Select Folder reprocesses every source file found under a folder."
         )
-        if not path:
+        btn_files = box.addButton("Select Files…", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        btn_folder = box.addButton("Select Folder…", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+
+        sources: list[Path] = []
+        if clicked is btn_files:
+            filter_str = "EIDAT source files (*.pdf *.xlsx *.xls *.xlsm *.mat);;All files (*)"
+            paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+                self,
+                "Select Source Files to Force Update",
+                str(node_root),
+                filter_str,
+            )
+            if not paths:
+                return
+            sources = [_as_abs(p) for p in paths]
+            bad = [s for s in sources if s.suffix.lower() not in source_exts]
+            if bad:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Force Files",
+                    "Select only PDF, Excel, or MAT source files. Not a source file:\n"
+                    + "\n".join(f"  {s.name}" for s in bad[:10]),
+                )
+                return
+        elif clicked is btn_folder:
+            folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Select Folder of Source Files to Force Update",
+                str(node_root),
+            )
+            if not folder:
+                return
+            folder_path = _as_abs(folder)
+            try:
+                folder_path.resolve().relative_to(node_root.resolve())
+            except Exception:
+                QtWidgets.QMessageBox.warning(self, "Force Files", "Select a folder inside the node root.")
+                return
+            skip_dirs = {"eidat support", "eidat", "edat support"}
+            try:
+                for p in sorted(folder_path.rglob("*")):
+                    if not p.is_file() or p.suffix.lower() not in source_exts:
+                        continue
+                    rel_parts = {str(part).strip().casefold() for part in p.relative_to(folder_path).parts[:-1]}
+                    if rel_parts & skip_dirs:
+                        continue
+                    if p.name.startswith("~$"):
+                        continue
+                    sources.append(p)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Force Files", f"Folder scan failed: {exc}")
+                return
+            if not sources:
+                QtWidgets.QMessageBox.information(
+                    self, "Force Files", "No PDF, Excel, or MAT source files found under that folder."
+                )
+                return
+        else:
             return
-        source = _as_abs(path)
-        if source.suffix.lower() not in {".pdf", ".xlsx", ".xls", ".xlsm", ".mat"}:
-            QtWidgets.QMessageBox.warning(self, "Force File", "Select a PDF, Excel, or MAT source file.")
+
+        outside = []
+        for s in sources:
+            try:
+                s.resolve().relative_to(node_root.resolve())
+            except Exception:
+                outside.append(s)
+        if outside:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Force Files",
+                "All source files must be inside the node root. Outside:\n"
+                + "\n".join(f"  {s}" for s in outside[:10]),
+            )
             return
-        try:
-            source.resolve().relative_to(node_root.resolve())
-        except Exception:
-            QtWidgets.QMessageBox.warning(self, "Force File", "Select a source file inside the node root.")
-            return
+
+        # De-duplicate while preserving order.
+        seen: set[str] = set()
+        unique_sources: list[Path] = []
+        for s in sources:
+            key = str(s.resolve()) if s.exists() else str(s)
+            if key not in seen:
+                seen.add(key)
+                unique_sources.append(s)
+        sources = unique_sources
+
+        if len(sources) > 1:
+            preview = "\n".join(f"  {s.name}" for s in sources[:20])
+            if len(sources) > 20:
+                preview += f"\n  … and {len(sources) - 20} more"
+            resp = QtWidgets.QMessageBox.question(
+                self,
+                "Force Files",
+                f"Force-reprocess {len(sources)} source file(s)?\n\n{preview}\n\nContinue?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if resp != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
 
         self._ensure_node_env_file(n.node_root)
         self.worker.set_tasks(
-            [(n.node_id, n.node_root, n.runtime_root, True, "force_single_file", {"file_path": str(source)})]
+            [
+                (
+                    n.node_id,
+                    n.node_root,
+                    n.runtime_root,
+                    True,
+                    "force_single_file",
+                    {"file_paths": [str(s) for s in sources]},
+                )
+            ]
         )
-        self._run_status.begin(f"Force File Update: {source.name}")
+        label = sources[0].name if len(sources) == 1 else f"{len(sources)} files"
+        self._run_status.begin(f"Force File Update: {label}")
         self.worker.start()
 
     def _on_finished_one(
