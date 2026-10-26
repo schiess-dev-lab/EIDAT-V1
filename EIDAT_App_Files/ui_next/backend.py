@@ -4794,7 +4794,7 @@ def save_td_repo_parameter_mappings(
                     "openpyxl is required to update ProgramRequirements workbooks. "
                     "Install it with `py -m pip install openpyxl` within the project environment."
                 ) from exc
-            wb = load_workbook(str(workbook_file))
+            wb = _td_load_workbook(str(workbook_file))
             try:
                 state = _td_program_requirements_parse_workbook(wb)
             finally:
@@ -9173,7 +9173,7 @@ def _read_test_data_config_columns(workbook_path: Path) -> list[dict]:
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
 
-    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
     try:
         if "Config" not in wb.sheetnames:
             return []
@@ -9227,7 +9227,7 @@ def _read_test_data_config_statistics(workbook_path: Path) -> list[str]:
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
 
-    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
     try:
         if "Config" not in wb.sheetnames:
             return []
@@ -9303,7 +9303,7 @@ def _read_test_data_sources(workbook_path: Path) -> list[dict]:
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
 
-    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
     try:
         if "Sources" not in wb.sheetnames:
             return []
@@ -9860,7 +9860,7 @@ def _write_test_data_source_link_updates(
         ) from exc
 
     wb_path = Path(workbook_path).expanduser()
-    wb = load_workbook(str(wb_path))
+    wb = _td_load_workbook(str(wb_path))
     changed: dict[str, dict[str, str]] = {}
     try:
         if "Sources" not in wb.sheetnames:
@@ -9906,7 +9906,7 @@ def _write_test_data_source_link_updates(
                 changed[update_key] = applied
 
         if dirty:
-            wb.save(str(wb_path))
+            _td_save_workbook_atomic(wb, wb_path)
         return changed
     finally:
         try:
@@ -10331,7 +10331,7 @@ def _read_test_data_data_definitions(workbook_path: Path) -> list[dict]:
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
 
-    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
     try:
         if "Data" not in wb.sheetnames:
             return []
@@ -11137,6 +11137,299 @@ def _td_load_workbook_ignore_long_title_warning(*args, **kwargs):
             category=UserWarning,
         )
         return load_workbook(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Robust .xlsx open/save helpers for Test Data project workbooks.
+#
+# Background: openpyxl's `wb.save(path)` truncates and rewrites the target in
+# place, so a crash / kill / OneDrive lock mid-save leaves a 0-byte or truncated
+# file and every later reader fails with the opaque "File is not a zip file".
+# Readers in another process (Admin Dashboard vs EDAT GUI, project mirroring)
+# hit the same thing while a save is in flight. These helpers (a) save to a
+# temp sibling and atomically replace, and (b) classify unreadable workbooks
+# with an actionable error that the GUI can route to "Rebuild Project".
+# ---------------------------------------------------------------------------
+
+
+class TDWorkbookCorruptError(RuntimeError):
+    """A workbook required by a Test Data project is missing, empty or not a valid .xlsx."""
+
+    def __init__(self, path: object, reason: str, *, guidance: str = "") -> None:
+        self.path = Path(str(path or "")).expanduser()
+        self.reason = str(reason or "").strip() or "unreadable"
+        hint = str(guidance or "").strip() or (
+            "Close it in Excel if it is open; if the file is damaged, run 'Rebuild Project' "
+            "(or restore it from a *.corrupt-*.bak copy next to it)."
+        )
+        super().__init__(f"Workbook is not a valid .xlsx file ({self.reason}): {self.path}. {hint}")
+
+
+def _xlsx_file_problem(path: object) -> str:
+    """
+    Return '' when `path` looks like a readable .xlsx container, else a short reason.
+
+    Only cheap structural checks are done here (size, PK signature, zip central
+    directory); openpyxl still does the real parse.
+    """
+    import zipfile
+
+    p = Path(str(path or "")).expanduser()
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return "file not found"
+    except OSError as exc:
+        return f"unreadable ({exc})"
+    if not p.is_file():
+        return "not a file"
+    if int(st.st_size or 0) == 0:
+        return "file is empty (0 bytes; an interrupted save?)"
+    try:
+        with p.open("rb") as fh:
+            head = fh.read(4)
+    except PermissionError:
+        # Locked by Excel/OneDrive - let openpyxl surface the real error.
+        return ""
+    except OSError as exc:
+        return f"unreadable ({exc})"
+    if head[:2] != b"PK":
+        return "not a zip/xlsx container (wrong signature)"
+    try:
+        if not zipfile.is_zipfile(str(p)):
+            return "zip central directory is damaged (truncated save?)"
+    except OSError as exc:
+        return f"unreadable ({exc})"
+    return ""
+
+
+def _td_load_workbook(path: object, **kwargs):
+    """
+    `openpyxl.load_workbook` with pre-checks and a classified error.
+
+    Raises TDWorkbookCorruptError for missing/empty/corrupt files instead of
+    the opaque `zipfile.BadZipFile("File is not a zip file")` / KeyError.
+    PermissionError (open in Excel) is left to the caller.
+    """
+    import zipfile
+
+    p = Path(str(path or "")).expanduser()
+    problem = _xlsx_file_problem(p)
+    if problem == "file not found":
+        # Preserve the historical exception type for callers that branch on it.
+        raise FileNotFoundError(f"Workbook not found: {p}")
+    if problem:
+        raise TDWorkbookCorruptError(p, problem)
+    try:
+        return _td_load_workbook_ignore_long_title_warning(str(p), **kwargs)
+    except PermissionError:
+        raise
+    except zipfile.BadZipFile as exc:
+        raise TDWorkbookCorruptError(p, str(exc) or "bad zip") from exc
+    except KeyError as exc:
+        # openpyxl raises KeyError when a mandatory xlsx part is missing.
+        raise TDWorkbookCorruptError(p, f"missing workbook part {exc}") from exc
+    except OSError as exc:
+        raise TDWorkbookCorruptError(p, f"unreadable ({exc})") from exc
+
+
+def _td_save_workbook_atomic(wb, path: object, *, replace_retries: int = 12, retry_wait_s: float = 0.5) -> Path:
+    """
+    Save `wb` to a temp sibling, verify it is a valid xlsx, then atomically
+    replace `path`. The target is never left empty/truncated.
+
+    `os.replace` can fail on Windows while another process still has the
+    target open for reading (GUI reading while the dashboard writes, or the
+    OneDrive client uploading); those readers are short-lived, so retry briefly
+    before reporting the file as locked.
+    """
+    import time as _time
+
+    target = Path(str(path or "")).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}-{_time.time_ns()}.tmp")
+    try:
+        wb.save(str(tmp))
+        problem = _xlsx_file_problem(tmp)
+        if problem:
+            raise RuntimeError(f"Workbook save produced an invalid file ({problem}): {tmp}")
+        last_exc: Exception | None = None
+        for attempt in range(max(1, int(replace_retries))):
+            try:
+                os.replace(str(tmp), str(target))
+                last_exc = None
+                break
+            except PermissionError as exc:
+                last_exc = exc
+                if attempt + 1 >= max(1, int(replace_retries)):
+                    break
+                _time.sleep(max(0.05, float(retry_wait_s)))
+        if last_exc is not None:
+            raise RuntimeError(
+                f"Workbook is not writable (close it in Excel first, or wait for OneDrive to finish syncing): {target}"
+            ) from last_exc
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return target
+
+
+def _td_quarantine_corrupt_file(path: object, *, reason: str = "") -> Path | None:
+    """
+    Move a damaged file aside as `<name>.corrupt-<stamp>.bak` (never deleted) so
+    the caller can regenerate it. Returns the backup path, or None when the file
+    does not exist / could not be moved.
+    """
+    import time as _time
+
+    p = Path(str(path or "")).expanduser()
+    if not p.exists():
+        return None
+    stamp = _time.strftime("%Y%m%d_%H%M%S")
+    backup = p.with_name(f"{p.name}.corrupt-{stamp}.bak")
+    idx = 1
+    while backup.exists():
+        idx += 1
+        backup = p.with_name(f"{p.name}.corrupt-{stamp}-{idx}.bak")
+    try:
+        os.replace(str(p), str(backup))
+    except Exception:
+        try:
+            shutil.move(str(p), str(backup))
+        except Exception:
+            return None
+    try:
+        note = backup.with_suffix(backup.suffix + ".txt")
+        note.write_text(
+            f"Quarantined {p.name} at {stamp}.\nReason: {reason or 'unreadable workbook'}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    return backup
+
+
+def _td_project_cache_file_paths(project_dir: Path) -> list[Path]:
+    """Every derived cache file a Test Data project keeps next to its workbook."""
+    proj_dir = Path(project_dir).expanduser()
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    raw_db_path = td_raw_cache_db_path_for(proj_dir)
+    out: list[Path] = []
+    for base in (db_path, raw_db_path):
+        out.append(base)
+        out.append(base.with_name(base.name + "-wal"))
+        out.append(base.with_name(base.name + "-shm"))
+        out.append(base.with_name(base.name + "-journal"))
+    out.append(db_path.with_suffix(".xlsx"))  # implementation cache Excel mirror
+    out.append(raw_db_path.with_name(EIDAT_PROJECT_TD_RAW_POINTS_XLSX))
+    out.append(proj_dir / TD_CACHE_DEBUG_JSON)
+    out.append(proj_dir / TD_RUN_CONDITION_DEBUG_JSON)
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for item in out:
+        key = str(item).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _td_purge_project_cache_files(project_dir: Path) -> list[Path]:
+    """
+    Delete the project's derived cache files (SQLite caches + Excel mirrors +
+    debug json). Best-effort: a file that is locked (open in the Trend viewer
+    or by Excel) is skipped - the full rebuild drops its tables anyway.
+    Returns the paths actually removed. User-authored files (workbook, support
+    workbook, project.json, saved equations) are never touched.
+    """
+    removed: list[Path] = []
+    for item in _td_project_cache_file_paths(project_dir):
+        try:
+            if item.exists() and item.is_file():
+                item.unlink()
+                removed.append(item)
+        except Exception:
+            continue
+    return removed
+
+
+def _td_quarantine_corrupt_support_workbook(workbook_path: Path, *, project_dir: Path | None = None) -> Path | None:
+    """
+    If the project's support workbook exists but is not a readable .xlsx, move
+    it aside (kept as *.corrupt-*.bak) so the support sync regenerates it.
+    Returns the backup path when something was quarantined.
+    """
+    support_path = td_support_workbook_path_for(workbook_path, project_dir=project_dir)
+    if not support_path.exists():
+        return None
+    problem = _xlsx_file_problem(support_path)
+    if not problem:
+        return None
+    return _td_quarantine_corrupt_file(support_path, reason=problem)
+
+
+def inspect_test_data_project_files(project_dir: Path, workbook_path: Path | None = None) -> dict[str, object]:
+    """
+    Cheap health snapshot of a Test Data project's on-disk files, for the GUI to
+    decide between Update Project and Rebuild Project. Never raises.
+    """
+    proj_dir = Path(project_dir).expanduser()
+    meta = _read_project_meta(proj_dir)
+    wb_path = (
+        Path(workbook_path).expanduser()
+        if workbook_path is not None
+        else (_td_project_workbook_path(proj_dir) or Path(str(meta.get("workbook") or "")).expanduser())
+    )
+    if not wb_path.is_absolute():
+        wb_path = proj_dir / wb_path
+    support_path = td_support_workbook_path_for(wb_path, project_dir=proj_dir)
+    db_path = proj_dir / EIDAT_PROJECT_IMPLEMENTATION_DB
+    raw_db_path = td_raw_cache_db_path_for(proj_dir)
+
+    def _sqlite_problem(path: Path) -> str:
+        if not path.exists():
+            return "file not found"
+        try:
+            if path.stat().st_size == 0:
+                # A 0-byte file is a valid (empty) SQLite database; Update builds it.
+                return ""
+        except OSError as exc:
+            return f"unreadable ({exc})"
+        try:
+            with closing(sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)) as conn:
+                conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+        except Exception as exc:
+            return f"corrupt ({exc})"
+        return ""
+
+    workbook_problem = _xlsx_file_problem(wb_path)
+    support_problem = _xlsx_file_problem(support_path) if support_path.exists() else ""
+    impl_problem = _sqlite_problem(db_path)
+    raw_problem = _sqlite_problem(raw_db_path)
+    quarantined = sorted(str(item.name) for item in proj_dir.glob("*.corrupt-*.bak"))
+    return {
+        "project_dir": str(proj_dir),
+        "workbook": str(wb_path),
+        "workbook_problem": workbook_problem,
+        "support_workbook": str(support_path),
+        "support_workbook_problem": support_problem,
+        "cache_db": str(db_path),
+        "cache_db_problem": impl_problem,
+        "raw_cache_db": str(raw_db_path),
+        "raw_cache_db_problem": raw_problem,
+        "quarantined_files": quarantined,
+        "workbook_corrupt": bool(workbook_problem and workbook_problem != "file not found"),
+        "workbook_missing": workbook_problem == "file not found",
+        "needs_rebuild": bool(
+            workbook_problem
+            or support_problem
+            or (impl_problem and impl_problem != "file not found")
+            or (raw_problem and raw_problem != "file not found")
+        ),
+    }
 
 
 def _td_safe_excel_sheet_title(title: object, used: set[str], *, fallback: str = "Sheet") -> str:
@@ -12145,7 +12438,7 @@ def _td_program_requirements_write_workbook(
     wb_path.parent.mkdir(parents=True, exist_ok=True)
     created = False
     if wb_path.exists():
-        wb = _td_load_workbook_ignore_long_title_warning(str(wb_path))
+        wb = _td_load_workbook(str(wb_path))
     else:
         wb = Workbook()
         created = True
@@ -12342,7 +12635,7 @@ def _td_program_requirements_write_workbook(
         except Exception:
             pass
 
-        wb.save(str(wb_path))
+        _td_save_workbook_atomic(wb, wb_path)
     finally:
         try:
             wb.close()
@@ -12451,7 +12744,7 @@ def _td_program_requirements_read_source_workbook(path: Path) -> list[dict[str, 
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
     workbook_path = Path(path).expanduser()
-    wb = load_workbook(str(workbook_path), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(workbook_path), read_only=True, data_only=True)
     try:
         state = _td_program_requirements_parse_workbook(wb)
     finally:
@@ -12506,7 +12799,7 @@ def _td_program_requirements_read_parameter_mappings(path: Path) -> list[dict[st
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
     workbook_path = Path(path).expanduser()
-    wb = load_workbook(str(workbook_path), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(workbook_path), read_only=True, data_only=True)
     try:
         state = _td_program_requirements_parse_workbook(wb)
     finally:
@@ -12609,7 +12902,7 @@ def _sync_td_support_program_requirements_import(
         seen_programs.add(key)
         selected_programs.append(program_title)
 
-    wb = load_workbook(str(support_path))
+    wb = _td_load_workbook(str(support_path))
     try:
         existing_by_program = _td_program_requirements_read_support_state(wb)
         found_programs: set[str] = set()
@@ -12652,7 +12945,7 @@ def _sync_td_support_program_requirements_import(
                 )
 
         if not combined_conditions:
-            wb.save(str(support_path))
+            _td_save_workbook_atomic(wb, support_path)
             return {
                 "path": str(support_path),
                 "updated": bool(found_programs),
@@ -12736,7 +13029,7 @@ def _sync_td_support_program_requirements_import(
                         str(condition.get("source_sheet_name") or "").strip(),
                     ]
                 )
-        wb.save(str(support_path))
+        _td_save_workbook_atomic(wb, support_path)
     finally:
         try:
             wb.close()
@@ -13221,7 +13514,7 @@ def _write_td_support_workbook(
             ws_prog.append([row.get(header) for header in TD_SUPPORT_PROGRAM_ROW_HEADERS])
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(path))
+    _td_save_workbook_atomic(wb, path)
     try:
         wb.close()
     except Exception:
@@ -13336,7 +13629,7 @@ def _refresh_td_support_run_conditions_sheet(
             return round(f, 12)
         return str(value).strip()
 
-    wb = _td_load_workbook_ignore_long_title_warning(str(support_path))
+    wb = _td_load_workbook(str(support_path))
     try:
         normalized_changed = _td_normalize_support_workbook_sheet_names(wb)
         legacy_sheet_names = [
@@ -13383,7 +13676,7 @@ def _refresh_td_support_run_conditions_sheet(
         ws_cond.append(headers)
         for row in desired_rows:
             ws_cond.append(list(row))
-        wb.save(str(support_path))
+        _td_save_workbook_atomic(wb, support_path)
     finally:
         try:
             wb.close()
@@ -13535,7 +13828,7 @@ def _sync_td_support_workbook_program_sheets(
                 ordered.append(clean)
         desired_sequences_by_program[title] = ordered
 
-    wb = _td_load_workbook_ignore_long_title_warning(str(support_path))
+    wb = _td_load_workbook(str(support_path))
     try:
         changed = _td_normalize_support_workbook_sheet_names(wb)
 
@@ -13647,7 +13940,7 @@ def _sync_td_support_workbook_program_sheets(
             for row in desired_rows:
                 ws_program.append(list(row))
 
-        wb.save(str(support_path))
+        _td_save_workbook_atomic(wb, support_path)
         changed = True
     finally:
         try:
@@ -13799,7 +14092,7 @@ def _read_td_support_workbook(workbook_path: Path, *, project_dir: Path | None =
             "bounds_by_sequence": {},
         }
 
-    wb = _td_load_workbook_ignore_long_title_warning(str(support_path), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(support_path), read_only=True, data_only=True)
     try:
         settings: dict[str, object] = {}
         if "Settings" in wb.sheetnames:
@@ -14532,7 +14825,7 @@ def _read_test_data_run_labeling(workbook_path: Path) -> dict | None:
     except Exception:
         return None
 
-    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
     try:
         if "Config" not in wb.sheetnames:
             return None
@@ -15972,6 +16265,10 @@ def _td_is_recoverable_cache_validation_error(exc: BaseException | str) -> bool:
         "Project cache contains non-ok source rows",
         "Project workbook outputs are incomplete",
         "Project cache has no compiled Test Data sources",
+        "Project cache DB is missing required tables",
+        "Project cache DB is unreadable",
+        "Project cache DB is corrupt",
+        "Project raw cache DB is corrupt",
     )
     return any(marker in message for marker in recoverable_markers)
 
@@ -16737,7 +17034,7 @@ def _td_validate_generated_workbook_outputs(
                 count += 1
         return count
 
-    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
     try:
         if "Data_calc" not in wb.sheetnames:
             problems.append("Project workbook outputs are incomplete: missing sheet Data_calc.")
@@ -17247,7 +17544,7 @@ def _sync_sqlite_excel_mirror(db_path: Path, *, force: bool = False) -> Path | N
                 ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 3
             ws.freeze_panes = "A2"
 
-    wb.save(str(out_path))
+    _td_save_workbook_atomic(wb, out_path)
     if db_path.name.lower() == EIDAT_PROJECT_TD_RAW_CACHE_DB.lower():
         try:
             _sync_td_raw_points_workbook(db_path, force=force)
@@ -17390,7 +17687,7 @@ def _sync_td_raw_points_workbook(db_path: Path, *, force: bool = False) -> Path 
         except Exception:
             pass
 
-    wb.save(str(out_path))
+    _td_save_workbook_atomic(wb, out_path)
     return out_path
 
 
@@ -20229,14 +20526,30 @@ def sync_test_data_project_cache(
 
     state: dict[str, object] = {}
     refresh_reason = ""
+    corrupt_reason = ""
+    if not rebuild:
+        try:
+            state = inspect_test_data_project_cache_state(proj_dir, wb_path)
+        except sqlite3.DatabaseError as exc:
+            # "file is not a database" / malformed schema: the cache files are
+            # derived data, so drop them and rebuild instead of failing the update.
+            corrupt_reason = f"project cache DB is corrupt ({exc})"
+            _td_emit_progress(progress_cb, f"Project cache is unreadable ({exc}); discarding cache files and rebuilding")
+            rebuild = True
     if rebuild:
+        removed_files = _td_purge_project_cache_files(proj_dir)
+        if removed_files:
+            _td_emit_progress(
+                progress_cb,
+                "Discarded project cache files: " + ", ".join(Path(item).name for item in removed_files),
+            )
         _td_emit_progress(progress_cb, "Refreshing raw Test Data cache (forced full rebuild)")
         payload = rebuild_test_data_project_cache(db_path, wb_path, progress_cb=progress_cb)
         payload["mode"] = "full_rebuild"
         payload.setdefault("counts", {})
-        payload["reason"] = "forced full rebuild"
+        payload["reason"] = corrupt_reason or "forced full rebuild"
+        payload["purged_cache_files"] = [str(item) for item in removed_files]
     else:
-        state = inspect_test_data_project_cache_state(proj_dir, wb_path)
         refresh_mode = str(state.get("mode") or "").strip().lower() or "none"
         refresh_reason = str(state.get("reason") or "").strip()
         if refresh_mode == "full":
@@ -23985,7 +24298,7 @@ def td_read_sources_metadata(workbook_path: Path) -> list[dict]:
             "Install it with `py -m pip install openpyxl` within the project environment."
         ) from exc
 
-    wb = load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
+    wb = _td_load_workbook(str(Path(workbook_path).expanduser()), read_only=True, data_only=True)
     try:
         if "Sources" not in wb.sheetnames:
             return []
@@ -40611,7 +40924,7 @@ def generate_test_data_project_performance_sheets(
 
     _td_emit_progress(progress_cb, "Loading workbook for performance sheet generation")
     try:
-        wb = load_workbook(str(wb_path))
+        wb = _td_load_workbook(str(wb_path))
     except PermissionError as exc:
         raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
 
@@ -40624,7 +40937,7 @@ def generate_test_data_project_performance_sheets(
         )
         _td_emit_progress(progress_cb, "Saving workbook with performance sheets")
         t0 = time.perf_counter()
-        wb.save(str(wb_path))
+        _td_save_workbook_atomic(wb, wb_path)
         timings["final_workbook_save_s"] = round(time.perf_counter() - t0, 3)
     finally:
         try:
@@ -40717,14 +41030,28 @@ def update_test_data_trending_project_workbook(
     if require_existing_cache:
         try:
             validate_existing_test_data_project_cache(project_dir, wb_path)
-        except RuntimeError as exc:
-            if not _td_is_recoverable_cache_validation_error(exc):
+        except (RuntimeError, sqlite3.DatabaseError) as exc:
+            if isinstance(exc, sqlite3.DatabaseError) or _td_is_recoverable_cache_validation_error(exc):
+                # Missing / incomplete / stale / corrupt cache is exactly what this
+                # update is about to rebuild - never a reason to stop here.
+                _td_emit_progress(progress_cb, f"Project cache needs a rebuild ({exc}); continuing with Update Project")
+            else:
                 raise
 
     try:
-        wb = load_workbook(str(wb_path))
+        wb = _td_load_workbook(str(wb_path))
     except PermissionError as exc:
         raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
+    except TDWorkbookCorruptError as exc:
+        raise TDWorkbookCorruptError(
+            exc.path,
+            exc.reason,
+            guidance=(
+                "The project workbook cannot be opened, so Update Project cannot continue. "
+                "Run 'Rebuild Project' to regenerate it from project.json (the damaged file is kept as a *.corrupt-*.bak copy), "
+                "or restore it from a backup."
+            ),
+        ) from exc
 
     if "Sources" not in wb.sheetnames:
         raise RuntimeError("Workbook missing required sheet: Sources")
@@ -41021,6 +41348,14 @@ def update_test_data_trending_project_workbook(
     if not dry_run:
         _stage_start("Refreshing support workbook")
         t0 = time.perf_counter()
+        support_quarantine = _td_quarantine_corrupt_support_workbook(wb_path, project_dir=project_dir)
+        if support_quarantine:
+            source_refresh_payload["support_workbook_quarantined"] = str(support_quarantine)
+            _td_emit_progress(
+                progress_cb,
+                f"Support workbook was unreadable and has been moved to {Path(support_quarantine).name}; "
+                "a fresh support workbook will be generated (re-enter any custom run-condition bounds).",
+            )
         _sync_td_support_workbook_program_sheets(
             wb_path,
             global_repo=repo,
@@ -41089,7 +41424,7 @@ def update_test_data_trending_project_workbook(
     if not dry_run:
         _stage_start("Saving workbook before cache validation")
         t0 = time.perf_counter()
-        wb.save(str(wb_path))
+        _td_save_workbook_atomic(wb, wb_path)
         timings["pre_cache_workbook_save_s"] = round(time.perf_counter() - t0, 3)
         _stage_done("Saving workbook before cache validation", t0)
         _stage_start("Ensuring project cache")
@@ -41520,7 +41855,7 @@ def update_test_data_trending_project_workbook(
         if not dry_run:
             _stage_start("Saving updated workbook")
             t0 = time.perf_counter()
-            wb.save(str(wb_path))
+            _td_save_workbook_atomic(wb, wb_path)
             timings["final_workbook_save_s"] = round(time.perf_counter() - t0, 3)
             _stage_done("Saving updated workbook", t0)
     finally:
@@ -41839,6 +42174,142 @@ def update_test_data_trending_project_workbook(
         "implementation_excel": str(implementation_excel_path or "").strip(),
         "debug_json": json.dumps(debug_payload, separators=(",", ":")),
     }
+
+
+def _td_regenerate_project_workbook(
+    global_repo: Path,
+    project_dir: Path,
+    workbook_path: Path,
+    *,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    """
+    Recreate a Test Data Trending project workbook from project.json + the
+    repo index (same path `create_eidat_project` uses). Any existing file at
+    `workbook_path` is quarantined first, never overwritten in place.
+    """
+    repo = Path(global_repo).expanduser()
+    proj_dir = Path(project_dir).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    meta = _read_project_meta(proj_dir)
+    if str(meta.get("type") or "").strip() and str(meta.get("type") or "").strip() != EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING:
+        raise RuntimeError(f"Workbook regeneration is only supported for Test Data Trending projects: {proj_dir}")
+
+    docs = read_eidat_index_documents(repo)
+    selected = {str(v).strip() for v in (meta.get("selected_metadata_rel") or []) if str(v).strip()}
+    chosen_docs = [d for d in docs if isinstance(d, dict) and str(d.get("metadata_rel") or "").strip() in selected]
+    if not chosen_docs:
+        wanted_serials = {str(v).strip() for v in (meta.get("serials") or []) if str(v).strip()}
+        if wanted_serials:
+            chosen_docs = [
+                d
+                for d in docs
+                if isinstance(d, dict)
+                and is_test_data_doc(d)
+                and str(d.get("serial_number") or "").strip() in wanted_serials
+            ]
+    chosen_docs = _td_canonicalize_project_docs(repo, chosen_docs, docs_pool=docs)
+    serials = sorted({str(d.get("serial_number") or "").strip() for d in chosen_docs if str(d.get("serial_number") or "").strip()})
+    if not serials:
+        raise RuntimeError(
+            "Cannot regenerate the project workbook: project.json lists no sources that still exist in the repo index. "
+            f"Re-create the project instead. ({proj_dir / EIDAT_PROJECT_META})"
+        )
+
+    cfg = meta.get("config_snapshot") if isinstance(meta.get("config_snapshot"), dict) else None
+    if not cfg or not (cfg.get("columns") or []):
+        cfg = _load_excel_trend_config(CENTRAL_EXCEL_TREND_CONFIG)
+
+    backup = _td_quarantine_corrupt_file(wb_path, reason="regenerated by Rebuild Project")
+    if backup is not None:
+        _td_emit_progress(progress_cb, f"Previous project workbook kept as {backup.name}")
+    _td_emit_progress(progress_cb, f"Regenerating project workbook from project.json ({len(serials)} serial(s))")
+    _write_test_data_trending_workbook(
+        wb_path,
+        global_repo=repo,
+        serials=serials,
+        docs=chosen_docs,
+        config=cfg,
+    )
+    problem = _xlsx_file_problem(wb_path)
+    if problem:
+        raise RuntimeError(f"Regenerated workbook is not readable ({problem}): {wb_path}")
+    meta["workbook"] = str(wb_path)
+    meta["serials"] = serials
+    meta["serials_count"] = len(serials)
+    if selected:
+        meta["selected_metadata_rel"] = sorted(selected)
+        meta["selected_count"] = len(selected)
+    try:
+        _write_project_meta(proj_dir, meta)
+    except Exception:
+        pass
+    return {"workbook": str(wb_path), "backup": str(backup) if backup else "", "serials": serials}
+
+
+def rebuild_test_data_trending_project(
+    global_repo: Path,
+    workbook_path: Path,
+    *,
+    overwrite: bool = False,
+    regenerate_workbook: bool = False,
+    include_performance_sheets: bool = True,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict:
+    """
+    Rebuild a Test Data Trending project from scratch:
+
+      1. discard every derived cache file (SQLite caches, Excel mirrors, debug json);
+      2. quarantine + regenerate the project workbook when it is unreadable
+         (or always, with `regenerate_workbook=True`) from project.json;
+      3. quarantine an unreadable support workbook so the update recreates it;
+      4. run Update Project with a forced full cache rebuild.
+
+    Nothing user-authored is deleted: damaged files are kept as *.corrupt-*.bak.
+    Returns the Update Project payload with a "rebuild" section added.
+    """
+    repo = Path(global_repo).expanduser()
+    wb_path = Path(workbook_path).expanduser()
+    project_dir = wb_path.parent
+    rebuild_payload: dict[str, object] = {
+        "purged_cache_files": [],
+        "workbook_regenerated": False,
+        "workbook_backup": "",
+        "support_workbook_backup": "",
+    }
+
+    _td_emit_progress(progress_cb, f"Rebuild Project: {project_dir}")
+    removed = _td_purge_project_cache_files(project_dir)
+    rebuild_payload["purged_cache_files"] = [str(item) for item in removed]
+    if removed:
+        _td_emit_progress(progress_cb, "Discarded cache files: " + ", ".join(item.name for item in removed))
+
+    workbook_problem = _xlsx_file_problem(wb_path)
+    if workbook_problem and workbook_problem != "file not found":
+        _td_emit_progress(progress_cb, f"Project workbook is unreadable ({workbook_problem})")
+    if regenerate_workbook or workbook_problem:
+        regen = _td_regenerate_project_workbook(repo, project_dir, wb_path, progress_cb=progress_cb)
+        rebuild_payload["workbook_regenerated"] = True
+        rebuild_payload["workbook_backup"] = str(regen.get("backup") or "")
+
+    support_backup = _td_quarantine_corrupt_support_workbook(wb_path, project_dir=project_dir)
+    if support_backup is not None:
+        rebuild_payload["support_workbook_backup"] = str(support_backup)
+        _td_emit_progress(progress_cb, f"Support workbook was unreadable; kept as {support_backup.name} and will be regenerated")
+
+    payload = update_test_data_trending_project_workbook(
+        repo,
+        wb_path,
+        overwrite=overwrite,
+        require_existing_cache=False,
+        include_performance_sheets=include_performance_sheets,
+        source_refresh_mode="smart",
+        force_project_rebuild=True,
+        progress_cb=progress_cb,
+    )
+    payload = dict(payload or {})
+    payload["rebuild"] = rebuild_payload
+    return payload
 
 
 def eidat_debug_ocr_root(global_repo: Path) -> Path:
@@ -43284,7 +43755,7 @@ def save_test_data_trending_project_editor_changes(
     )
 
     try:
-        wb = load_workbook(str(wb_path))
+        wb = _td_load_workbook(str(wb_path))
     except PermissionError as exc:
         raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
 
@@ -43318,7 +43789,7 @@ def save_test_data_trending_project_editor_changes(
             docs_pool=docs,
         )
         _td_write_sources_sheet_rows(ws_src, src_headers, materialized_rows)
-        wb.save(str(wb_path))
+        _td_save_workbook_atomic(wb, wb_path)
     finally:
         try:
             wb.close()
@@ -43590,7 +44061,7 @@ def sync_project_workbook_metadata(global_repo: Path, workbook_path: Path) -> di
     docs_preferred = [d for d in docs if str(d.get("metadata_rel") or "").strip() in selected] if selected else None
 
     try:
-        wb = load_workbook(str(wb_path))
+        wb = _td_load_workbook(str(wb_path))
     except PermissionError as exc:
         raise RuntimeError(f"Workbook is not writable (close it in Excel first): {wb_path}") from exc
 
@@ -43601,7 +44072,7 @@ def sync_project_workbook_metadata(global_repo: Path, workbook_path: Path) -> di
             docs_all=docs,
             docs_preferred=docs_preferred,
         )
-        wb.save(str(wb_path))
+        _td_save_workbook_atomic(wb, wb_path)
         return {"workbook": str(wb_path), **res}
     finally:
         try:
@@ -48927,7 +49398,7 @@ def _write_test_data_trending_workbook(
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(str(path))
+    _td_save_workbook_atomic(wb, path)
     try:
         wb.close()
     except Exception:

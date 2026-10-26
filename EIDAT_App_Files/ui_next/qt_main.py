@@ -32618,6 +32618,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_edit = QtWidgets.QPushButton("Edit Project")
         self.btn_project_parameter_normalization = QtWidgets.QPushButton("Parameters...")
         self.btn_project_update = QtWidgets.QPushButton("Update Project")
+        self.btn_project_rebuild = QtWidgets.QPushButton("Rebuild Project")
+        self.btn_project_rebuild.setToolTip(
+            "Test Data Trending only: discard the project's cache files, regenerate any unreadable "
+            "workbook, then run a full Update Project. Damaged files are kept as *.corrupt-*.bak."
+        )
         self.btn_project_perf_sheets = QtWidgets.QPushButton("Generate Performance Sheets")
         self.btn_project_debug_excels = QtWidgets.QPushButton("Generate Debug Excel Files")
         self.btn_project_env = QtWidgets.QPushButton("Project Env")
@@ -32629,6 +32634,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_project_edit,
             self.btn_project_parameter_normalization,
             self.btn_project_update,
+            self.btn_project_rebuild,
             self.btn_project_perf_sheets,
             self.btn_project_debug_excels,
             self.btn_project_env,
@@ -32654,6 +32660,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_project_edit.clicked.connect(self._act_edit_project)
         self.btn_project_parameter_normalization.clicked.connect(self._act_project_parameter_normalization)
         self.btn_project_update.clicked.connect(self._act_update_project)
+        self.btn_project_rebuild.clicked.connect(self._act_rebuild_project)
         self.btn_project_perf_sheets.clicked.connect(self._act_generate_project_performance_sheets)
         self.btn_project_debug_excels.clicked.connect(self._act_generate_project_debug_excels)
         self.btn_project_env.clicked.connect(self._act_project_env)
@@ -32666,6 +32673,7 @@ class MainWindow(QtWidgets.QMainWindow):
         actions.addWidget(self.btn_project_edit)
         actions.addWidget(self.btn_project_parameter_normalization)
         actions.addWidget(self.btn_project_update)
+        actions.addWidget(self.btn_project_rebuild)
         actions.addWidget(self.btn_project_perf_sheets)
         actions.addWidget(self.btn_project_debug_excels)
         actions.addWidget(self.btn_project_env)
@@ -33350,6 +33358,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.btn_project_parameter_normalization.setEnabled(bool(record) and is_td and not project_busy)
         if hasattr(self, "btn_project_update"):
             self.btn_project_update.setEnabled(bool(record) and is_update_supported and not project_busy)
+        if hasattr(self, "btn_project_rebuild"):
+            self.btn_project_rebuild.setEnabled(bool(record) and is_td and not project_busy)
         if hasattr(self, "btn_project_perf_sheets"):
             self.btn_project_perf_sheets.setEnabled(bool(record) and is_td and not project_busy)
         if hasattr(self, "btn_project_debug_excels"):
@@ -33431,10 +33441,103 @@ class MainWindow(QtWidgets.QMainWindow):
             self._append_log(f"[PROJECT TASK ERROR] {heading}: {msg}")
         except Exception:
             pass
-        QtWidgets.QMessageBox.warning(self, heading, msg)
         if self._project_popup_active:
             self._repo_scan_dialog.finish(f"{heading} failed: {msg}", success=False)
             self._project_popup_active = False
+        if heading in ("Update Project", "Rebuild Project") and self._offer_project_rebuild_for_error(heading, msg):
+            return
+        QtWidgets.QMessageBox.warning(self, heading, msg)
+
+    @staticmethod
+    def _project_error_wants_rebuild(message: str) -> str:
+        """
+        Classify a failed project task message. Returns "workbook" when the
+        project/support workbook is unreadable, "cache" when the cache DBs are
+        missing/incomplete/corrupt, else "".
+        """
+        text = str(message or "")
+        folded = text.casefold()
+        workbook_markers = (
+            "not a valid .xlsx",
+            "project workbook not found",
+            "file is not a zip file",
+            "bad zip",
+            "badzipfile",
+            "zip central directory",
+            "workbook save produced an invalid file",
+            "missing workbook part",
+        )
+        if any(marker in folded for marker in workbook_markers):
+            return "workbook"
+        cache_markers = (
+            "file is not a database",
+            "database disk image is malformed",
+            "cache db is corrupt",
+            "cache db is unreadable",
+            "cache db is incomplete",
+            "cache db not found",
+            "cache db is missing required tables",
+            "raw cache db is incomplete",
+            "raw cache db not found",
+            "parameter runtime cache is incomplete",
+            "did not produce a trend/analyze-ready",
+            "has no compiled test data sources",
+        )
+        if any(marker in folded for marker in cache_markers):
+            return "cache"
+        return ""
+
+    def _offer_project_rebuild_for_error(self, heading: str, message: str) -> bool:
+        """
+        For Update/Rebuild failures caused by damaged project files, replace the
+        bare warning with an explanation and a one-click Rebuild Project.
+        Returns True when the error was handled here.
+        """
+        kind = MainWindow._project_error_wants_rebuild(message)
+        if not kind:
+            return False
+        record = dict(getattr(self, "_last_project_task_record", None) or {})
+        if not record:
+            return False
+        ptype = str(record.get("type") or "").strip()
+        if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            return False
+        already_rebuild = heading == "Rebuild Project"
+        if kind == "workbook":
+            explanation = (
+                "A workbook this project depends on is not a readable .xlsx file (usually a save that was "
+                "interrupted, or a file still being written by Excel/OneDrive).\n\n"
+                "Rebuild Project keeps the damaged file as a *.corrupt-*.bak copy, regenerates the workbook "
+                "from project.json, discards the cache files and runs a full update."
+            )
+        else:
+            explanation = (
+                "The project's cache database is missing, incomplete or unreadable.\n\n"
+                "Rebuild Project discards the cache files and rebuilds everything from the TD source extractions.\n\n"
+                "If the details below list excluded/invalid sources, the extractions themselves are the problem: "
+                "fix those first (Admin Dashboard: TD Serials / Force Files) - a rebuild re-reads the same sources."
+            )
+        if already_rebuild:
+            explanation += "\n\nThe rebuild itself failed - the details below name the file to fix by hand."
+        prompt = QtWidgets.QMessageBox(self)
+        prompt.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        prompt.setWindowTitle(heading)
+        prompt.setText(f"{heading} failed." if already_rebuild else "Update Project could not finish - the project needs a rebuild.")
+        prompt.setInformativeText(explanation)
+        prompt.setDetailedText(str(message or ""))
+        rebuild_button = None
+        if not already_rebuild:
+            rebuild_button = prompt.addButton("Rebuild Project", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        close_button = prompt.addButton(QtWidgets.QMessageBox.StandardButton.Close)
+        prompt.setDefaultButton(cast(QtWidgets.QPushButton, rebuild_button or close_button))
+        prompt.setEscapeButton(cast(QtWidgets.QPushButton, close_button))
+        prompt.exec()
+        if rebuild_button is not None and prompt.clickedButton() is rebuild_button:
+            try:
+                self._run_project_rebuild(record, regenerate_workbook=(kind == "workbook"))
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Rebuild Project", str(exc))
+        return True
 
     def _handle_project_update_success(self, payload: object, *, wb_path: Path, ptype: str, started: float) -> str:
         if not isinstance(payload, dict):
@@ -33950,6 +34053,27 @@ class MainWindow(QtWidgets.QMainWindow):
         record_dict = dict(record or {}) if isinstance(record, Mapping) else {}
         project_dir = Path(str(record_dict.get("folder") or "")).expanduser()
         workbook = Path(str(record_dict.get("workbook") or "")).expanduser()
+        # Fast readiness check first: an unbuilt / incomplete / corrupt cache (or an
+        # unreadable workbook) gets an Update/Rebuild offer instead of an error
+        # popup inside the viewer.
+        try:
+            be.validate_test_data_project_cache_for_open(project_dir, workbook)
+            if hasattr(be, "_xlsx_file_problem"):
+                wb_problem = str(be._xlsx_file_problem(workbook) or "")
+                if wb_problem:
+                    raise RuntimeError(f"Workbook is not a valid .xlsx file ({wb_problem}): {workbook}")
+        except Exception as exc:
+            offer = getattr(self, "_offer_project_cache_build", None)
+            if callable(offer) and offer(
+                record_dict,
+                heading="Trend / Analyze Data",
+                message=str(exc),
+                retry=lambda _record=record_dict, _post_open=post_open: MainWindow._open_test_data_trend_dialog_with_preopen_gate(
+                    self, _record, post_open=_post_open
+                ),
+            ):
+                return
+            raise
         decision = be.inspect_test_data_trend_open_status(project_dir, workbook)
         if not bool(decision.get("snapshot_exists")):
             try:
@@ -34059,6 +34183,7 @@ class MainWindow(QtWidgets.QMainWindow):
         is_td = ptype == getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending")
         force_full = bool(force_project_rebuild and is_td)
         project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
+        self._last_project_task_record = dict(record)
         started = time.perf_counter()
         self._append_log(f"[PROJECT UPDATE] Starting: {project_name}")
         self._append_log(f"[PROJECT UPDATE] Workbook: {wb_path}")
@@ -34102,6 +34227,149 @@ class MainWindow(QtWidgets.QMainWindow):
             task_factory=_task,
             on_success=_on_success,
         )
+
+    def _run_project_rebuild(self, record: dict, *, regenerate_workbook: bool = False, on_success_extra=None) -> None:
+        repo_raw = (self.ed_global_repo.text() or "").strip()
+        if not repo_raw:
+            raise RuntimeError("Select a Global Repo first (Setup tab).")
+        repo = Path(repo_raw).expanduser()
+        if not record:
+            raise RuntimeError("Select a project in the list first.")
+        ptype = str(record.get("type") or "").strip()
+        if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            raise RuntimeError("Rebuild Project is available only for Test Data Trending projects.")
+        wb_path = Path(str(record.get("workbook") or "")).expanduser()
+        folder_text = str(record.get("folder") or "").strip()
+        project_dir = Path(folder_text).expanduser() if folder_text else wb_path.parent
+        if not str(record.get("workbook") or "").strip() or not wb_path.exists():
+            # Workbook missing/renamed: let the backend resolve it from project.json
+            # (Rebuild can regenerate a missing workbook, Update cannot).
+            resolved = be._td_project_workbook_path(project_dir) if hasattr(be, "_td_project_workbook_path") else None
+            if resolved is not None:
+                wb_path = Path(resolved)
+            elif not str(record.get("workbook") or "").strip():
+                wb_path = project_dir / f"{str(record.get('name') or project_dir.name).strip()}.xlsx"
+        overwrite = bool(getattr(self, "cb_project_overwrite", None) and self.cb_project_overwrite.isChecked())
+        project_name = str(record.get("name") or wb_path.stem or "").strip() or wb_path.stem
+        self._last_project_task_record = dict(record)
+        started = time.perf_counter()
+        self._append_log(f"[PROJECT REBUILD] Starting: {project_name}")
+        self._append_log(f"[PROJECT REBUILD] Workbook: {wb_path}")
+        if regenerate_workbook:
+            self._append_log("[PROJECT REBUILD] Workbook will be regenerated from project.json")
+
+        def _task(report):
+            return be.rebuild_test_data_trending_project(
+                repo,
+                wb_path,
+                overwrite=overwrite,
+                regenerate_workbook=bool(regenerate_workbook),
+                include_performance_sheets=True,
+                progress_cb=report,
+            )
+
+        def _on_success(payload):
+            msg = self._handle_project_update_success(payload, wb_path=wb_path, ptype=ptype, started=started)
+            rebuild_info = payload.get("rebuild") if isinstance(payload, dict) else None
+            if isinstance(rebuild_info, dict):
+                notes: list[str] = []
+                if rebuild_info.get("workbook_regenerated"):
+                    notes.append("project workbook regenerated from project.json")
+                if rebuild_info.get("workbook_backup"):
+                    notes.append(f"previous workbook kept as {Path(str(rebuild_info['workbook_backup'])).name}")
+                if rebuild_info.get("support_workbook_backup"):
+                    notes.append(
+                        f"support workbook regenerated (old copy: {Path(str(rebuild_info['support_workbook_backup'])).name})"
+                    )
+                purged = list(rebuild_info.get("purged_cache_files") or [])
+                if purged:
+                    notes.append(f"{len(purged)} cache file(s) discarded")
+                if notes:
+                    self._append_log("[PROJECT REBUILD] " + "; ".join(notes))
+                    msg = f"{msg} Rebuild: {'; '.join(notes)}."
+            try:
+                self._refresh_projects()
+                self._select_project_by_dir(project_dir)
+            except Exception:
+                pass
+            if callable(on_success_extra):
+                try:
+                    on_success_extra(payload)
+                except Exception as exc:
+                    self._append_log(f"[PROJECT REBUILD] Post-rebuild refresh failed: {exc}")
+                    QtWidgets.QMessageBox.warning(self, "Rebuild Project", f"Project rebuilt, but refresh failed:\n{exc}")
+            return msg
+
+        self._start_project_task(
+            heading="Rebuild Project",
+            status_text=f"Rebuilding {project_name}",
+            project_dir=project_dir,
+            log_prefix="project_rebuild",
+            task_factory=_task,
+            on_success=_on_success,
+        )
+
+    def _act_rebuild_project(self) -> None:
+        try:
+            record = self._selected_project_record()
+            if not record:
+                raise RuntimeError("Select a project in the list first.")
+            ptype = str(record.get("type") or "").strip()
+            if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+                raise RuntimeError("Rebuild Project is available only for Test Data Trending projects.")
+            project_dir = Path(str(record.get("folder") or "")).expanduser()
+            workbook = Path(str(record.get("workbook") or "")).expanduser()
+            health: dict = {}
+            try:
+                health = dict(be.inspect_test_data_project_files(project_dir, workbook) or {})
+            except Exception:
+                health = {}
+            findings: list[str] = []
+            for label, key in (
+                ("Project workbook", "workbook_problem"),
+                ("Support workbook", "support_workbook_problem"),
+                ("Cache DB", "cache_db_problem"),
+                ("Raw cache DB", "raw_cache_db_problem"),
+            ):
+                problem = str(health.get(key) or "").strip()
+                if problem and problem != "file not found":
+                    findings.append(f"{label}: {problem}")
+                elif problem == "file not found" and key == "workbook_problem":
+                    findings.append(f"{label}: missing")
+            workbook_bad = bool(health.get("workbook_corrupt") or health.get("workbook_missing"))
+
+            prompt = QtWidgets.QMessageBox(self)
+            prompt.setIcon(QtWidgets.QMessageBox.Icon.Question)
+            prompt.setWindowTitle("Rebuild Project")
+            prompt.setText(f"Rebuild '{record.get('name') or workbook.stem}' from scratch?")
+            lines = [
+                "This will:",
+                "  - discard the project's cache files (SQLite caches, Excel mirrors, debug json)",
+                "  - regenerate the project workbook from project.json if it is unreadable",
+                "  - regenerate the support workbook if it is unreadable",
+                "  - run a full Update Project (re-reads every TD source extraction)",
+                "",
+                "Damaged files are kept next to the project as *.corrupt-*.bak. Saved equations are not touched.",
+            ]
+            if findings:
+                lines += ["", "Problems detected now:"] + [f"  - {item}" for item in findings]
+            else:
+                lines += ["", "No file problems detected; this is a clean full rebuild."]
+            prompt.setInformativeText("\n".join(lines))
+            cb_regen = QtWidgets.QCheckBox("Also regenerate the project workbook (resets the Config/Sources sheets)")
+            cb_regen.setChecked(workbook_bad)
+            cb_regen.setEnabled(not workbook_bad)
+            prompt.setCheckBox(cb_regen)
+            rebuild_button = prompt.addButton("Rebuild", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+            cancel_button = prompt.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+            prompt.setDefaultButton(cast(QtWidgets.QPushButton, rebuild_button))
+            prompt.setEscapeButton(cast(QtWidgets.QPushButton, cancel_button))
+            prompt.exec()
+            if prompt.clickedButton() is not rebuild_button:
+                return
+            self._run_project_rebuild(record, regenerate_workbook=bool(cb_regen.isChecked() or workbook_bad))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Rebuild Project", str(exc))
 
     def _act_edit_project(self) -> None:
         try:
@@ -34163,9 +34431,79 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
         except Exception as exc:
             message = str(exc)
+            record_for_retry = None
+            try:
+                record_for_retry = self._selected_project_record()
+            except Exception:
+                record_for_retry = None
+            if record_for_retry and self._offer_project_cache_build(
+                record_for_retry,
+                heading="Project Parameters",
+                message=message,
+                retry=self._act_project_parameter_normalization,
+            ):
+                return
             if "Trend / Analyze" in message or "cache" in message.casefold():
                 message = f"{message}\n\nRun Update Project first if this Test Data project has not been built yet."
             QtWidgets.QMessageBox.warning(self, "Project Parameters", message)
+
+    def _offer_project_cache_build(self, record: Mapping[str, object], *, heading: str, message: str, retry=None) -> bool:
+        """
+        When a Test Data feature cannot open because the project cache is not
+        built / incomplete / corrupt (or a workbook is unreadable), offer to run
+        Update Project or Rebuild Project right away and re-run `retry` after
+        success. Returns True when the prompt was shown (error handled).
+        """
+        kind = MainWindow._project_error_wants_rebuild(message)
+        if not kind:
+            return False
+        record_dict = dict(record or {})
+        ptype = str(record_dict.get("type") or "").strip()
+        if ptype != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+            return False
+        if self._project_worker is not None and self._project_worker.isRunning():
+            QtWidgets.QMessageBox.information(
+                self, heading, "A project task is already running. Try again when it finishes.\n\n" + message
+            )
+            return True
+        prompt = QtWidgets.QMessageBox(self)
+        prompt.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        prompt.setWindowTitle(heading)
+        if kind == "workbook":
+            prompt.setText("A project workbook is not readable, so this cannot open yet.")
+            prompt.setInformativeText(
+                "Rebuild Project keeps the damaged file as a *.corrupt-*.bak copy, regenerates it from project.json "
+                "and rebuilds the cache. This window reopens automatically when it finishes."
+            )
+        else:
+            prompt.setText("The project cache has not been built (or is incomplete), so this cannot open yet.")
+            prompt.setInformativeText(
+                "Update Project builds the cache from the TD source extractions. Use Rebuild Project instead if "
+                "Update Project keeps failing. This window reopens automatically when it finishes."
+            )
+        prompt.setDetailedText(str(message or ""))
+        update_button = None
+        if kind != "workbook":
+            update_button = prompt.addButton("Update Project", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        rebuild_button = prompt.addButton("Rebuild Project", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        cancel_button = prompt.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        prompt.setDefaultButton(cast(QtWidgets.QPushButton, update_button or rebuild_button))
+        prompt.setEscapeButton(cast(QtWidgets.QPushButton, cancel_button))
+        prompt.exec()
+        clicked = prompt.clickedButton()
+
+        def _after(_payload) -> None:
+            if callable(retry):
+                QtCore.QTimer.singleShot(0, retry)
+
+        try:
+            if update_button is not None and clicked is update_button:
+                self._run_project_update(record_dict, force_project_rebuild=False, on_success_extra=_after)
+            elif clicked is rebuild_button:
+                self._run_project_rebuild(record_dict, regenerate_workbook=(kind == "workbook"), on_success_extra=_after)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, heading, str(exc))
+        return True
 
     def _act_update_project(self) -> None:
         try:

@@ -492,8 +492,18 @@ def run_update_projects(
     overwrite: bool = False,
     force_project_rebuild: bool = False,
     repair_serials: bool = False,
+    rebuild: bool = False,
+    auto_rebuild_on_failure: bool = True,
     on_log: Callable[[str], None] | None = None,
 ) -> PipelineResult:
+    """
+    Update (or, with `rebuild=True`, rebuild from scratch) the selected projects.
+
+    With `auto_rebuild_on_failure` (default on), a Test Data Trending update that
+    fails because a workbook is unreadable ("not a zip file") or the cache DB is
+    missing/incomplete/corrupt is retried once as a full Rebuild Project instead
+    of being reported as a failure.
+    """
     node = _as_abs(node_root)
     runtime = _as_abs(runtime_root)
     selected = [dict(item or {}) for item in (projects or []) if isinstance(item, dict)]
@@ -515,8 +525,37 @@ def run_update_projects(
             on_log(
                 "[ACTION] update_projects "
                 f"selected={len(selected)} overwrite={bool(overwrite)} force_rebuild={bool(force_project_rebuild)} "
-                f"repair_serials={bool(repair_serials)}"
+                f"repair_serials={bool(repair_serials)} rebuild={bool(rebuild)} auto_rebuild_on_failure={bool(auto_rebuild_on_failure)}"
             )
+
+        def _error_wants_rebuild(message: object) -> str:
+            text = str(message or "").casefold()
+            workbook_markers = (
+                "not a valid .xlsx",
+                "file is not a zip file",
+                "bad zip",
+                "badzipfile",
+                "zip central directory",
+                "missing workbook part",
+                "workbook save produced an invalid file",
+            )
+            if any(marker in text for marker in workbook_markers):
+                return "workbook"
+            # Only structurally broken caches are auto-rebuilt. "incomplete" /
+            # "did not produce a Trend/Analyze-ready project" after a full update
+            # means the TD sources themselves failed - a rebuild would just repeat
+            # the same (long) run, so that is reported as a failure with details.
+            cache_markers = (
+                "file is not a database",
+                "database disk image is malformed",
+                "cache db is corrupt",
+                "cache db is unreadable",
+                "cache db is missing required tables",
+                "raw cache db is corrupt",
+            )
+            if any(marker in text for marker in cache_markers):
+                return "cache"
+            return ""
 
         results: list[dict[str, object]] = []
         succeeded = 0
@@ -616,23 +655,95 @@ def run_update_projects(
 
                 serial_health: dict[str, object] = {}
                 is_td_project = raw_type.strip().casefold() == "test data trending"
-                if is_td_project:
+                rebuild_this = bool(rebuild and is_td_project)
+                if is_td_project and not rebuild_this:
+                    # File-level health first: a missing/corrupt workbook or cache
+                    # DB cannot be fixed by a serial repair - go straight to rebuild.
+                    try:
+                        file_health = dict(node_backend.inspect_project_files(node, project_dir=wb.parent) or {})
+                    except Exception:
+                        file_health = {}
+                    file_problems = [
+                        f"{label}: {file_health.get(key)}"
+                        for label, key in (
+                            ("workbook", "workbook_problem"),
+                            ("support workbook", "support_workbook_problem"),
+                            ("cache DB", "cache_db_problem"),
+                            ("raw cache DB", "raw_cache_db_problem"),
+                        )
+                        if str(file_health.get(key) or "").strip()
+                        and not (str(file_health.get(key) or "") == "file not found" and key != "workbook_problem")
+                    ]
+                    if file_problems and on_log is not None:
+                        on_log(f"[HEALTH] {name}: file problems: " + "; ".join(file_problems))
+                    if file_problems and auto_rebuild_on_failure:
+                        rebuild_this = True
+                        if on_log is not None:
+                            on_log(f"[HEALTH] {name}: switching to Rebuild Project because of file problems")
+                if is_td_project and not rebuild_this:
                     issues = _serial_health_check(name, wb.parent)
                     serial_health["issues_before"] = issues
                     if issues and repair_serials:
                         serial_health["repair"] = _serial_repair(name, wb.parent, issues)
 
-                payload = dict(
-                    node_backend.update_project(
-                        node,
-                        workbook_path=wb,
-                        project_type=raw_type,
-                        overwrite=bool(overwrite),
-                        force_project_rebuild=bool(force_project_rebuild),
-                        progress_cb=_progress,
+                rebuilt = False
+                if rebuild_this:
+                    if on_log is not None:
+                        on_log(f"[REBUILD] {name}: rebuilding project from scratch")
+                    payload = dict(
+                        node_backend.rebuild_project(
+                            node,
+                            workbook_path=wb,
+                            project_type=raw_type,
+                            overwrite=bool(overwrite),
+                            progress_cb=_progress,
+                        )
+                        or {}
                     )
-                    or {}
-                )
+                    rebuilt = True
+                else:
+                    try:
+                        payload = dict(
+                            node_backend.update_project(
+                                node,
+                                workbook_path=wb,
+                                project_type=raw_type,
+                                overwrite=bool(overwrite),
+                                force_project_rebuild=bool(force_project_rebuild),
+                                progress_cb=_progress,
+                            )
+                            or {}
+                        )
+                    except Exception as update_exc:
+                        kind = _error_wants_rebuild(update_exc) if (is_td_project and auto_rebuild_on_failure) else ""
+                        if not kind:
+                            raise
+                        if on_log is not None:
+                            on_log(f"[PROJECT RETRY] name={name}: update failed ({kind} problem): {update_exc}")
+                            on_log(f"[REBUILD] {name}: retrying as Rebuild Project")
+                        payload = dict(
+                            node_backend.rebuild_project(
+                                node,
+                                workbook_path=wb,
+                                project_type=raw_type,
+                                overwrite=bool(overwrite),
+                                regenerate_workbook=(kind == "workbook"),
+                                progress_cb=_progress,
+                            )
+                            or {}
+                        )
+                        payload["update_error_before_rebuild"] = str(update_exc)
+                        rebuilt = True
+                if rebuilt:
+                    rebuild_info = payload.get("rebuild") if isinstance(payload.get("rebuild"), dict) else {}
+                    serial_health["rebuild"] = dict(rebuild_info)
+                    if on_log is not None and rebuild_info:
+                        purged = list(rebuild_info.get("purged_cache_files") or [])
+                        on_log(
+                            f"[REBUILD] {name}: cache_files_discarded={len(purged)} "
+                            f"workbook_regenerated={bool(rebuild_info.get('workbook_regenerated'))} "
+                            f"support_regenerated={bool(rebuild_info.get('support_workbook_backup'))}"
+                        )
                 if is_td_project and serial_health.get("issues_before"):
                     remaining = _serial_health_check(f"{name} (after update)", wb.parent)
                     serial_health["issues_after"] = remaining
@@ -648,6 +759,7 @@ def run_update_projects(
                         "type": raw_type,
                         "workbook": str(wb),
                         "ok": True,
+                        "rebuilt": bool(rebuilt),
                         "payload": payload,
                         "serial_health": serial_health,
                     }
@@ -655,7 +767,7 @@ def run_update_projects(
                 succeeded += 1
                 if on_log is not None:
                     updated_cells = int(payload.get("updated_cells", 0) or 0)
-                    on_log(f"[PROJECT OK] name={name} updated_cells={updated_cells}")
+                    on_log(f"[PROJECT OK] name={name} updated_cells={updated_cells}" + (" (rebuilt)" if rebuilt else ""))
             except Exception as exc:
                 failed += 1
                 results.append(
@@ -689,6 +801,9 @@ def run_update_projects(
             "overwrite": bool(overwrite),
             "force_project_rebuild": bool(force_project_rebuild),
             "repair_serials": bool(repair_serials),
+            "rebuild": bool(rebuild),
+            "auto_rebuild_on_failure": bool(auto_rebuild_on_failure),
+            "rebuilt_count": sum(1 for item in results if bool(item.get("rebuilt"))),
             "projects": results,
             "projects_sample": sample,
         }
@@ -697,7 +812,8 @@ def run_update_projects(
         if on_log is not None:
             on_log(
                 "[SUMMARY] update_projects "
-                f"selected={len(selected)} succeeded={succeeded} failed={failed}"
+                f"selected={len(selected)} succeeded={succeeded} failed={failed} "
+                f"rebuilt={sum(1 for item in results if bool(item.get('rebuilt')))}"
             )
 
         if failed:

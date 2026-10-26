@@ -199,6 +199,62 @@ def update_project(
     raise RuntimeError(f"Unsupported project type: {project_type}")
 
 
+def rebuild_project(
+    node_root: str | Path | None,
+    *,
+    workbook_path: str | Path,
+    project_type: str,
+    overwrite: bool = False,
+    regenerate_workbook: bool = False,
+    progress_cb: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Rebuild a node's Test Data Trending project from scratch: discard cache
+    files, regenerate unreadable workbooks, then run a forced full update.
+    Other project types fall back to a plain update.
+    """
+    be = _be(node_root)
+    repo = global_repo(node_root)
+    project_dir = _resolve_node_project_dir(repo, Path(workbook_path).expanduser().parent)
+    try:
+        wb = _resolve_node_project_workbook(repo, workbook_path, project_dir=project_dir)
+    except Exception:
+        # A missing workbook is one of the things Rebuild repairs.
+        resolved = be._td_project_workbook_path(project_dir) if hasattr(be, "_td_project_workbook_path") else None
+        wb = Path(resolved) if resolved is not None else project_dir / Path(str(workbook_path)).name
+    if project_type != getattr(be, "EIDAT_PROJECT_TYPE_TEST_DATA_TRENDING", "Test Data Trending"):
+        return update_project(
+            node_root,
+            workbook_path=wb,
+            project_type=project_type,
+            overwrite=overwrite,
+            progress_cb=progress_cb,
+        )
+    _rewrite_project_meta_for_node(project_dir, node_root=repo, workbook_path=wb)
+    return dict(
+        be.rebuild_test_data_trending_project(
+            repo,
+            wb,
+            overwrite=overwrite,
+            regenerate_workbook=bool(regenerate_workbook),
+            include_performance_sheets=True,
+            progress_cb=progress_cb,
+        )
+        or {}
+    )
+
+
+def inspect_project_files(node_root: str | Path | None, *, project_dir: str | Path) -> dict[str, Any]:
+    """File-level health of a node's Test Data Trending project (never raises)."""
+    be = _be(node_root)
+    repo = global_repo(node_root)
+    proj_dir = _resolve_node_project_dir(repo, project_dir)
+    try:
+        return dict(be.inspect_test_data_project_files(proj_dir) or {})
+    except Exception as exc:
+        return {"project_dir": str(proj_dir), "error": str(exc)}
+
+
 def delete_project(node_root: str | Path | None, *, project_dir: str | Path) -> dict[str, Any]:
     be = _be(node_root)
     repo = global_repo(node_root)

@@ -128,10 +128,12 @@ class _Worker(QtCore.QThread):
                 overwrite = bool(options.get("overwrite"))
                 force_project_rebuild = bool(options.get("force_project_rebuild"))
                 repair_serials = bool(options.get("repair_serials"))
+                rebuild = bool(options.get("rebuild"))
+                auto_rebuild_on_failure = bool(options.get("auto_rebuild_on_failure", True))
                 _emit(
                     "[ACTION] update projects via backend processor "
                     f"(selected={len(projects)} overwrite={overwrite} force_rebuild={force_project_rebuild} "
-                    f"repair_serials={repair_serials})"
+                    f"repair_serials={repair_serials} rebuild={rebuild} auto_rebuild_on_failure={auto_rebuild_on_failure})"
                 )
                 res = run_update_projects(
                     node_root=node_root,
@@ -140,6 +142,8 @@ class _Worker(QtCore.QThread):
                     overwrite=overwrite,
                     force_project_rebuild=force_project_rebuild,
                     repair_serials=repair_serials,
+                    rebuild=rebuild,
+                    auto_rebuild_on_failure=auto_rebuild_on_failure,
                     on_log=_emit,
                 )
             else:
@@ -162,9 +166,13 @@ class _Worker(QtCore.QThread):
                         selected = int((summary or {}).get("selected_count", 0))
                         succeeded = int((summary or {}).get("succeeded_count", 0))
                         failed = int((summary or {}).get("failed_count", 0))
+                        rebuilt = int((summary or {}).get("rebuilt_count", 0))
                     except Exception:
-                        selected = succeeded = failed = 0
-                    _emit(f"[OK] update_projects selected={selected} succeeded={succeeded} failed={failed}")
+                        selected = succeeded = failed = rebuilt = 0
+                    _emit(
+                        f"[OK] update_projects selected={selected} succeeded={succeeded} failed={failed}"
+                        + (f" rebuilt={rebuilt}" if rebuilt else "")
+                    )
                 elif action == "force_single_file":
                     proc = res.outputs.get("process") or {}
                     sources = res.outputs.get("source_files") or []
@@ -277,7 +285,10 @@ class _ProjectUpdatePickerDialog(QtWidgets.QDialog):
 
         hint = QtWidgets.QLabel(
             "Run project updates from the backend processor path. "
-            "Force full rebuild applies only to Test Data Trending projects."
+            "Force full rebuild / Rebuild from scratch apply only to Test Data Trending projects. "
+            "Rebuild from scratch discards the project cache files, regenerates unreadable workbooks "
+            "(damaged files are kept as *.corrupt-*.bak) and runs a full update; it is also applied "
+            "automatically when an update fails on an unreadable workbook or an incomplete/corrupt cache DB."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size: 12px; color: #475569;")
@@ -301,6 +312,18 @@ class _ProjectUpdatePickerDialog(QtWidgets.QDialog):
         self.cb_overwrite = QtWidgets.QCheckBox("Overwrite existing cells")
         self.cb_force_rebuild = QtWidgets.QCheckBox("Force full rebuild")
         self.cb_force_rebuild.setToolTip("Applies only to Test Data Trending projects.")
+        self.cb_rebuild = QtWidgets.QCheckBox("Rebuild from scratch")
+        self.cb_rebuild.setToolTip(
+            "Test Data Trending projects only: discard cache DBs/mirrors, regenerate any unreadable "
+            "project/support workbook, then run a full update. Use when Update Project keeps failing "
+            "with 'file is not a zip file' or 'cache DB is incomplete'."
+        )
+        self.cb_auto_rebuild = QtWidgets.QCheckBox("Auto-rebuild on file/cache errors")
+        self.cb_auto_rebuild.setChecked(True)
+        self.cb_auto_rebuild.setToolTip(
+            "If an update fails because a workbook is unreadable or the cache DB is missing/incomplete/corrupt, "
+            "retry that project once as a full rebuild instead of reporting a failure."
+        )
         self.cb_repair_serials = QtWidgets.QCheckBox("Detect && repair broken serials")
         self.cb_repair_serials.setChecked(True)
         self.cb_repair_serials.setToolTip(
@@ -311,6 +334,8 @@ class _ProjectUpdatePickerDialog(QtWidgets.QDialog):
         )
         opts.addWidget(self.cb_overwrite)
         opts.addWidget(self.cb_force_rebuild)
+        opts.addWidget(self.cb_rebuild)
+        opts.addWidget(self.cb_auto_rebuild)
         opts.addWidget(self.cb_repair_serials)
         opts.addStretch(1)
         layout.addLayout(opts)
@@ -1127,7 +1152,9 @@ class AdminWindow(QtWidgets.QMainWindow):
         self._run_status.begin(f"Update Processor Envs/Runtime: {Path(n.node_root).name}")
         self.worker.start()
 
-    def _choose_projects_for_update(self, node_root: str | Path) -> tuple[list[dict[str, object]], bool, bool, bool] | None:
+    def _choose_projects_for_update(
+        self, node_root: str | Path
+    ) -> tuple[list[dict[str, object]], bool, bool, bool, bool, bool] | None:
         from . import node_backend
 
         projects = list(node_backend.list_projects(node_root) or [])
@@ -1140,6 +1167,8 @@ class AdminWindow(QtWidgets.QMainWindow):
                 bool(dlg.cb_overwrite.isChecked()),
                 bool(dlg.cb_force_rebuild.isChecked()),
                 bool(dlg.cb_repair_serials.isChecked()),
+                bool(dlg.cb_rebuild.isChecked()),
+                bool(dlg.cb_auto_rebuild.isChecked()),
             )
         finally:
             dlg.deleteLater()
@@ -1156,10 +1185,25 @@ class AdminWindow(QtWidgets.QMainWindow):
             picked = self._choose_projects_for_update(n.node_root)
             if not picked:
                 return
-            projects, overwrite, force_project_rebuild, repair_serials = picked
+            projects, overwrite, force_project_rebuild, repair_serials, rebuild, auto_rebuild = picked
             if not projects:
                 QtWidgets.QMessageBox.information(self, "Update Projects", "Select at least one project to update.")
                 return
+            if rebuild:
+                td_count = sum(
+                    1 for item in projects if str(item.get("type") or "").strip().casefold() == "test data trending"
+                )
+                confirm = QtWidgets.QMessageBox.question(
+                    self,
+                    "Rebuild Projects",
+                    f"Rebuild {td_count} Test Data Trending project(s) from scratch?\n\n"
+                    "Cache files are discarded and rebuilt from the TD source extractions; unreadable "
+                    "workbooks are regenerated from project.json (damaged files are kept as *.corrupt-*.bak).",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No,
+                )
+                if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
             self._ensure_node_env_file(n.node_root)
             self.worker.set_tasks(
                 [
@@ -1174,11 +1218,15 @@ class AdminWindow(QtWidgets.QMainWindow):
                             "overwrite": bool(overwrite),
                             "force_project_rebuild": bool(force_project_rebuild),
                             "repair_serials": bool(repair_serials),
+                            "rebuild": bool(rebuild),
+                            "auto_rebuild_on_failure": bool(auto_rebuild),
                         },
                     )
                 ]
             )
-            self._run_status.begin(f"Update Projects: {Path(n.node_root).name} ({len(projects)} selected)")
+            self._run_status.begin(
+                f"{'Rebuild' if rebuild else 'Update'} Projects: {Path(n.node_root).name} ({len(projects)} selected)"
+            )
             self.worker.start()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Update Projects", str(exc))

@@ -70,7 +70,14 @@ class TestAdminGuiUpdateProjects(unittest.TestCase):
                 with patch.object(
                     window,
                     "_choose_projects_for_update",
-                    return_value=([{"name": "Proj 1", "type": "EIDP Trending", "workbook": str(node_root / "projects" / "p1.xlsx")}], True, True),
+                    return_value=(
+                        [{"name": "Proj 1", "type": "EIDP Trending", "workbook": str(node_root / "projects" / "p1.xlsx")}],
+                        True,
+                        True,
+                        True,
+                        False,
+                        True,
+                    ),
                 ), patch.object(window.worker, "set_tasks", side_effect=lambda tasks: captured.extend(tasks)), patch.object(
                     window.worker,
                     "start",
@@ -84,6 +91,9 @@ class TestAdminGuiUpdateProjects(unittest.TestCase):
                 self.assertEqual(task[4], "update_projects")
                 self.assertTrue(bool(task[5]["overwrite"]))
                 self.assertTrue(bool(task[5]["force_project_rebuild"]))
+                self.assertTrue(bool(task[5]["repair_serials"]))
+                self.assertFalse(bool(task[5]["rebuild"]))
+                self.assertTrue(bool(task[5]["auto_rebuild_on_failure"]))
                 self.assertEqual(len(list(task[5]["projects"])), 1)
             finally:
                 window.close()
