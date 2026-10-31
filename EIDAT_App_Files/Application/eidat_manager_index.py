@@ -15,6 +15,11 @@ from typing import Any, Mapping
 from eidat_manager_db import SupportPaths
 from eidat_manager_metadata import normalize_title, sanitize_metadata
 
+try:
+    from eidat_manager_artifacts import excel_artifacts_dir as _collision_safe_excel_artifacts_dir
+except Exception:  # pragma: no cover
+    _collision_safe_excel_artifacts_dir = None  # type: ignore[assignment]
+
 TD_FILE_EXTRACTIONS_DIRNAME = "Test Data File Extractions"
 UI_VISIBLE_FILES_DIRNAME = "UI Visible Files"
 UI_VISIBLE_TD_DIRNAME = "Test Data File Extractions"
@@ -478,6 +483,17 @@ def _build_source_rel_by_artifacts_rel(paths: SupportPaths) -> dict[str, str]:
         if not stem:
             continue
         artifacts_rel = f"debug/ocr/{stem}{'__excel' if ext in EXCEL_EXTENSIONS else ''}"
+        if ext in {".xlsx", ".xls", ".xlsm"} and _collision_safe_excel_artifacts_dir is not None:
+            # Same-name sources in different folders live in distinct hashed
+            # folders; map each one to its own artifacts_rel instead of
+            # dropping both as a "collision".
+            try:
+                resolved_dir = _collision_safe_excel_artifacts_dir(
+                    paths.support_dir, paths.global_repo / path_obj, repo_root=paths.global_repo
+                )
+                artifacts_rel = _support_rel(paths.support_dir, resolved_dir) or artifacts_rel
+            except Exception:
+                pass
         key = artifacts_rel.casefold()
         if key in out and out[key] != rel_path:
             collisions.add(key)
@@ -712,7 +728,10 @@ def _visible_eidp_target_dir(root: Path, payload: Mapping[str, Any], meta_path: 
         if source_rel:
             leaf = Path(source_rel).stem
         else:
-            leaf = re.sub(r"__excel$", "", str(meta_path.parent.name or "").strip(), flags=re.IGNORECASE) or meta_path.parent.name
+            leaf = (
+                re.sub(r"(__[0-9a-f]{10})?__excel$", "", str(meta_path.parent.name or "").strip(), flags=re.IGNORECASE)
+                or meta_path.parent.name
+            )
     return (
         Path(root)
         / _safe_visible_component(payload.get("program_title"), fallback="Unknown_Program")

@@ -30,6 +30,14 @@ except Exception:  # pragma: no cover
         mat_bundle_artifacts_dir = None  # type: ignore[assignment]
 
 try:
+    from eidat_manager_artifacts import excel_artifacts_dir as _collision_safe_excel_artifacts_dir  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        from .eidat_manager_artifacts import excel_artifacts_dir as _collision_safe_excel_artifacts_dir  # type: ignore
+    except Exception:  # pragma: no cover
+        _collision_safe_excel_artifacts_dir = None  # type: ignore[assignment]
+
+try:
     import fitz  # PyMuPDF
 except Exception:  # pragma: no cover
     fitz = None
@@ -369,6 +377,16 @@ def _expected_artifacts_dir(support_dir: Path, file_path: Path) -> Path:
             bundle = None
         if bundle is not None:
             return mat_bundle_artifacts_dir(support_dir, bundle)
+    if ext in {".xlsx", ".xls", ".xlsm"} and _collision_safe_excel_artifacts_dir is not None:
+        # Same resolution as the processor: a second file with the same name
+        # (same serial under another asset) has its own hashed folder, so its
+        # artifacts are judged on their own instead of the first file's.
+        try:
+            return _collision_safe_excel_artifacts_dir(
+                support_dir, file_path, repo_root=_node_root_from_support_dir(support_dir)
+            )
+        except Exception:
+            pass
     stem = str(file_path.stem or "").strip() or "unknown"
     name = stem + (EXCEL_ARTIFACT_SUFFIX if ext in {".xlsx", ".xls", ".xlsm", ".mat"} else "")
     return Path(support_dir) / "debug" / "ocr" / name

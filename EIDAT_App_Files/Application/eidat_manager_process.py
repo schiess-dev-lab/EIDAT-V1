@@ -17,6 +17,8 @@ import hashlib
 import uuid
 
 from eidat_manager_db import SupportPaths, connect_db, ensure_schema
+from eidat_manager_artifacts import excel_artifacts_dir as _collision_safe_excel_artifacts_dir
+from eidat_manager_artifacts import folder_asset_hints as _folder_asset_hints
 
 
 def _fallback_build_pointer_token(payload: dict) -> str:
@@ -1040,7 +1042,41 @@ def _excel_artifacts_dir(paths: SupportPaths, excel_path: Path) -> Path:
         bundle = detect_mat_bundle_member(excel_path, repo_root=paths.global_repo)
         if bundle is not None:
             return mat_bundle_artifacts_dir(paths.support_dir, bundle)
-    return paths.support_dir / "debug" / "ocr" / f"{excel_path.stem}{EXCEL_ARTIFACT_SUFFIX}"
+    # Collision-safe: a second source with the same file name (same serial
+    # under another asset / specific type) gets its own `<stem>__<hash>__excel`
+    # folder instead of inheriting the first file's metadata and artifacts.
+    return _collision_safe_excel_artifacts_dir(paths.support_dir, excel_path, repo_root=paths.global_repo)
+
+
+def _td_folder_asset_hints_enabled() -> bool:
+    """
+    Opt-in (EIDAT_TEST_DATA_FOLDER_ASSET_HINTS=1): fill an Unknown asset_type /
+    asset_specific_type for Excel sources from the folder structure
+    `<AssetType>/<AssetSpecificType>/<file>`, the way .mat bundles already do.
+    Off by default because it changes the identity (and official artifact
+    location) of existing Excel sources whose metadata is Unknown.
+    """
+    raw = str(os.environ.get("EIDAT_TEST_DATA_FOLDER_ASSET_HINTS", "") or "").strip().lower()
+    if not raw:
+        try:
+            _, _, _, _, _load_env, _truthy_fn, _ = _get_excel_sqlite_helpers()
+            raw = str((_load_env() or {}).get("EIDAT_TEST_DATA_FOLDER_ASSET_HINTS", "") or "").strip().lower()
+        except Exception:
+            raw = ""
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _apply_excel_folder_asset_hints(metadata: Mapping[str, Any] | None, excel_path: Path) -> dict[str, Any]:
+    out = dict(metadata or {})
+    if not _td_folder_asset_hints_enabled():
+        return out
+    hints = _folder_asset_hints(excel_path)
+    for key in ("asset_type", "asset_specific_type"):
+        if str(out.get(key) or "").strip() in {"", "Unknown", "unknown"}:
+            hinted = str(hints.get(key) or "").strip()
+            if hinted and hinted.casefold() != "unknown":
+                out[key] = hinted
+    return out
 
 
 def _safe_repo_rel(repo_root: Path, path: Path) -> str:
@@ -2787,6 +2823,8 @@ def process_candidates(
                                 mat_path=mat_hint_path,
                                 bundle_seed=bundle_seed if is_mat_bundle else None,
                             )
+                        elif is_excel:
+                            raw_meta = _apply_excel_folder_asset_hints(raw_meta, abs_path)
                         raw_meta = _augment_td_source_metadata(
                             global_repo=paths.global_repo,
                             metadata=raw_meta,
@@ -2990,6 +3028,8 @@ def process_candidates(
                                 mat_path=mat_hint_path,
                                 bundle_seed=bundle_seed if is_mat_bundle else None,
                             )
+                        elif is_excel:
+                            clean_meta = _apply_excel_folder_asset_hints(clean_meta, abs_path)
                         clean_meta = _augment_td_source_metadata(
                             global_repo=paths.global_repo,
                             metadata=clean_meta,

@@ -42636,6 +42636,14 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
         if bundle is not None:
             raw_candidates.append(mat_bundle_artifacts_dir(support_dir, bundle))
     if ext in EXCEL_EXTENSIONS:
+        # Collision-safe hashed folder first (same-name source under another
+        # asset), then the legacy stem-only folder.
+        try:
+            source_hash_basis = str((repo / path_obj).expanduser().resolve()).casefold()
+        except Exception:
+            source_hash_basis = str((repo / path_obj).expanduser()).casefold()
+        source_hash = hashlib.sha1(source_hash_basis.encode("utf-8", errors="ignore")).hexdigest()[:10]
+        raw_candidates.append(root / f"{stem}__{source_hash}{EXCEL_ARTIFACT_SUFFIX}")
         raw_candidates.append(root / f"{stem}{EXCEL_ARTIFACT_SUFFIX}")
     for raw_cand in raw_candidates:
         if not raw_cand.exists():
@@ -42645,6 +42653,20 @@ def get_file_artifacts_path(global_repo: Path, rel_path: str) -> Path | None:
         except Exception:
             raw_meta = {}
         if raw_meta:
+            # A stem-only folder may belong to a different same-named source
+            # (same serial under another asset); never resolve to its artifacts.
+            try:
+                owner_rels = {
+                    str(v or "").strip().replace("\\", "/").strip("/").casefold()
+                    for v in [raw_meta.get("source_rel_path"), *list(raw_meta.get("source_rel_paths") or [])]
+                    if str(v or "").strip()
+                }
+            except Exception:
+                owner_rels = set()
+            if owner_rels and rel_norm.casefold() not in owner_rels and not any(
+                o.endswith("/" + rel_norm.casefold()) for o in owner_rels
+            ):
+                continue
             try:
                 if is_test_data_doc(raw_meta):
                     official = _td_resolve_existing_official_materialization(repo, raw_meta)
